@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderType {
     Limit,
@@ -67,7 +67,9 @@ impl PriceLevel {
         self.orders.pop_front()
     }
 
-    pub fn match_order(&mut self, incoming_order: &mut Order) -> u64 {
+    pub fn match_order(&mut self, incoming_order: &mut Order) -> Vec<OrderBookId> {
+        let mut filled = Vec::new();
+        
         while let Some(mut resting) = self.pop_front() {
             let traded = resting.quantity.min(incoming_order.quantity);
             resting.quantity -= traded;
@@ -79,12 +81,14 @@ impl PriceLevel {
                 break;
             }
 
+            filled.push(resting.id);
+
             if incoming_order.quantity == 0 {
                 break;
             }
         }
 
-        incoming_order.quantity
+        filled
     }
 
     pub fn total_volume(&self) -> u64 {
@@ -95,6 +99,7 @@ impl PriceLevel {
 pub struct BookSide {
     pub side: Side,
     pub price_levels: BTreeMap<u64, PriceLevel>, // Price levels in the OrderBook side
+    pub order_map: HashMap<OrderBookId, (Side, u64)>, // Map from order ID to its price level
 }
 
 impl BookSide {
@@ -102,6 +107,7 @@ impl BookSide {
         Self {
             side,
             price_levels: BTreeMap::new(),
+            order_map: HashMap::new(),
         }
     }
 
@@ -119,14 +125,15 @@ impl BookSide {
             .price_levels
             .entry(order.price)
             .or_insert_with(|| PriceLevel::new(order.price));
+        self.order_map.insert(order.id, (order.side, order.price));
         price_level.add_order(order);
     }
 
     // Remove an order by its ID from the book side
     pub fn remove_order(&mut self, order_id: OrderBookId) -> Option<Order> {
-        let (&price, level) = self.price_levels.iter_mut().find(|(_, level)| {
-            level.orders.iter().any(|o| o.id == order_id)
-        })?;
+        let (_ , price) = self.order_map.remove(&order_id)?;
+        
+        let level = self.price_levels.get_mut(&price)?;
 
         let pos = level.orders.iter().position(|o| o.id == order_id)?;
 
@@ -162,7 +169,8 @@ impl BookSide {
             };
 
             // Match the order with the best price level on the other side
-            level.match_order(order);
+            let filled = level.match_order(order);
+            filled.iter().for_each(|id| { self.order_map.remove(id); });
             self.remove_level_if_empty(best_price);
         }
         order.quantity
@@ -494,15 +502,35 @@ mod tests {
     }
 
     #[test]
+    fn order_map_stays_in_sync_through_fill_and_cancel() {
+        let mut book = OrderBook::new();
+        book.submit_limit_order(limit(1, Side::Ask, 100, 2));
+        book.submit_limit_order(limit(2, Side::Ask, 100, 3));
+        assert_eq!(book.asks.order_map.get(&1), Some(&(Side::Ask, 100)));
+
+        // 吃掉订单 1，部分成交订单 2
+        let remaining = book.submit_limit_order(limit(3, Side::Bid, 100, 4));
+
+        assert_eq!(remaining, 0);
+        assert!(!book.asks.order_map.contains_key(&1));
+        assert_eq!(book.asks.order_map.get(&2), Some(&(Side::Ask, 100)));
+        assert_eq!(level_volume(&book, Side::Ask, 100), 1);
+        assert!(book.bids.order_map.is_empty());
+
+        assert!(book.cancel_limit_order(2));
+        assert!(book.asks.order_map.is_empty());
+    }
+
+    #[test]
     fn price_level_partial_fill_keeps_order_at_front() {
         let mut level = PriceLevel::new(100);
         level.add_order(limit(1, Side::Bid, 100, 2));
         level.add_order(limit(2, Side::Bid, 100, 3));
 
         let mut incoming = limit(3, Side::Ask, 100, 3);
-        let remaining = level.match_order(&mut incoming);
+        let filled = level.match_order(&mut incoming);
 
-        assert_eq!(remaining, 0);
+        assert_eq!(filled, vec![1]);
         assert_eq!(incoming.quantity, 0);
         assert_eq!(level.orders.len(), 1);
         assert_eq!(level.orders[0].id, 2);
