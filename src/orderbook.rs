@@ -263,14 +263,14 @@ impl OrderBook {
     }
 
     // cancel limit order by ID; returns true if the order was found and removed
-    pub fn cancel_limit_order(&mut self, order_id: OrderBookId) -> bool {
-        if self.bids.remove_order(order_id).is_some() {
-            return true;
+    pub fn cancel_limit_order(&mut self, order_id: OrderBookId) -> Option<Order> {
+        if let Some(order) = self.bids.remove_order(order_id) {
+            return Some(order);
         }
-        if self.asks.remove_order(order_id).is_some() {
-            return true;
+        if let Some(order) = self.asks.remove_order(order_id) {
+            return Some(order);
         }
-        false
+        None
     }
 
     // submit market order; market orders match against the best available prices until filled or no more liquidity
@@ -532,7 +532,9 @@ mod tests {
         let mut book = OrderBook::new();
         book.submit_limit_order(limit(1, Side::Bid, 100, 5));
 
-        assert!(book.cancel_limit_order(1));
+        let canceled = book.cancel_limit_order(1).unwrap();
+        assert_eq!(canceled.id, 1);
+        assert_eq!(canceled.quantity, 5);
         assert!(book.bids.price_levels.is_empty());
         assert_eq!(book.bids.best_price_level(), None);
     }
@@ -543,7 +545,7 @@ mod tests {
         book.submit_limit_order(limit(1, Side::Ask, 100, 2));
         book.submit_limit_order(limit(2, Side::Ask, 100, 3));
 
-        assert!(book.cancel_limit_order(1));
+        assert!(book.cancel_limit_order(1).is_some());
         assert_eq!(order_ids_at(&book, Side::Ask, 100), vec![2]);
         assert_eq!(level_volume(&book, Side::Ask, 100), 3);
     }
@@ -552,7 +554,7 @@ mod tests {
     fn cancel_unknown_order_returns_false() {
         let mut book = OrderBook::new();
 
-        assert!(!book.cancel_limit_order(42));
+        assert!(book.cancel_limit_order(42).is_none());
     }
 
     #[test]
@@ -571,7 +573,7 @@ mod tests {
         assert_eq!(level_volume(&book, Side::Ask, 100), 1);
         assert!(book.bids.order_map.is_empty());
 
-        assert!(book.cancel_limit_order(2));
+        assert!(book.cancel_limit_order(2).is_some());
         assert!(book.asks.order_map.is_empty());
     }
 
