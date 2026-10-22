@@ -1,0 +1,9 @@
+[package]
+name = "orderbook-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+colored = "3.1.1"
+rust_decimal = "1.43.0"
+uuid = "1.28.0"
