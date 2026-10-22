@@ -31,9 +31,9 @@ fn main() {
         order_type: OrderType::Market,
     };
 
-    let remaining = book.submit_limit_order(taker);
+    let remaining = book.submit_limit_order(taker).remaining_quantity;
 
-    let remaining_market = book.submit_market_order(market_order_1);
+    let remaining_market = book.submit_market_order(market_order_1).remaining_quantity;
 
     println!("Taker remaining: {}", remaining);
     println!("Market order remaining: {}", remaining_market);

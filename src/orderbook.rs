@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderType {
     Limit,
@@ -44,6 +45,39 @@ impl Order {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct Fill {
+    pub maker_order_id: OrderBookId,
+    pub taker_order_id: OrderBookId,
+    pub price: u64,      // 成交价 = 挂单价（maker price）
+    pub quantity: u64,
+    pub taker_side: Side,
+}
+
+#[derive(Debug, Default)]
+pub struct MatchOutcome {
+    pub fills: Vec<Fill>,
+    pub filled_order_ids: Vec<OrderBookId>, // 完全成交的，需要从 order_map 移除
+}
+
+#[derive(Debug, Default)]
+pub struct SubmitResult {
+    pub remaining_quantity: u64,
+    pub fills: Vec<Fill>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Trade {
+    pub id: u64,
+    pub symbol: String,
+    pub maker_order_id: OrderBookId,
+    pub taker_order_id: OrderBookId,
+    pub price: u64,
+    pub quantity: u64,
+    pub taker_side: Side,
+    pub timestamp: u64,
+}
+
 /// Orders at a single price level in the OrderBook
 #[derive(Debug, Clone)]
 pub struct PriceLevel {
@@ -67,13 +101,21 @@ impl PriceLevel {
         self.orders.pop_front()
     }
 
-    pub fn match_order(&mut self, incoming_order: &mut Order) -> Vec<OrderBookId> {
-        let mut filled = Vec::new();
+    pub fn match_order(&mut self, incoming_order: &mut Order) -> MatchOutcome {
+        let mut outcome = MatchOutcome::default();
         
         while let Some(mut resting) = self.pop_front() {
             let traded = resting.quantity.min(incoming_order.quantity);
             resting.quantity -= traded;
             incoming_order.quantity -= traded;
+
+            outcome.fills.push(Fill {
+                maker_order_id: resting.id,
+                taker_order_id: incoming_order.id,
+                price: resting.price,
+                quantity: traded,
+                taker_side: incoming_order.side,
+            });
 
             if resting.quantity > 0 {
                 // Partially filled, put the remaining back to the front of the level
@@ -81,14 +123,14 @@ impl PriceLevel {
                 break;
             }
 
-            filled.push(resting.id);
+            outcome.filled_order_ids.push(resting.id);
 
             if incoming_order.quantity == 0 {
                 break;
             }
         }
 
-        filled
+        outcome
     }
 
     pub fn total_volume(&self) -> u64 {
@@ -152,7 +194,9 @@ impl BookSide {
     }
 
     // match order
-    pub fn match_order(&mut self, order: &mut Order) -> u64 {
+    pub fn match_order(&mut self, order: &mut Order) -> Vec<Fill> {
+        let mut filled = Vec::new();
+
         while order.quantity > 0 {
             // Peek best opposite price
             let Some(best_price) = self.best_price_level() else {
@@ -169,11 +213,13 @@ impl BookSide {
             };
 
             // Match the order with the best price level on the other side
-            let filled = level.match_order(order);
-            filled.iter().for_each(|id| { self.order_map.remove(id); });
+            let outcome = level.match_order(order);
+            outcome.filled_order_ids.iter().for_each(|id| { self.order_map.remove(id); });
+            filled.extend(outcome.fills);
+            
             self.remove_level_if_empty(best_price);
         }
-        order.quantity
+        filled
     }
 }
 
@@ -194,7 +240,7 @@ impl OrderBook {
     }
 
     // submit a new limit order; returns remaining quantity if not fully filled
-    pub fn submit_limit_order(&mut self, mut order: Order) -> u64 {
+    pub fn submit_limit_order(&mut self, mut order: Order) -> SubmitResult {
         debug_assert_eq!(order.order_type, OrderType::Limit);
 
         let (own_side, other_side) = match order.side {
@@ -203,13 +249,17 @@ impl OrderBook {
         };
 
         // Attempt to match the order against the other side
-        let remaining_quantity = other_side.match_order(&mut order);
+        let fills = other_side.match_order(&mut order);
+        let remaining_quantity = order.quantity;
 
         if remaining_quantity > 0 {
             own_side.insert_order(order);
         }
 
-        remaining_quantity
+        SubmitResult {
+            remaining_quantity,
+            fills,
+        }
     }
 
     // cancel limit order by ID; returns true if the order was found and removed
@@ -224,16 +274,20 @@ impl OrderBook {
     }
 
     // submit market order; market orders match against the best available prices until filled or no more liquidity
-    pub fn submit_market_order(&mut self, mut order: Order) -> u64 {
+    pub fn submit_market_order(&mut self, mut order: Order) -> SubmitResult {
         debug_assert_eq!(order.order_type, OrderType::Market);
         let other_side = match order.side {
             Side::Bid => &mut self.asks, // Bid side is own side, Ask side is other side
             Side::Ask => &mut self.bids, // Ask side is own side, Bid side is other side
         };
 
-        let remaining_quantity = other_side.match_order(&mut order);
+        let fills = other_side.match_order(&mut order);
+        let remaining_quantity = order.quantity;
 
-        remaining_quantity
+        SubmitResult {
+            remaining_quantity,
+            fills,
+        }
     }
 
     pub fn print_order_book(&self) {
@@ -324,7 +378,7 @@ mod tests {
     fn limit_order_rests_on_empty_book() {
         let mut book = OrderBook::new();
 
-        let remaining = book.submit_limit_order(limit(1, Side::Bid, 100, 5));
+        let remaining = book.submit_limit_order(limit(1, Side::Bid, 100, 5)).remaining_quantity;
 
         assert_eq!(remaining, 5);
         assert_eq!(book.bids.best_price_level(), Some(100));
@@ -337,7 +391,7 @@ mod tests {
         let mut book = OrderBook::new();
         book.submit_limit_order(limit(1, Side::Ask, 100, 5));
 
-        let remaining = book.submit_limit_order(limit(2, Side::Bid, 100, 5));
+        let remaining = book.submit_limit_order(limit(2, Side::Bid, 100, 5)).remaining_quantity;
 
         assert_eq!(remaining, 0);
         assert!(book.asks.price_levels.is_empty());
@@ -349,7 +403,7 @@ mod tests {
         let mut book = OrderBook::new();
         book.submit_limit_order(limit(1, Side::Bid, 100, 5));
 
-        let remaining = book.submit_limit_order(limit(2, Side::Ask, 100, 5));
+        let remaining = book.submit_limit_order(limit(2, Side::Ask, 100, 5)).remaining_quantity;
 
         assert_eq!(remaining, 0);
         assert!(book.asks.price_levels.is_empty());
@@ -361,7 +415,7 @@ mod tests {
         let mut book = OrderBook::new();
         book.submit_limit_order(limit(1, Side::Ask, 100, 5));
 
-        let remaining = book.submit_limit_order(limit(2, Side::Bid, 99, 5));
+        let remaining = book.submit_limit_order(limit(2, Side::Bid, 99, 5)).remaining_quantity;
 
         assert_eq!(remaining, 5);
         assert_eq!(level_volume(&book, Side::Ask, 100), 5);
@@ -373,7 +427,7 @@ mod tests {
         let mut book = OrderBook::new();
         book.submit_limit_order(limit(1, Side::Bid, 100, 5));
 
-        let remaining = book.submit_limit_order(limit(2, Side::Ask, 101, 5));
+        let remaining = book.submit_limit_order(limit(2, Side::Ask, 101, 5)).remaining_quantity;
 
         assert_eq!(remaining, 5);
         assert_eq!(level_volume(&book, Side::Bid, 100), 5);
@@ -385,7 +439,7 @@ mod tests {
         let mut book = OrderBook::new();
         book.submit_limit_order(limit(1, Side::Ask, 100, 3));
 
-        let remaining = book.submit_limit_order(limit(2, Side::Bid, 105, 10));
+        let remaining = book.submit_limit_order(limit(2, Side::Bid, 105, 10)).remaining_quantity;
 
         assert_eq!(remaining, 7);
         assert!(book.asks.price_levels.is_empty());
@@ -399,7 +453,7 @@ mod tests {
         book.submit_limit_order(limit(1, Side::Ask, 100, 2));
         book.submit_limit_order(limit(2, Side::Ask, 101, 3));
 
-        let remaining = book.submit_limit_order(limit(3, Side::Bid, 101, 4));
+        let remaining = book.submit_limit_order(limit(3, Side::Bid, 101, 4)).remaining_quantity;
 
         assert_eq!(remaining, 0);
         assert!(!book.asks.price_levels.contains_key(&100));
@@ -414,7 +468,7 @@ mod tests {
         book.submit_limit_order(limit(1, Side::Ask, 100, 2));
         book.submit_limit_order(limit(2, Side::Ask, 100, 3));
 
-        let remaining = book.submit_limit_order(limit(3, Side::Bid, 100, 3));
+        let remaining = book.submit_limit_order(limit(3, Side::Bid, 100, 3)).remaining_quantity;
 
         assert_eq!(remaining, 0);
         assert_eq!(order_ids_at(&book, Side::Ask, 100), vec![2]);
@@ -427,7 +481,7 @@ mod tests {
         book.submit_limit_order(limit(1, Side::Ask, 100, 2));
         book.submit_limit_order(limit(2, Side::Ask, 101, 3));
 
-        let remaining = book.submit_market_order(market(3, Side::Bid, 4));
+        let remaining = book.submit_market_order(market(3, Side::Bid, 4)).remaining_quantity;
 
         assert_eq!(remaining, 0);
         assert!(!book.asks.price_levels.contains_key(&100));
@@ -441,7 +495,7 @@ mod tests {
         let mut book = OrderBook::new();
         book.submit_limit_order(limit(1, Side::Ask, 100, 2));
 
-        let remaining = book.submit_market_order(market(2, Side::Bid, 5));
+        let remaining = book.submit_market_order(market(2, Side::Bid, 5)).remaining_quantity;
 
         assert_eq!(remaining, 3);
         assert!(book.asks.price_levels.is_empty());
@@ -452,7 +506,7 @@ mod tests {
     fn market_order_on_empty_book_is_unfilled() {
         let mut book = OrderBook::new();
 
-        let remaining = book.submit_market_order(market(1, Side::Bid, 5));
+        let remaining = book.submit_market_order(market(1, Side::Bid, 5)).remaining_quantity;
 
         assert_eq!(remaining, 5);
         assert!(book.bids.price_levels.is_empty());
@@ -465,7 +519,7 @@ mod tests {
         book.submit_limit_order(limit(1, Side::Bid, 99, 2));
         book.submit_limit_order(limit(2, Side::Bid, 100, 2));
 
-        let remaining = book.submit_market_order(market(3, Side::Ask, 3));
+        let remaining = book.submit_market_order(market(3, Side::Ask, 3)).remaining_quantity;
 
         assert_eq!(remaining, 0);
         assert!(!book.bids.price_levels.contains_key(&100));
@@ -509,7 +563,7 @@ mod tests {
         assert_eq!(book.asks.order_map.get(&1), Some(&(Side::Ask, 100)));
 
         // 吃掉订单 1，部分成交订单 2
-        let remaining = book.submit_limit_order(limit(3, Side::Bid, 100, 4));
+        let remaining = book.submit_limit_order(limit(3, Side::Bid, 100, 4)).remaining_quantity;
 
         assert_eq!(remaining, 0);
         assert!(!book.asks.order_map.contains_key(&1));
@@ -528,13 +582,100 @@ mod tests {
         level.add_order(limit(2, Side::Bid, 100, 3));
 
         let mut incoming = limit(3, Side::Ask, 100, 3);
-        let filled = level.match_order(&mut incoming);
+        let outcome = level.match_order(&mut incoming);
 
-        assert_eq!(filled, vec![1]);
+        assert_eq!(outcome.filled_order_ids, vec![1]);
+        assert_eq!(outcome.fills.len(), 2);
+        assert_eq!(outcome.fills[0].maker_order_id, 1);
+        assert_eq!(outcome.fills[0].taker_order_id, 3);
+        assert_eq!(outcome.fills[0].price, 100);
+        assert_eq!(outcome.fills[0].quantity, 2);
+        assert_eq!(outcome.fills[0].taker_side, Side::Ask);
+        assert_eq!(outcome.fills[1].maker_order_id, 2);
+        assert_eq!(outcome.fills[1].taker_order_id, 3);
+        assert_eq!(outcome.fills[1].price, 100);
+        assert_eq!(outcome.fills[1].quantity, 1);
+        assert_eq!(outcome.fills[1].taker_side, Side::Ask);
         assert_eq!(incoming.quantity, 0);
         assert_eq!(level.orders.len(), 1);
         assert_eq!(level.orders[0].id, 2);
         assert_eq!(level.orders[0].quantity, 2);
         assert_eq!(level.total_volume(), 2);
+    }
+
+    #[test]
+    fn limit_fills_use_maker_price() {
+        let mut book = OrderBook::new();
+        book.submit_limit_order(limit(1, Side::Ask, 100, 2));
+
+        let result = book.submit_limit_order(limit(2, Side::Bid, 105, 2));
+
+        assert_eq!(result.remaining_quantity, 0);
+        assert_eq!(result.fills.len(), 1);
+        assert_eq!(result.fills[0].maker_order_id, 1);
+        assert_eq!(result.fills[0].taker_order_id, 2);
+        assert_eq!(result.fills[0].price, 100);
+        assert_eq!(result.fills[0].quantity, 2);
+        assert_eq!(result.fills[0].taker_side, Side::Bid);
+    }
+
+    #[test]
+    fn sweeping_multiple_levels_produces_one_fill_per_level() {
+        let mut book = OrderBook::new();
+        book.submit_limit_order(limit(1, Side::Ask, 100, 2));
+        book.submit_limit_order(limit(2, Side::Ask, 101, 3));
+
+        let result = book.submit_limit_order(limit(3, Side::Bid, 101, 4));
+
+        assert_eq!(result.remaining_quantity, 0);
+        assert_eq!(result.fills.len(), 2);
+        assert_eq!(result.fills[0].maker_order_id, 1);
+        assert_eq!(result.fills[0].price, 100);
+        assert_eq!(result.fills[0].quantity, 2);
+        assert_eq!(result.fills[1].maker_order_id, 2);
+        assert_eq!(result.fills[1].price, 101);
+        assert_eq!(result.fills[1].quantity, 2);
+        assert!(result.fills.iter().all(|f| f.taker_order_id == 3));
+    }
+
+    #[test]
+    fn partial_fill_records_only_traded_quantity() {
+        let mut book = OrderBook::new();
+        book.submit_limit_order(limit(1, Side::Ask, 100, 3));
+
+        let result = book.submit_limit_order(limit(2, Side::Bid, 105, 10));
+
+        assert_eq!(result.remaining_quantity, 7);
+        assert_eq!(result.fills.len(), 1);
+        assert_eq!(result.fills[0].quantity, 3);
+        assert_eq!(result.fills[0].price, 100);
+    }
+
+    #[test]
+    fn market_order_records_fills_at_resting_prices() {
+        let mut book = OrderBook::new();
+        book.submit_limit_order(limit(1, Side::Ask, 100, 2));
+        book.submit_limit_order(limit(2, Side::Ask, 101, 3));
+
+        let result = book.submit_market_order(market(3, Side::Bid, 4));
+
+        assert_eq!(result.remaining_quantity, 0);
+        assert_eq!(result.fills.len(), 2);
+        assert_eq!(result.fills[0].price, 100);
+        assert_eq!(result.fills[0].quantity, 2);
+        assert_eq!(result.fills[1].price, 101);
+        assert_eq!(result.fills[1].quantity, 2);
+        assert!(result.fills.iter().all(|f| f.taker_side == Side::Bid));
+    }
+
+    #[test]
+    fn non_crossing_order_produces_no_fills() {
+        let mut book = OrderBook::new();
+        book.submit_limit_order(limit(1, Side::Ask, 100, 5));
+
+        let result = book.submit_limit_order(limit(2, Side::Bid, 99, 5));
+
+        assert_eq!(result.remaining_quantity, 5);
+        assert!(result.fills.is_empty());
     }
 }
