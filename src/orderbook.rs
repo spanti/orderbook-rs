@@ -227,7 +227,6 @@ impl BookSide {
 pub struct OrderBook {
     bids: BookSide,
     asks: BookSide,
-    next_order_id: OrderBookId,
 }
 
 impl OrderBook {
@@ -235,7 +234,6 @@ impl OrderBook {
         Self {
             bids: BookSide::new(Side::Bid),
             asks: BookSide::new(Side::Ask),
-            next_order_id: 1,
         }
     }
 

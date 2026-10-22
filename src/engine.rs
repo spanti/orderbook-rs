@@ -6,12 +6,30 @@ use uuid::{Uuid, timestamp};
 
 use crate::orderbook::{Fill, Order, OrderBook, OrderBookId, OrderType, Side, Trade};
 
+#[derive(Debug, Clone, Copy)]
+pub struct OrderRequest {
+    // TODO: add symbol
+    pub side: Side,
+    pub price: u64,
+    pub quantity: u64,
+    pub timestamp: u64,
+    pub order_type: OrderType,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderStatus {
     New,             // 未成交，挂在簿上
     PartiallyFilled, // 部分成交，剩余挂在簿上
     Filled,          // 全部成交
     Canceled,        // 未成交或剩余部分被丢弃（市价单/IOC）
+}
+
+pub struct OrderRecord {
+    pub symbol: String,
+    pub status: OrderStatus,
+    pub original_quantity: u64,
+    pub filled_quantity: u64,
+    pub remaining_quantity: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +82,8 @@ pub struct MatchingEngine {
     trades: Vec<Trade>,
     next_trade_id: u64,
     config: EngineConfig,
+    orders: HashMap<OrderBookId, OrderRecord>,
+    next_order_id: u64,
 }
 
 impl Default for MatchingEngine {
@@ -73,6 +93,8 @@ impl Default for MatchingEngine {
             trades: Vec::new(),
             next_trade_id: 1,
             config: EngineConfig::default(),
+            orders: HashMap::new(),
+            next_order_id: 1,
         }
     }
 }
@@ -84,15 +106,30 @@ impl MatchingEngine {
             trades: Vec::new(),
             next_trade_id: 1,
             config,
+            orders: HashMap::new(),
+            next_order_id: 1,
         }
     }
 
-    pub fn submit_limit_order(&mut self, symbol: &str, order: Order) -> Result<ExecutionReport, EngineError> {
-        self.validate(&order, OrderType::Limit)?;
+    pub fn submit_limit_order(
+        &mut self,
+        symbol: &str,
+        request: OrderRequest,
+    ) -> Result<ExecutionReport, EngineError> {
+        self.validate(&request, OrderType::Limit)?;
 
-        let order_id = order.id;
-        let original_quantity = order.quantity;
-        let timestamp = order.timestamp;
+        let order_id = self.next_order_id;
+        self.next_order_id += 1;
+        let order = Order {
+            id: order_id,
+            side: request.side,
+            price: request.price,
+            quantity: request.quantity,
+            timestamp: request.timestamp,
+            order_type: request.order_type,
+        };
+        let original_quantity = request.quantity;
+        let timestamp = request.timestamp;
         let symbol_owned = symbol.to_string();
 
         let order_book = self
@@ -104,29 +141,56 @@ impl MatchingEngine {
 
         let fills = self.record_fills(symbol, timestamp, result.fills);
 
+        let filled_quantity = original_quantity - result.remaining_quantity;
+        let status = if result.remaining_quantity == 0 {
+            OrderStatus::Filled
+        } else if filled_quantity > 0 {
+            OrderStatus::PartiallyFilled
+        } else {
+            OrderStatus::New
+        };
+
+        self.orders.insert(
+            order_id,
+            OrderRecord {
+                symbol: symbol_owned.clone(),
+                status,
+                original_quantity,
+                filled_quantity,
+                remaining_quantity: result.remaining_quantity,
+            },
+        );
+
         Ok(ExecutionReport {
             order_id,
             symbol: symbol_owned,
-            status: if result.remaining_quantity == 0 {
-                OrderStatus::Filled
-            } else if result.remaining_quantity < original_quantity {
-                OrderStatus::PartiallyFilled
-            } else {
-                OrderStatus::New
-            },
+            status: status,
             original_quantity,
-            filled_quantity: original_quantity - result.remaining_quantity,
+            filled_quantity: filled_quantity,
             remaining_quantity: result.remaining_quantity,
             fills: fills,
         })
     }
 
-    pub fn submit_market_order(&mut self, symbol: &str, order: Order) -> Result<ExecutionReport, EngineError> {
-        self.validate(&order, OrderType::Market)?;
+    pub fn submit_market_order(
+        &mut self,
+        symbol: &str,
+        request: OrderRequest,
+    ) -> Result<ExecutionReport, EngineError> {
+        self.validate(&request, OrderType::Market)?;
 
-        let order_id = order.id;
-        let original_quantity = order.quantity;
-        let timestamp = order.timestamp;
+        let order_id = self.next_order_id;
+        self.next_order_id += 1;
+        let order = Order {
+            id: order_id,
+            side: request.side,
+            price: request.price,
+            quantity: request.quantity,
+            timestamp: request.timestamp,
+            order_type: request.order_type,
+        };
+        let original_quantity = request.quantity;
+        let timestamp = request.timestamp;
         let symbol_owned = symbol.to_string();
 
         let order_book = self
@@ -138,31 +202,63 @@ impl MatchingEngine {
 
         let fills = self.record_fills(symbol, timestamp, result.fills);
 
+        let filled_quantity = original_quantity - result.remaining_quantity;
+        // 市价单不回挂，剩余量视为取消
+        let status = if result.remaining_quantity == 0 {
+            OrderStatus::Filled
+        } else {
+            OrderStatus::Canceled
+        };
+
+        self.orders.insert(
+            order_id,
+            OrderRecord {
+                symbol: symbol_owned.clone(),
+                status,
+                original_quantity,
+                filled_quantity,
+                remaining_quantity: result.remaining_quantity,
+            },
+        );
+
         Ok(ExecutionReport {
             order_id,
             symbol: symbol_owned,
-            // 市价单不回挂，剩余量视为取消
-            status: if result.remaining_quantity == 0 {
-                OrderStatus::Filled
-            } else {
-                OrderStatus::Canceled
-            },
+            status,
             original_quantity,
-            filled_quantity: original_quantity - result.remaining_quantity,
+            filled_quantity,
             remaining_quantity: result.remaining_quantity,
-            fills: fills,
+            fills,
         })
     }
 
-    pub fn cancel_order(&mut self, symbol: &str, order_id: u64) -> Option<CancelReport> {
-        self.order_books
-            .get_mut(symbol)
-            .and_then(|order_book| order_book.cancel_limit_order(order_id))
-            .map(|order| CancelReport {
-                order_id,
-                symbol: symbol.to_string(),
-                canceled_quantity: order.quantity,
-            })
+    pub fn cancel_order(&mut self, symbol: &str, order_id: u64) -> Option<ExecutionReport> {
+        let record = self.orders.get_mut(&order_id)?;
+        if record.symbol != symbol
+            || !matches!(
+                record.status,
+                OrderStatus::New | OrderStatus::PartiallyFilled
+            )
+        {
+            return None;
+        }
+
+        let order = self.order_books.get_mut(symbol)?.cancel_limit_order(order_id)?;
+
+        let canceled_quantity = order.quantity;
+        let record = self.orders.get_mut(&order_id)?;
+        record.status = OrderStatus::Canceled;
+        record.remaining_quantity = canceled_quantity;
+        
+        Some(ExecutionReport {
+            order_id,
+            symbol: symbol.to_string(),
+            status: OrderStatus::Canceled,
+            original_quantity: record.original_quantity,
+            filled_quantity: record.filled_quantity,
+            remaining_quantity: record.remaining_quantity,
+            fills: Vec::new(),
+        })
     }
 
     pub fn trades(&self) -> &Vec<Trade> {
@@ -186,16 +282,16 @@ impl MatchingEngine {
         }
     }
 
-    fn validate(&self, order: &Order, expected: OrderType) -> Result<(), EngineError> {
-        if order.order_type != expected {
+    fn validate(&self, request: &OrderRequest, expected: OrderType) -> Result<(), EngineError> {
+        if request.order_type != expected {
             return Err(EngineError::WrongOrderType);
         }
-        if order.quantity < self.config.min_order_quantity
-            || order.quantity > self.config.max_order_quantity
+        if request.quantity < self.config.min_order_quantity
+            || request.quantity > self.config.max_order_quantity
         {
             return Err(EngineError::QuantityOutOfRange);
         }
-        if order.order_type == OrderType::Limit && order.price % self.config.tick_size != 0 {
+        if request.order_type == OrderType::Limit && request.price % self.config.tick_size != 0 {
             return Err(EngineError::PriceNotOnTick);
         }
         Ok(())
@@ -204,6 +300,16 @@ impl MatchingEngine {
     fn record_fills(&mut self, symbol: &str, timestamp: u64, fills: Vec<Fill>) -> Vec<Trade> {
         let mut record_trades = Vec::with_capacity(fills.len());
         fills.iter().for_each(|fill| {
+            if let Some(record) = self.orders.get_mut(&fill.maker_order_id) {
+                record.filled_quantity += fill.quantity;
+                record.remaining_quantity -= fill.quantity;
+                record.status = if record.remaining_quantity == 0 {
+                    OrderStatus::Filled
+                } else {
+                    OrderStatus::PartiallyFilled
+                };
+            }
+
             let trade = Trade {
                 id: self.next_trade_id,
                 symbol: symbol.to_string(),
@@ -227,24 +333,22 @@ impl MatchingEngine {
 mod tests {
     use super::*;
 
-    fn limit(id: OrderBookId, side: Side, price: u64, quantity: u64) -> Order {
-        Order {
-            id,
+    fn limit(timestamp: u64, side: Side, price: u64, quantity: u64) -> OrderRequest {
+        OrderRequest {
             side,
             price,
             quantity,
-            timestamp: id,
+            timestamp,
             order_type: OrderType::Limit,
         }
     }
 
-    fn market(id: OrderBookId, side: Side, quantity: u64) -> Order {
-        Order {
-            id,
+    fn market(timestamp: u64, side: Side, quantity: u64) -> OrderRequest {
+        OrderRequest {
             side,
             price: 0,
             quantity,
-            timestamp: id,
+            timestamp,
             order_type: OrderType::Market,
         }
     }
@@ -294,9 +398,11 @@ mod tests {
         assert_eq!(trades[1].maker_order_id, 2);
         assert_eq!(trades[1].price, 101);
         assert_eq!(trades[1].quantity, 2);
-        assert!(trades
-            .iter()
-            .all(|t| t.taker_order_id == 3 && t.taker_side == Side::Bid));
+        assert!(
+            trades
+                .iter()
+                .all(|t| t.taker_order_id == 3 && t.taker_side == Side::Bid)
+        );
     }
 
     #[test]
@@ -388,8 +494,13 @@ mod tests {
         let report = engine.cancel_order("BTC-USDT", 1).unwrap();
         assert_eq!(report.order_id, 1);
         assert_eq!(report.symbol, "BTC-USDT");
-        assert_eq!(report.canceled_quantity, 5);
+        assert_eq!(report.status, OrderStatus::Canceled);
+        assert_eq!(report.original_quantity, 5);
+        assert_eq!(report.filled_quantity, 0);
+        assert_eq!(report.remaining_quantity, 5);
+        assert!(report.fills.is_empty());
 
+        assert_eq!(engine.orders.get(&1).unwrap().status, OrderStatus::Canceled);
         assert!(engine.cancel_order("BTC-USDT", 1).is_none());
         assert!(engine.cancel_order("ETH-USDT", 1).is_none());
     }
@@ -521,6 +632,133 @@ mod tests {
 
         assert_eq!(report.order_id, 2);
         assert_eq!(report.symbol, "BTC-USDT");
-        assert_eq!(report.canceled_quantity, 3);
+        assert_eq!(report.status, OrderStatus::Canceled);
+        assert_eq!(report.original_quantity, 5);
+        assert_eq!(report.filled_quantity, 2);
+        assert_eq!(report.remaining_quantity, 3);
+        assert!(report.fills.is_empty());
+
+        let record = engine.orders.get(&2).unwrap();
+        assert_eq!(record.status, OrderStatus::Canceled);
+        assert_eq!(record.filled_quantity, 2);
+        assert_eq!(record.remaining_quantity, 3);
+    }
+
+    #[test]
+    fn order_ids_are_assigned_by_engine_across_symbols() {
+        let mut engine = MatchingEngine::new(EngineConfig::default());
+
+        let first = engine
+            .submit_limit_order("BTC-USDT", limit(10, Side::Bid, 100, 1))
+            .unwrap();
+        let second = engine
+            .submit_limit_order("ETH-USDT", limit(20, Side::Bid, 100, 1))
+            .unwrap();
+
+        assert_eq!(first.order_id, 1);
+        assert_eq!(second.order_id, 2);
+    }
+
+    #[test]
+    fn rejected_order_does_not_consume_order_id() {
+        let mut engine = MatchingEngine::new(EngineConfig::default());
+
+        assert!(engine
+            .submit_limit_order("BTC-USDT", limit(1, Side::Bid, 100, 0))
+            .is_err());
+
+        let report = engine
+            .submit_limit_order("BTC-USDT", limit(2, Side::Bid, 100, 1))
+            .unwrap();
+        assert_eq!(report.order_id, 1);
+    }
+
+    #[test]
+    fn order_records_track_fills_for_maker_and_taker() {
+        let mut engine = MatchingEngine::new(EngineConfig::default());
+        engine
+            .submit_limit_order("BTC-USDT", limit(1, Side::Ask, 100, 3))
+            .unwrap();
+
+        // taker 成交 3，剩余 2 挂在 100
+        engine
+            .submit_limit_order("BTC-USDT", limit(2, Side::Bid, 100, 5))
+            .unwrap();
+
+        let maker = engine.orders.get(&1).unwrap();
+        assert_eq!(maker.status, OrderStatus::Filled);
+        assert_eq!(maker.original_quantity, 3);
+        assert_eq!(maker.filled_quantity, 3);
+        assert_eq!(maker.remaining_quantity, 0);
+
+        let taker = engine.orders.get(&2).unwrap();
+        assert_eq!(taker.status, OrderStatus::PartiallyFilled);
+        assert_eq!(taker.original_quantity, 5);
+        assert_eq!(taker.filled_quantity, 3);
+        assert_eq!(taker.remaining_quantity, 2);
+    }
+
+    #[test]
+    fn maker_record_updates_across_multiple_fills() {
+        let mut engine = MatchingEngine::new(EngineConfig::default());
+        engine
+            .submit_limit_order("BTC-USDT", limit(1, Side::Ask, 100, 5))
+            .unwrap();
+
+        engine
+            .submit_limit_order("BTC-USDT", limit(2, Side::Bid, 100, 2))
+            .unwrap();
+        let maker = engine.orders.get(&1).unwrap();
+        assert_eq!(maker.status, OrderStatus::PartiallyFilled);
+        assert_eq!(maker.filled_quantity, 2);
+        assert_eq!(maker.remaining_quantity, 3);
+
+        engine
+            .submit_limit_order("BTC-USDT", limit(3, Side::Bid, 100, 3))
+            .unwrap();
+        let maker = engine.orders.get(&1).unwrap();
+        assert_eq!(maker.status, OrderStatus::Filled);
+        assert_eq!(maker.filled_quantity, 5);
+        assert_eq!(maker.remaining_quantity, 0);
+    }
+
+    #[test]
+    fn order_record_is_created_for_market_orders() {
+        let mut engine = MatchingEngine::new(EngineConfig::default());
+        engine
+            .submit_limit_order("BTC-USDT", limit(1, Side::Ask, 100, 2))
+            .unwrap();
+
+        let report = engine
+            .submit_market_order("BTC-USDT", market(2, Side::Bid, 5))
+            .unwrap();
+
+        let record = engine.orders.get(&report.order_id).unwrap();
+        assert_eq!(record.symbol, "BTC-USDT");
+        assert_eq!(record.status, OrderStatus::Canceled);
+        assert_eq!(record.original_quantity, 5);
+        assert_eq!(record.filled_quantity, 2);
+        assert_eq!(record.remaining_quantity, 3);
+    }
+
+    #[test]
+    fn cancel_filled_or_already_canceled_order_returns_none() {
+        let mut engine = MatchingEngine::new(EngineConfig::default());
+        engine
+            .submit_limit_order("BTC-USDT", limit(1, Side::Ask, 100, 2))
+            .unwrap();
+        engine
+            .submit_limit_order("BTC-USDT", limit(2, Side::Bid, 100, 2))
+            .unwrap();
+
+        // 双方都已完全成交
+        assert!(engine.cancel_order("BTC-USDT", 1).is_none());
+        assert!(engine.cancel_order("BTC-USDT", 2).is_none());
+
+        engine
+            .submit_limit_order("BTC-USDT", limit(3, Side::Bid, 99, 1))
+            .unwrap();
+        assert!(engine.cancel_order("BTC-USDT", 3).is_some());
+        assert!(engine.cancel_order("BTC-USDT", 3).is_none());
     }
 }
