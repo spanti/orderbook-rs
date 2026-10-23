@@ -126,6 +126,7 @@ pub enum OrderStatus {
     PartiallyFilled, // 部分成交，剩余挂在簿上
     Filled,          // 全部成交
     Canceled,        // 未成交或剩余部分被丢弃（市价单/IOC）
+    PendingTrigger,   // 等待触发的止损单
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -153,7 +154,7 @@ impl OrderRecord {
 
     /// Whether the order is still working on the book.
     pub fn is_open(&self) -> bool {
-        matches!(self.status, OrderStatus::New | OrderStatus::PartiallyFilled)
+        matches!(self.status, OrderStatus::New | OrderStatus::PartiallyFilled | OrderStatus::PendingTrigger)
     }
 
     /// Record a maker fill delta reported by the book.
@@ -279,6 +280,8 @@ pub enum EngineError {
     InvalidTimeInForce,
     PostOnlyWouldCross,
     InsufficientLiquidity,
+    StopPriceWouldTriggerImmediately,
+    StopOrderNotModifiable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -305,6 +308,10 @@ pub enum EngineCommand {
     CancelOrder {
         symbol: String,
         order_id: OrderBookId,
+    },
+    SubmitStopOrder {
+        symbol: String,
+        request: StopOrderRequest,
     },
 }
 
@@ -334,6 +341,13 @@ pub enum EngineEvent {
         sequence_id: u64,
         reason: EngineError,
     },
+    StopTriggered {
+        symbol: String,
+        sequence_id: u64,
+        order_id: OrderBookId,
+        stop_price: u64,
+        last_price: u64,   // 触发瞬间的成交价
+    },
 }
 
 impl EngineEvent {
@@ -343,6 +357,7 @@ impl EngineEvent {
             EngineEvent::TradeExecuted { sequence_id, .. } => *sequence_id,
             EngineEvent::OrderCanceled { sequence_id, .. } => *sequence_id,
             EngineEvent::OrderRejected { sequence_id, .. } => *sequence_id,
+            EngineEvent::StopTriggered { sequence_id, .. } => *sequence_id,
         }
     }
 }
@@ -353,4 +368,29 @@ pub struct BookSnapshot {
     pub sequence: u64,
     pub bids: Vec<(u64, u64)>, // (price, quantity)，从高到低
     pub asks: Vec<(u64, u64)>, // (price, quantity)，从低到高
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopKind {
+    Market,
+    Limit { price: u64 },   // 触发后转换成的限价
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StopOrderRequest {
+    pub side: Side,
+    pub stop_price: u64,
+    pub order_type: StopKind,
+    pub quantity: u64,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StopOrder {
+    pub id: OrderBookId,
+    pub side: Side,
+    pub stop_price: u64,
+    pub order_type: StopKind,
+    pub quantity: u64,
+    pub timestamp: u64,
 }

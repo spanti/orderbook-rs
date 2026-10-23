@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use crate::types::{OrderBookId, OrderRecord};
+use crate::types::{OrderBookId, OrderRecord, OrderStatus};
 
 /// Status and quantity record for every order the engine has accepted.
 #[derive(Debug, Default)]
@@ -55,6 +55,37 @@ impl OrderLedger {
     ) -> Option<&OrderRecord> {
         let record = self.records.get_mut(&order_id)?;
         record.mark_canceled(canceled_quantity);
+        Some(record)
+    }
+
+    pub(crate) fn insert_pending_stop(
+        &mut self,
+        order_id: OrderBookId,
+        symbol: String,
+        quantity: u64,
+    ) -> &OrderRecord {
+        let mut record = OrderRecord::new(symbol, quantity);
+        record.status = OrderStatus::PendingTrigger;
+        self.insert(order_id, record);
+        self.records
+            .get(&order_id)
+            .expect("pending stop record was just inserted")
+    }
+
+    pub(crate) fn begin_trigger(&mut self, order_id: OrderBookId) {
+        let record = self
+            .records
+            .get_mut(&order_id)
+            .expect("triggered stop has no ledger record");
+        debug_assert_eq!(record.status, OrderStatus::PendingTrigger);
+        debug_assert_eq!(record.filled_quantity, 0);
+    }
+
+    pub(crate) fn complete_taker(
+        &mut self, order_id: OrderBookId, remaining_quantity: u64, rests: bool,
+    ) -> Option<&OrderRecord> {
+        let record = self.records.get_mut(&order_id)?;
+        record.complete_taker(remaining_quantity, rests);
         Some(record)
     }
 

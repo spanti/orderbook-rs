@@ -1,16 +1,33 @@
-use std::collections::HashMap;
-
 use colored::Colorize;
-use rust_decimal::Decimal;
-use uuid::{Uuid, timestamp};
+
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::ledger::OrderLedger;
 use crate::orderbook::OrderBook;
 use crate::types::{
     BookSnapshot, CommandOutcome, EngineCommand, EngineConfig, EngineError, EngineEvent,
-    ExecutionReport, Fill, ModifyRequest, Order, OrderBookId, OrderRecord, OrderRequest, OrderType,
-    Side, TimeInForce, Trade,
+    ExecutionReport, Fill, ModifyRequest, Order, OrderBookId, OrderRecord, OrderRequest,
+    OrderStatus, OrderType, Side, StopKind, StopOrder, StopOrderRequest, TimeInForce, Trade,
 };
+
+#[derive(Debug, Clone, Copy)]
+struct LastTrade {
+    price: u64,
+    timestamp: u64,
+}
+
+#[derive(Debug, Default)]
+struct StopBook {
+    buy: BTreeSet<(u64, OrderBookId)>, // (stop_price, order_id)
+    sell: BTreeSet<(Reverse<u64>, OrderBookId)>, // (Reverse(stop_price), order_id)
+    orders: HashMap<OrderBookId, StopOrder>,
+}
+
+enum TakerRecord {
+    InsertNew,
+    ResumePendingStop,
+}
 
 // I want to implement a matching engine for the order book system
 // for educational purposes......
@@ -25,6 +42,8 @@ pub struct MatchingEngine {
     events: Vec<EngineEvent>,
     commands: Vec<EngineCommand>,
     next_sequence_id: u64,
+    stop_books: HashMap<String, StopBook>,
+    last_trades: HashMap<String, LastTrade>,
 }
 
 impl Default for MatchingEngine {
@@ -38,6 +57,8 @@ impl Default for MatchingEngine {
             next_order_id: 1,
             events: Vec::new(),
             commands: Vec::new(),
+            stop_books: HashMap::new(),
+            last_trades: HashMap::new(),
             next_sequence_id: 1,
         }
     }
@@ -54,6 +75,8 @@ impl MatchingEngine {
             next_order_id: 1,
             events: Vec::new(),
             commands: Vec::new(),
+            stop_books: HashMap::new(),
+            last_trades: HashMap::new(),
             next_sequence_id: 1,
         }
     }
@@ -89,7 +112,17 @@ impl MatchingEngine {
 
     /// Shared apply path for `execute` and replay. Never touches the log.
     fn apply(&mut self, command: &EngineCommand) -> CommandOutcome {
-        match command {
+        let symbol = match command {
+            EngineCommand::SubmitOrder { symbol, .. } => symbol,
+            EngineCommand::SubmitStopOrder { symbol, .. } => symbol,
+            EngineCommand::CancelOrder { symbol, .. } => symbol,
+            EngineCommand::ModifyOrder { symbol, .. } => symbol,
+        };
+
+        let outcome = match command {
+            EngineCommand::SubmitStopOrder { symbol, request } => {
+                self.apply_submit_stop(symbol, request)
+            }
             EngineCommand::SubmitOrder { symbol, request } => self.apply_submit(symbol, request),
             EngineCommand::CancelOrder { symbol, order_id } => {
                 self.apply_cancel_order(symbol, *order_id)
@@ -99,7 +132,101 @@ impl MatchingEngine {
                 order_id,
                 request,
             } => self.apply_modify_order(symbol, *order_id, request),
+        };
+
+        self.drain_triggered_stops(symbol);
+        outcome
+    }
+
+    fn drain_triggered_stops(&mut self, symbol: &str) {
+        loop {
+            let Some(last) = self.last_trades.get(symbol).copied() else {
+                return;
+            };
+            let Some(order_id) = self.next_triggered_stop(symbol, last.price) else {
+                return;
+            };
+            self.trigger_stop(symbol, order_id, last.price, last.timestamp);
         }
+    }
+
+    fn next_triggered_stop(&self, symbol: &str, last_price: u64) -> Option<OrderBookId> {
+        let book = self.stop_books.get(symbol)?;
+
+        // 买止损：stop_price <= last，价格升序 + id 升序
+        let buy = book
+            .buy
+            .range(..=(last_price, OrderBookId::MAX))
+            .next()
+            .map(|&(_, id)| id);
+
+        // 卖止损：stop_price >= last，即 Reverse(stop_price) <= Reverse(last)
+        // 升序遍历 = 价格降序 + id 升序
+        let sell = book
+            .sell
+            .range(..=(Reverse(last_price), OrderBookId::MAX))
+            .next()
+            .map(|&(_, id)| id);
+
+        match (buy, sell) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    fn trigger_stop(
+        &mut self,
+        symbol: &str,
+        order_id: OrderBookId,
+        last_price: u64,
+        last_timestamp: u64,
+    ) {
+        let stop = self
+            .remove_pending_stop(symbol, order_id)
+            .expect("stop index and order map diverged");
+
+        // StopTriggered event
+        let sequence_id = self.allocate_sequence_id();
+        self.events.push(EngineEvent::StopTriggered {
+            symbol: symbol.to_string(),
+            sequence_id,
+            order_id,
+            stop_price: stop.stop_price,
+            last_price,
+        });
+
+        let request = OrderRequest {
+            quantity: stop.quantity,
+            price: match stop.order_type {
+                StopKind::Market => 0,
+                StopKind::Limit { price } => price,
+            },
+            side: stop.side,
+            timestamp: last_timestamp,
+            post_only: false,
+            order_type: match stop.order_type {
+                StopKind::Market => OrderType::Market,
+                StopKind::Limit { .. } => OrderType::Limit,
+            },
+            time_in_force: match stop.order_type {
+                StopKind::Market => TimeInForce::IOC,
+                StopKind::Limit { .. } => TimeInForce::GTC,
+            },
+        };
+
+        let _report =
+            self.execute_taker(symbol, &request, order_id, TakerRecord::ResumePendingStop);
+    }
+
+    fn remove_pending_stop(&mut self, symbol: &str, order_id: OrderBookId) -> Option<StopOrder> {
+        let book = self.stop_books.get_mut(symbol)?;
+        let stop = book.orders.remove(&order_id)?;
+        let removed = match stop.side {
+            Side::Bid => book.buy.remove(&(stop.stop_price, order_id)),
+            Side::Ask => book.sell.remove(&(Reverse(stop.stop_price), order_id)),
+        };
+        debug_assert!(removed, "stop index missing entry for {order_id}");
+        Some(stop)
     }
 
     fn can_fill_completely(&self, symbol: &str, request: &OrderRequest) -> bool {
@@ -130,6 +257,18 @@ impl MatchingEngine {
 
         let order_id = self.next_order_id;
         self.next_order_id += 1;
+
+        let report = self.execute_taker(symbol, request, order_id, TakerRecord::InsertNew);
+        CommandOutcome::Accepted(report)
+    }
+
+    fn execute_taker(
+        &mut self,
+        symbol: &str,
+        request: &OrderRequest,
+        order_id: OrderBookId,
+        record: TakerRecord,
+    ) -> ExecutionReport {
         let order = request.to_order(order_id);
         let original_quantity = request.quantity;
         let timestamp = request.timestamp;
@@ -144,24 +283,36 @@ impl MatchingEngine {
 
         let fills = self.record_fills(symbol, timestamp, result.fills);
 
-        let report = self
-            .ledger
-            .insert_taker(
+        let report = match record {
+            TakerRecord::InsertNew => self.ledger.insert_taker(
                 order_id,
                 symbol_owned,
                 original_quantity,
                 result.remaining_quantity,
                 result.rested,
-            )
-            .to_report(order_id, fills);
+            ),
+            TakerRecord::ResumePendingStop => {
+                let pending = self
+                    .ledger
+                    .get(order_id)
+                    .expect("triggered stop has no ledger record");
+                debug_assert_eq!(pending.status, OrderStatus::PendingTrigger);
+                debug_assert_eq!(pending.original_quantity, original_quantity);
+
+                self.ledger.begin_trigger(order_id);
+                self.ledger
+                    .complete_taker(order_id, result.remaining_quantity, result.rested)
+                    .expect("triggered stop ledger record disappeared")
+            }
+        }
+        .to_report(order_id, fills);
 
         self.emit_accepted(report.clone());
         report
             .fills
             .iter()
             .for_each(|fill| self.emit_trade_executed(fill.clone()));
-
-        CommandOutcome::Accepted(report)
+        report
     }
 
     fn would_cross(&self, symbol: &str, request: &OrderRequest) -> bool {
@@ -175,9 +326,52 @@ impl MatchingEngine {
     }
 
     fn apply_cancel_order(&mut self, symbol: &str, order_id: OrderBookId) -> CommandOutcome {
+        let pending_stop = self
+            .ledger
+            .get(order_id)
+            .is_some_and(|r| r.symbol == symbol && r.status == OrderStatus::PendingTrigger);
+
+        if pending_stop {
+            let stop = self
+                .remove_pending_stop(symbol, order_id)
+                .expect("pending stop missing from stop store");
+            let report = self
+                .ledger
+                .mark_canceled(order_id, stop.quantity)
+                .expect("pending stop ledger record disappeared")
+                .to_report(order_id, Vec::new());
+            self.emit_order_canceled(report.clone());
+            return CommandOutcome::Canceled(report);
+        }
+
         match self.try_cancel_order(symbol, order_id) {
             Some(report) => CommandOutcome::Canceled(report),
             None => CommandOutcome::Rejected(EngineError::UnknownOrder),
+        }
+    }
+
+    /// 仅返回“待触发”的止损单；触发/撤销后返回 None。
+    pub fn stop_order(&self, order_id: OrderBookId) -> Option<&StopOrder> {
+        let record = self.ledger.get(order_id)?;
+        self.stop_books.get(&record.symbol)?.orders.get(&order_id)
+    }
+
+    /// 按侧返回：买侧触发价升序，卖侧触发价降序；同价按 order_id 升序。
+    pub fn stop_orders(&self, symbol: &str, side: Side) -> Vec<&StopOrder> {
+        let Some(book) = self.stop_books.get(symbol) else {
+            return Vec::new();
+        };
+        match side {
+            Side::Bid => book
+                .buy
+                .iter()
+                .filter_map(|&(_, id)| book.orders.get(&id))
+                .collect(),
+            Side::Ask => book
+                .sell
+                .iter()
+                .filter_map(|&(_, id)| book.orders.get(&id))
+                .collect(),
         }
     }
 
@@ -200,6 +394,64 @@ impl MatchingEngine {
         self.validate_price_on_tick(price)
     }
 
+    fn validate_stop(&self, symbol: &str, request: &StopOrderRequest) -> Result<(), EngineError> {
+        self.validate_quantity(request.quantity)?;
+        self.validate_price_on_tick(request.stop_price)?;
+        if let StopKind::Limit { price } = request.order_type {
+            self.validate_price_on_tick(price)?;
+        }
+
+        if let Some(last) = self.last_trades.get(symbol) {
+            let would_trigger = match request.side {
+                Side::Bid => request.stop_price <= last.price, // Q3 严格：必须 > last
+                Side::Ask => request.stop_price >= last.price, // 必须 < last
+            };
+            if would_trigger {
+                return Err(EngineError::StopPriceWouldTriggerImmediately);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn apply_submit_stop(&mut self, symbol: &str, request: &StopOrderRequest) -> CommandOutcome {
+        if let Err(err) = self.validate_stop(symbol, request) {
+            self.emit_order_rejected(err);
+            return CommandOutcome::Rejected(err);
+        }
+
+        let order_id = self.next_order_id;
+        self.next_order_id += 1;
+
+        let stop = StopOrder {
+            id: order_id,
+            side: request.side,
+            stop_price: request.stop_price,
+            order_type: request.order_type,
+            quantity: request.quantity,
+            timestamp: request.timestamp,
+        };
+
+        let book = self.stop_books.entry(symbol.to_string()).or_default();
+        match stop.side {
+            Side::Bid => {
+                book.buy.insert((stop.stop_price, order_id));
+            }
+            Side::Ask => {
+                book.sell.insert((Reverse(stop.stop_price), order_id));
+            }
+        }
+        book.orders.insert(order_id, stop);
+
+        let report = self
+            .ledger
+            .insert_pending_stop(order_id, symbol.to_string(), request.quantity)
+            .to_report(order_id, Vec::new());
+
+        self.emit_accepted(report.clone());
+        CommandOutcome::Accepted(report)
+    }
+
     fn apply_modify_order(
         &mut self,
         symbol: &str,
@@ -208,6 +460,14 @@ impl MatchingEngine {
     ) -> CommandOutcome {
         // 1. order must be limit + gtc, and need check validity of price and quantity
         if let Err(err) = self.validate_limit(request.price, request.quantity) {
+            self.emit_order_rejected(err);
+            return CommandOutcome::Rejected(err);
+        }
+
+        if self.ledger.get(order_id).is_some_and(|record| {
+            record.symbol == symbol && record.status == OrderStatus::PendingTrigger
+        }) {
+            let err = EngineError::StopOrderNotModifiable;
             self.emit_order_rejected(err);
             return CommandOutcome::Rejected(err);
         }
@@ -377,9 +637,20 @@ impl MatchingEngine {
             self.next_trade_id += 1;
 
             self.trades.push(trade.clone());
+            self.last_trades.insert(
+                symbol.to_string(),
+                LastTrade {
+                    price: trade.price,
+                    timestamp: trade.timestamp,
+                },
+            );
             record_trades.push(trade);
         });
         record_trades
+    }
+
+    pub fn last_trade_price(&self, symbol: &str) -> Option<u64> {
+        self.last_trades.get(symbol).map(|last| last.price)
     }
 
     pub fn events(&self) -> &[EngineEvent] {
@@ -891,7 +1162,8 @@ mod tests {
             EngineEvent::OrderAccepted { sequence_id, .. }
             | EngineEvent::TradeExecuted { sequence_id, .. }
             | EngineEvent::OrderCanceled { sequence_id, .. }
-            | EngineEvent::OrderRejected { sequence_id, .. } => *sequence_id,
+            | EngineEvent::OrderRejected { sequence_id, .. }
+            | EngineEvent::StopTriggered { sequence_id, .. } => *sequence_id,
         }
     }
 
