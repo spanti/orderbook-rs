@@ -17,9 +17,12 @@ struct LastTrade {
     timestamp: u64,
 }
 
-enum TakerRecord {
-    InsertNew,
-    ResumePendingStop,
+/// Where a taker order's id comes from: a fresh submission allocates one, a
+/// triggered stop resumes the id its pending record already owns.
+#[derive(Debug, Clone, Copy)]
+enum TakerOrigin {
+    Fresh,
+    Resume(OrderBookId),
 }
 
 // I want to implement a matching engine for the order book system
@@ -189,8 +192,12 @@ impl MatchingEngine {
             },
         };
 
-        let _report =
-            self.execute_taker(symbol, &request, order_id, TakerRecord::ResumePendingStop);
+        // The stop was validated when it was submitted, and the engine builds a
+        // valid market+IOC or limit+GTC request here, so a policy failure would
+        // be an internal invariant violation.
+        let _report = self
+            .intake(symbol, &request, TakerOrigin::Resume(order_id))
+            .expect("triggered stop failed taker policy after submission validation");
     }
 
     fn can_fill_completely(&self, symbol: &str, request: &OrderRequest) -> bool {
@@ -202,28 +209,52 @@ impl MatchingEngine {
     }
 
     fn apply_submit(&mut self, symbol: &str, request: &OrderRequest) -> CommandOutcome {
-        if let Err(err) = self.validate(request) {
-            self.emit_order_rejected(err);
-            return CommandOutcome::Rejected(err);
+        match self.intake(symbol, request, TakerOrigin::Fresh) {
+            Ok(report) => CommandOutcome::Accepted(report),
+            Err(err) => {
+                self.emit_order_rejected(err);
+                CommandOutcome::Rejected(err)
+            }
         }
+    }
+
+    /// The one entrance for taker orders. Policy checks run once, before any
+    /// id is allocated; fresh submissions then allocate an id, while a
+    /// triggered stop resumes the id its pending record already owns.
+    fn intake(
+        &mut self,
+        symbol: &str,
+        request: &OrderRequest,
+        origin: TakerOrigin,
+    ) -> Result<ExecutionReport, EngineError> {
+        self.check_taker_policy(symbol, request)?;
+
+        let order_id = match origin {
+            TakerOrigin::Fresh => {
+                let order_id = self.next_order_id;
+                self.next_order_id += 1;
+                order_id
+            }
+            TakerOrigin::Resume(order_id) => order_id,
+        };
+
+        Ok(self.execute_taker(symbol, request, order_id, origin))
+    }
+
+    /// Every rejection reason a taker can hit before it reaches the book, in
+    /// the order the outcome vocabulary has always reported them.
+    fn check_taker_policy(&self, symbol: &str, request: &OrderRequest) -> Result<(), EngineError> {
+        self.validate(request)?;
 
         if request.post_only && self.would_cross(symbol, request) {
-            let err = EngineError::PostOnlyWouldCross;
-            self.emit_order_rejected(err);
-            return CommandOutcome::Rejected(err);
+            return Err(EngineError::PostOnlyWouldCross);
         }
 
         if request.time_in_force == TimeInForce::FOK && !self.can_fill_completely(symbol, request) {
-            let err = EngineError::InsufficientLiquidity;
-            self.emit_order_rejected(err);
-            return CommandOutcome::Rejected(err);
+            return Err(EngineError::InsufficientLiquidity);
         }
 
-        let order_id = self.next_order_id;
-        self.next_order_id += 1;
-
-        let report = self.execute_taker(symbol, request, order_id, TakerRecord::InsertNew);
-        CommandOutcome::Accepted(report)
+        Ok(())
     }
 
     fn execute_taker(
@@ -231,7 +262,7 @@ impl MatchingEngine {
         symbol: &str,
         request: &OrderRequest,
         order_id: OrderBookId,
-        record: TakerRecord,
+        origin: TakerOrigin,
     ) -> ExecutionReport {
         let order = request.to_order(order_id);
         let original_quantity = request.quantity;
@@ -247,15 +278,16 @@ impl MatchingEngine {
 
         let fills = self.record_fills(symbol, timestamp, result.fills);
 
-        let report = match record {
-            TakerRecord::InsertNew => self.ledger.insert_taker(
+        let report = match origin {
+            TakerOrigin::Fresh => self.ledger.insert_taker(
                 order_id,
                 symbol_owned,
                 original_quantity,
                 result.remaining_quantity,
                 result.rested,
             ),
-            TakerRecord::ResumePendingStop => {
+            TakerOrigin::Resume(stop_id) => {
+                debug_assert_eq!(stop_id, order_id);
                 let pending = self
                     .ledger
                     .get(order_id)
@@ -263,9 +295,8 @@ impl MatchingEngine {
                 debug_assert_eq!(pending.status, OrderStatus::PendingTrigger);
                 debug_assert_eq!(pending.original_quantity, original_quantity);
 
-                self.ledger.begin_trigger(order_id);
                 self.ledger
-                    .complete_taker(order_id, result.remaining_quantity, result.rested)
+                    .resume_stop(order_id, result.remaining_quantity, result.rested)
                     .expect("triggered stop ledger record disappeared")
             }
         }

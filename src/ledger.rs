@@ -72,19 +72,17 @@ impl OrderLedger {
             .expect("pending stop record was just inserted")
     }
 
-    pub(crate) fn begin_trigger(&mut self, order_id: OrderBookId) {
-        let record = self
-            .records
-            .get_mut(&order_id)
-            .expect("triggered stop has no ledger record");
-        debug_assert_eq!(record.status, OrderStatus::PendingTrigger);
-        debug_assert_eq!(record.filled_quantity, 0);
-    }
-
-    pub(crate) fn complete_taker(
-        &mut self, order_id: OrderBookId, remaining_quantity: u64, rests: bool,
+    /// Resume a triggered stop's pending record and record its match result in
+    /// one step. Returns `None` if the record is missing.
+    pub(crate) fn resume_stop(
+        &mut self,
+        order_id: OrderBookId,
+        remaining_quantity: u64,
+        rests: bool,
     ) -> Option<&OrderRecord> {
         let record = self.records.get_mut(&order_id)?;
+        debug_assert_eq!(record.status, OrderStatus::PendingTrigger);
+        debug_assert_eq!(record.filled_quantity, 0);
         record.complete_taker(remaining_quantity, rests);
         Some(record)
     }
@@ -105,5 +103,68 @@ impl OrderLedger {
 
     pub(crate) fn len(&self) -> usize {
         self.records.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending_ledger(order_id: OrderBookId, quantity: u64) -> OrderLedger {
+        let mut ledger = OrderLedger::default();
+        ledger.insert_pending_stop(order_id, "BTC-USDT".to_string(), quantity);
+        ledger
+    }
+
+    fn resume(
+        ledger: &mut OrderLedger,
+        order_id: OrderBookId,
+        remaining_quantity: u64,
+        rests: bool,
+    ) -> OrderRecord {
+        ledger
+            .resume_stop(order_id, remaining_quantity, rests)
+            .expect("pending stop record is present")
+            .clone()
+    }
+
+    #[test]
+    fn resume_stop_marks_a_full_fill_filled() {
+        let mut ledger = pending_ledger(1, 5);
+
+        let record = resume(&mut ledger, 1, 0, false);
+
+        assert_eq!(record.status, OrderStatus::Filled);
+        assert_eq!(record.filled_quantity, 5);
+        assert_eq!(record.remaining_quantity, 0);
+    }
+
+    #[test]
+    fn resume_stop_with_resting_remainder_is_new() {
+        let mut ledger = pending_ledger(1, 5);
+
+        let record = resume(&mut ledger, 1, 5, true);
+
+        assert_eq!(record.status, OrderStatus::New);
+        assert_eq!(record.filled_quantity, 0);
+        assert_eq!(record.remaining_quantity, 5);
+    }
+
+    #[test]
+    fn resume_stop_with_discarded_remainder_is_canceled() {
+        let mut ledger = pending_ledger(1, 5);
+
+        let record = resume(&mut ledger, 1, 3, false);
+
+        assert_eq!(record.status, OrderStatus::Canceled);
+        assert_eq!(record.filled_quantity, 2);
+        assert_eq!(record.remaining_quantity, 3);
+    }
+
+    #[test]
+    fn resume_stop_returns_none_for_an_unknown_record() {
+        let mut ledger = OrderLedger::default();
+
+        assert!(ledger.resume_stop(42, 0, false).is_none());
     }
 }
