@@ -4,110 +4,11 @@ use colored::Colorize;
 use rust_decimal::Decimal;
 use uuid::{Uuid, timestamp};
 
-use crate::orderbook::{Fill, Order, OrderBook, OrderBookId, OrderType, Side, Trade};
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct OrderRequest {
-    // TODO: add symbol
-    pub side: Side,
-    pub price: u64,
-    pub quantity: u64,
-    pub timestamp: u64,
-    pub order_type: OrderType,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OrderStatus {
-    New,             // 未成交，挂在簿上
-    PartiallyFilled, // 部分成交，剩余挂在簿上
-    Filled,          // 全部成交
-    Canceled,        // 未成交或剩余部分被丢弃（市价单/IOC）
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct OrderRecord {
-    pub symbol: String,
-    pub status: OrderStatus,
-    pub original_quantity: u64,
-    pub filled_quantity: u64,
-    pub remaining_quantity: u64,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ExecutionReport {
-    pub order_id: u64,
-    pub symbol: String,
-    pub status: OrderStatus,
-    pub original_quantity: u64,
-    pub filled_quantity: u64,
-    pub remaining_quantity: u64,
-    pub fills: Vec<Trade>,
-}
-
-#[derive(Debug, Clone)]
-pub struct CancelReport {
-    pub order_id: OrderBookId,
-    pub symbol: String,
-    pub canceled_quantity: u64, // 撤单时的剩余量
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct EngineConfig {
-    pub min_order_quantity: u64,
-    pub max_order_quantity: u64,
-    pub tick_size: u64,
-}
-
-impl Default for EngineConfig {
-    fn default() -> Self {
-        Self {
-            min_order_quantity: 1,
-            max_order_quantity: u64::MAX,
-            tick_size: 1,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EngineError {
-    QuantityOutOfRange,
-    PriceNotOnTick,
-    WrongOrderType,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum EngineCommand {
-    SubmitOrder {
-        symbol: String,
-        request: OrderRequest,
-        order_type: OrderType,
-    },
-    CancelOrder {
-        symbol: String,
-        order_id: OrderBookId,
-    },
-}
-
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum EngineEvent {
-    OrderAccepted{
-        sequence_id: u64,
-        report: ExecutionReport
-    },
-    TradeExecuted{
-        sequence_id: u64,
-        trade: Trade
-    },
-    OrderCanceled{
-        sequence_id: u64,
-        report: ExecutionReport
-    },
-    OrderRejected{
-        sequence_id: u64,
-        reason: EngineError
-    }
-}
+use crate::orderbook::OrderBook;
+use crate::types::{
+    EngineCommand, EngineConfig, EngineError, EngineEvent, ExecutionReport, Fill, Order,
+    OrderBookId, OrderRecord, OrderRequest, OrderStatus, OrderType, Side, Trade,
+};
 
 // I want to implement a matching engine for the order book system
 // for educational purposes......

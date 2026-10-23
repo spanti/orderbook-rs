@@ -1,4 +1,5 @@
-use orderbook_rs::orderbook::{Order, OrderBook, OrderType, Side};
+use orderbook_rs::orderbook::OrderBook;
+use orderbook_rs::types::{Order, OrderType, Side};
 
 fn main() {
     let mut book = OrderBook::new();
