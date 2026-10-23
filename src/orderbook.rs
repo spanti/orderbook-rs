@@ -25,7 +25,7 @@ impl Side {
 }
 
 // Structure representing an order in the OrderBook
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Order {
     pub id: OrderBookId,
     pub side: Side,
@@ -66,7 +66,7 @@ pub struct SubmitResult {
     pub fills: Vec<Fill>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Trade {
     pub id: u64,
     pub symbol: String,
@@ -79,7 +79,7 @@ pub struct Trade {
 }
 
 /// Orders at a single price level in the OrderBook
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PriceLevel {
     pub price: u64,              // Price level in ticks (smallest price increment)
     pub orders: VecDeque<Order>, // Orders at this price level in the OrderBook
@@ -138,6 +138,7 @@ impl PriceLevel {
     }
 }
 // One side of the OrderBook (either Bid or Ask)
+#[derive(Debug, Clone, PartialEq)]
 pub struct BookSide {
     pub side: Side,
     pub price_levels: BTreeMap<u64, PriceLevel>, // Price levels in the OrderBook side
@@ -151,6 +152,15 @@ impl BookSide {
             price_levels: BTreeMap::new(),
             order_map: HashMap::new(),
         }
+    }
+
+    pub fn depth(&self, level: usize) -> Option<(u64, u64)> {
+        // Bid 侧从最高价开始，Ask 侧从最低价开始
+        let (price, price_level) = match self.side {
+            Side::Bid => self.price_levels.iter().rev().nth(level)?,
+            Side::Ask => self.price_levels.iter().nth(level)?,
+        };
+        Some((*price, price_level.total_volume()))
     }
 
     // Get best price level (highest for Bid side, lowest for Ask side)
@@ -224,6 +234,7 @@ impl BookSide {
 }
 
 // Structure representing the full OrderBook with both Bid and Ask sides
+#[derive(Debug, Clone, PartialEq)]
 pub struct OrderBook {
     bids: BookSide,
     asks: BookSide,
@@ -235,6 +246,22 @@ impl OrderBook {
             bids: BookSide::new(Side::Bid),
             asks: BookSide::new(Side::Ask),
         }
+    }
+
+    pub fn best_bid(&self) -> Option<u64> {
+        self.bids.best_price_level()
+    }
+
+    pub fn best_ask(&self) -> Option<u64> {
+        self.asks.best_price_level()
+    }
+
+    pub fn depth(&self, side: Side, level: usize) -> Option<(u64, u64)> {
+        let book_side = match side {
+            Side::Bid => &self.bids,
+            Side::Ask => &self.asks,
+        };
+        book_side.depth(level)
     }
 
     // submit a new limit order; returns remaining quantity if not fully filled
@@ -356,6 +383,82 @@ mod tests {
     fn side_opposite_flips() {
         assert_eq!(Side::Bid.opposite(), Side::Ask);
         assert_eq!(Side::Ask.opposite(), Side::Bid);
+    }
+
+    #[test]
+    fn best_bid_and_ask_are_none_on_empty_book() {
+        let book = OrderBook::new();
+
+        assert_eq!(book.best_bid(), None);
+        assert_eq!(book.best_ask(), None);
+        assert_eq!(book.depth(Side::Bid, 0), None);
+        assert_eq!(book.depth(Side::Ask, 0), None);
+    }
+
+    #[test]
+    fn best_bid_and_ask_follow_price_priority() {
+        let mut book = OrderBook::new();
+        book.submit_limit_order(limit(1, Side::Bid, 99, 1));
+        book.submit_limit_order(limit(2, Side::Bid, 101, 2));
+        book.submit_limit_order(limit(3, Side::Ask, 105, 3));
+        book.submit_limit_order(limit(4, Side::Ask, 103, 4));
+
+        assert_eq!(book.best_bid(), Some(101));
+        assert_eq!(book.best_ask(), Some(103));
+    }
+
+    #[test]
+    fn depth_returns_levels_in_price_priority() {
+        let mut book = OrderBook::new();
+        book.submit_limit_order(limit(1, Side::Bid, 99, 1));
+        book.submit_limit_order(limit(2, Side::Bid, 101, 2));
+        book.submit_limit_order(limit(3, Side::Bid, 100, 3));
+        book.submit_limit_order(limit(4, Side::Ask, 105, 4));
+        book.submit_limit_order(limit(5, Side::Ask, 103, 5));
+        book.submit_limit_order(limit(6, Side::Ask, 104, 6));
+
+        // Bid: 从最高价开始
+        assert_eq!(book.depth(Side::Bid, 0), Some((101, 2)));
+        assert_eq!(book.depth(Side::Bid, 1), Some((100, 3)));
+        assert_eq!(book.depth(Side::Bid, 2), Some((99, 1)));
+        assert_eq!(book.depth(Side::Bid, 3), None);
+
+        // Ask: 从最低价开始
+        assert_eq!(book.depth(Side::Ask, 0), Some((103, 5)));
+        assert_eq!(book.depth(Side::Ask, 1), Some((104, 6)));
+        assert_eq!(book.depth(Side::Ask, 2), Some((105, 4)));
+        assert_eq!(book.depth(Side::Ask, 3), None);
+    }
+
+    #[test]
+    fn depth_aggregates_orders_at_same_price() {
+        let mut book = OrderBook::new();
+        book.submit_limit_order(limit(1, Side::Bid, 100, 2));
+        book.submit_limit_order(limit(2, Side::Bid, 100, 3));
+
+        assert_eq!(book.depth(Side::Bid, 0), Some((100, 5)));
+        assert_eq!(book.depth(Side::Bid, 1), None);
+    }
+
+    #[test]
+    fn depth_reflects_fills_and_cancellations() {
+        let mut book = OrderBook::new();
+        book.submit_limit_order(limit(1, Side::Ask, 100, 5));
+        book.submit_limit_order(limit(2, Side::Ask, 101, 2));
+
+        // 部分成交后，100 档剩余 2
+        book.submit_limit_order(limit(3, Side::Bid, 100, 3));
+        assert_eq!(book.depth(Side::Ask, 0), Some((100, 2)));
+
+        // 撤掉 100 档剩余后，最优卖价变为 101
+        assert!(book.cancel_limit_order(1).is_some());
+        assert_eq!(book.depth(Side::Ask, 0), Some((101, 2)));
+        assert_eq!(book.depth(Side::Ask, 1), None);
+
+        // 市价单吃光后，深度为空
+        book.submit_market_order(market(4, Side::Bid, 2));
+        assert_eq!(book.best_ask(), None);
+        assert_eq!(book.depth(Side::Ask, 0), None);
     }
 
     #[test]
