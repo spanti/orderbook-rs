@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use crate::engine::MatchingEngine;
 use crate::orderbook::OrderBook;
 use crate::types::{
-    EngineConfig, EngineError, ExecutionReport, OrderRequest, OrderType, Side, TimeInForce,
+    CommandOutcome, EngineCommand, EngineConfig, OrderRequest, OrderType, Side, TimeInForce,
 };
 
 use super::config::{BenchConfig, BenchError};
@@ -29,13 +29,13 @@ pub fn run(config: &BenchConfig) -> Result<BenchReport, BenchError> {
     for index in 0..config.warmup {
         let action =
             workload.next_action(|symbol_index| book_prices(&engine, &symbols, symbol_index));
-        let prepared = PreparedCommand::from_action(&action);
+        let command = command_from_action(&action, &symbols);
         if config.rate > 0 {
             pace(intended_time(warmup_start, index, config.rate));
         }
-        let executed = execute(&mut engine, &symbols, &prepared);
-        std::hint::black_box(&executed);
-        record_workload(&mut workload, &action, executed);
+        let outcome = engine.execute(command);
+        std::hint::black_box(&outcome);
+        record_workload(&mut workload, &action, outcome);
     }
 
     let mut total_all = Samples::default();
@@ -57,7 +57,7 @@ pub fn run(config: &BenchConfig) -> Result<BenchReport, BenchError> {
     for index in 0..config.events {
         let action =
             workload.next_action(|symbol_index| book_prices(&engine, &symbols, symbol_index));
-        let prepared = PreparedCommand::from_action(&action);
+        let command = command_from_action(&action, &symbols);
         let intended = if config.rate > 0 {
             Some(intended_time(measured_start, index, config.rate))
         } else {
@@ -68,9 +68,9 @@ pub fn run(config: &BenchConfig) -> Result<BenchReport, BenchError> {
         }
 
         let send = Instant::now();
-        let executed = execute(&mut engine, &symbols, &prepared);
+        let outcome = engine.execute(command);
         let done = Instant::now();
-        std::hint::black_box(&executed);
+        std::hint::black_box(&outcome);
 
         let service = ns_between(send, done);
         let (total, send_lag) = match intended {
@@ -96,7 +96,7 @@ pub fn run(config: &BenchConfig) -> Result<BenchReport, BenchError> {
             }
         }
 
-        record_workload(&mut workload, &action, executed);
+        record_workload(&mut workload, &action, outcome);
     }
 
     let wall_time_ns = duration_ns(measured_start.elapsed());
@@ -144,89 +144,58 @@ pub fn run(config: &BenchConfig) -> Result<BenchReport, BenchError> {
     })
 }
 
-enum PreparedCommand {
-    Limit {
-        symbol_index: usize,
-        request: OrderRequest,
-    },
-    Market {
-        symbol_index: usize,
-        request: OrderRequest,
-    },
-    Cancel {
-        symbol_index: usize,
-        order_id: u64,
-    },
+/// Adapt a workload action into the engine's command vocabulary.
+///
+/// Cancel actions carry placeholder side/price/quantity; those are ignored.
+/// Submit actions set the same order type and time-in-force the old mapping
+/// used: Limit+GTC, Market+IOC, never post-only.
+fn command_from_action(action: &Action, symbols: &[String]) -> EngineCommand {
+    let symbol = symbols[action.symbol_index].clone();
+    match action.kind {
+        CommandKind::Limit => EngineCommand::SubmitOrder {
+            symbol,
+            request: OrderRequest {
+                side: action.side,
+                price: action.price,
+                quantity: action.quantity,
+                timestamp: action.timestamp,
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::GTC,
+                post_only: false,
+            },
+        },
+        CommandKind::Market => EngineCommand::SubmitOrder {
+            symbol,
+            request: OrderRequest {
+                side: action.side,
+                price: action.price,
+                quantity: action.quantity,
+                timestamp: action.timestamp,
+                order_type: OrderType::Market,
+                time_in_force: TimeInForce::IOC,
+                post_only: false,
+            },
+        },
+        CommandKind::Cancel => EngineCommand::CancelOrder {
+            symbol,
+            order_id: action
+                .target_order_id
+                .expect("cancel actions carry a target order id"),
+        },
+    }
 }
 
-impl PreparedCommand {
-    fn from_action(action: &Action) -> Self {
-        let request = OrderRequest {
-            side: action.side,
-            price: action.price,
-            quantity: action.quantity,
-            timestamp: action.timestamp,
-            order_type: match action.kind {
-                CommandKind::Limit => OrderType::Limit,
-                CommandKind::Market => OrderType::Market,
-                CommandKind::Cancel => OrderType::Limit,
-            },
-            time_in_force: match action.kind {
-                CommandKind::Market => TimeInForce::IOC,
-                _ => TimeInForce::GTC,
-            },
-            post_only: false,
-        };
-
-        match action.kind {
-            CommandKind::Limit => Self::Limit {
-                symbol_index: action.symbol_index,
-                request,
-            },
-            CommandKind::Market => Self::Market {
-                symbol_index: action.symbol_index,
-                request,
-            },
-            CommandKind::Cancel => Self::Cancel {
-                symbol_index: action.symbol_index,
-                order_id: action
-                    .target_order_id
-                    .expect("cancel actions carry a target order id"),
-            },
+fn record_workload(workload: &mut Workload, action: &Action, outcome: CommandOutcome) {
+    match outcome {
+        CommandOutcome::Accepted(report) => workload.on_submit_result(action, &Ok(report)),
+        CommandOutcome::Canceled(report) => workload.on_cancel_result(action, Some(&report)),
+        CommandOutcome::Rejected(reason) => {
+            if action.kind == CommandKind::Cancel {
+                workload.on_cancel_result(action, None);
+            } else {
+                workload.on_submit_result(action, &Err(reason));
+            }
         }
-    }
-}
-
-enum Executed {
-    Submit(Result<ExecutionReport, EngineError>),
-    Cancel(Option<ExecutionReport>),
-}
-
-fn execute(
-    engine: &mut MatchingEngine,
-    symbols: &[String],
-    prepared: &PreparedCommand,
-) -> Executed {
-    match prepared {
-        PreparedCommand::Limit {
-            symbol_index,
-            request,
-        } => Executed::Submit(engine.submit_limit_order(&symbols[*symbol_index], *request)),
-        PreparedCommand::Market {
-            symbol_index,
-            request,
-        } => Executed::Submit(engine.submit_market_order(&symbols[*symbol_index], *request)),
-        PreparedCommand::Cancel {
-            symbol_index,
-            order_id,
-        } => Executed::Cancel(engine.cancel_order(&symbols[*symbol_index], *order_id)),
-    }
-}
-
-fn record_workload(workload: &mut Workload, action: &Action, executed: Executed) {
-    match executed {
-        Executed::Submit(result) => workload.on_submit_result(action, &result),
-        Executed::Cancel(report) => workload.on_cancel_result(action, report.as_ref()),
     }
 }
 

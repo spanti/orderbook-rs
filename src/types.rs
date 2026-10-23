@@ -174,23 +174,33 @@ impl Default for EngineConfig {
 pub enum EngineError {
     QuantityOutOfRange,
     PriceNotOnTick,
-    WrongOrderType,
+    UnknownOrder,
     InvalidTimeInForce,
     PostOnlyWouldCross,
     InsufficientLiquidity,
 }
 
+/// The engine's submission vocabulary: every state change enters through a
+/// command. Order type and time-in-force travel inside `request`, so a command
+/// cannot disagree with the engine method it is sent to.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EngineCommand {
     SubmitOrder {
         symbol: String,
         request: OrderRequest,
-        order_type: OrderType,
     },
     CancelOrder {
         symbol: String,
         order_id: OrderBookId,
     },
+}
+
+/// What [`crate::engine::MatchingEngine::execute`] did with a command.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CommandOutcome {
+    Accepted(ExecutionReport),
+    Canceled(ExecutionReport),
+    Rejected(EngineError),
 }
 
 #[derive(Debug, Clone, PartialEq)]

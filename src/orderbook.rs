@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::ops::Bound;
 
 use crate::types::{Fill, MatchOutcome, Order, OrderBookId, OrderType, Side, SubmitResult};
 
@@ -79,22 +80,61 @@ impl PriceLevel {
     }
 }
 
-// 按价格优先顺序累加可成交档位的数量，遇到第一档不可成交价格即停止
-fn sum_matchable_quantity<'a>(
-    levels: impl Iterator<Item = (&'a u64, &'a PriceLevel)>,
-    order: &Order,
-) -> u64 {
-    let mut available = 0u64;
-    for (price, level) in levels {
-        if !order.matches_price(*price) {
-            break;
-        }
-        available = available.saturating_add(level.total_quantity);
-        if available >= order.quantity {
-            break;
+/// Cursor over the price levels on one book side that an incoming order can
+/// match, visited in price-priority order.
+///
+/// This is the single definition of the matchable-level walk shared by the
+/// read-only liquidity probe ([`BookSide::available_quantity`]) and the
+/// mutating matcher ([`BookSide::match_order`]):
+///
+/// * a limit bid can match asks priced at or below its limit, a limit ask can
+///   match bids priced at or above its limit, and a market order matches every
+///   level (the same prices accepted by [`Order::matches_price`]);
+/// * bids are visited best first (highest price), asks best first (lowest
+///   price);
+/// * the walk ends when the eligible price range is exhausted.
+///
+/// The cursor yields prices rather than level references, so the matcher can
+/// take a mutable borrow of a level between two steps without cloning the book.
+#[derive(Debug, Clone, Copy)]
+struct MatchWalk {
+    /// Resting side whose levels are being walked; decides the direction.
+    side: Side,
+    /// Inclusive lower bound of the eligible price range.
+    start: Bound<u64>,
+    /// Inclusive upper bound of the eligible price range.
+    end: Bound<u64>,
+}
+
+impl MatchWalk {
+    fn new(side: Side, order: &Order) -> Self {
+        let (start, end) = match (side, order.order_type) {
+            (_, OrderType::Market) => (Bound::Unbounded, Bound::Unbounded),
+            // Incoming ask: resting bids at or above its limit are eligible.
+            (Side::Bid, OrderType::Limit) => (Bound::Included(order.price), Bound::Unbounded),
+            // Incoming bid: resting asks at or below its limit are eligible.
+            (Side::Ask, OrderType::Limit) => (Bound::Unbounded, Bound::Included(order.price)),
+        };
+
+        Self { side, start, end }
+    }
+
+    /// Next price to visit, or `None` once the eligible range is exhausted.
+    fn next_price(&self, levels: &BTreeMap<u64, PriceLevel>) -> Option<u64> {
+        let next = match self.side {
+            Side::Bid => levels.range((self.start, self.end)).next_back(),
+            Side::Ask => levels.range((self.start, self.end)).next(),
+        };
+        next.map(|(price, _)| *price)
+    }
+
+    /// Move the cursor past `price` so the next step visits another level.
+    fn advance_past(&mut self, price: u64) {
+        match self.side {
+            Side::Bid => self.end = Bound::Excluded(price),
+            Side::Ask => self.start = Bound::Excluded(price),
         }
     }
-    available
 }
 
 // One side of the OrderBook (either Bid or Ask)
@@ -115,10 +155,20 @@ impl BookSide {
     }
 
     pub fn available_quantity(&self, order: &Order) -> u64 {
-        match self.side {
-            Side::Bid => sum_matchable_quantity(self.price_levels.iter().rev(), order),
-            Side::Ask => sum_matchable_quantity(self.price_levels.iter(), order),
+        let mut walk = MatchWalk::new(self.side, order);
+        let mut available = 0u64;
+
+        while let Some(price) = walk.next_price(&self.price_levels) {
+            available = available.saturating_add(self.price_levels[&price].total_quantity);
+            walk.advance_past(price);
+
+            // Liquidity beyond the requested quantity cannot change the answer.
+            if available >= order.quantity {
+                break;
+            }
         }
+
+        available
     }
 
     pub fn snapshot(&self, depth: usize) -> Vec<(u64, u64)> {
@@ -189,28 +239,27 @@ impl BookSide {
     // match order
     pub fn match_order(&mut self, order: &mut Order) -> Vec<Fill> {
         let mut filled = Vec::new();
+        let mut walk = MatchWalk::new(self.side, order);
 
         while order.quantity > 0 {
-            // Peek best opposite price
-            let Some(best_price) = self.best_price_level() else {
+            // The walk only yields prices the incoming order is allowed to match.
+            let Some(price) = walk.next_price(&self.price_levels) else {
                 break;
             };
-            
-            // Check if the best price is matchable
-            if !order.matches_price(best_price) {
-                break;
-            }
 
-            let Some(level) = self.price_levels.get_mut(&best_price) else {
+            let Some(level) = self.price_levels.get_mut(&price) else {
                 break;
             };
 
             // Match the order with the best price level on the other side
             let outcome = level.match_order(order);
-            outcome.filled_order_ids.iter().for_each(|id| { self.order_map.remove(id); });
+            outcome.filled_order_ids.iter().for_each(|id| {
+                self.order_map.remove(id);
+            });
             filled.extend(outcome.fills);
-            
-            self.remove_level_if_empty(best_price);
+
+            self.remove_level_if_empty(price);
+            walk.advance_past(price);
         }
         filled
     }
@@ -599,6 +648,111 @@ mod tests {
         assert!(!book.can_fill_completely(&limit(6, Side::Bid, 100, 3)));
         assert!(book.can_fill_completely(&market(7, Side::Bid, 5)));
         assert!(!book.can_fill_completely(&market(8, Side::Bid, 6)));
+    }
+
+    /// Drive the shared walk to exhaustion and check it visited exactly the
+    /// levels `Order::matches_price` accepts, in price-priority order.
+    fn walk_prices(book_side: &BookSide, order: &Order) -> Vec<u64> {
+        let mut walk = MatchWalk::new(book_side.side, order);
+        let mut visited = Vec::new();
+        while let Some(price) = walk.next_price(&book_side.price_levels) {
+            assert!(
+                order.matches_price(price),
+                "walk visited non-matchable price {price} for {order:?}"
+            );
+            visited.push(price);
+            walk.advance_past(price);
+        }
+
+        let expected: Vec<u64> = match book_side.side {
+            Side::Bid => book_side
+                .price_levels
+                .keys()
+                .rev()
+                .copied()
+                .filter(|price| order.matches_price(*price))
+                .collect(),
+            Side::Ask => book_side
+                .price_levels
+                .keys()
+                .copied()
+                .filter(|price| order.matches_price(*price))
+                .collect(),
+        };
+        assert_eq!(visited, expected, "walk diverged for {order:?}");
+        visited
+    }
+
+    #[test]
+    fn match_walk_visits_exactly_the_prices_matches_price_accepts() {
+        let mut asks = OrderBook::new();
+        for (id, price) in [99u64, 100, 101, 102].into_iter().enumerate() {
+            asks.submit_limit_order(limit(id as u64 + 1, Side::Ask, price, 1));
+        }
+
+        // Ask side: eligible asks are <= the incoming bid's limit, lowest first.
+        assert_eq!(
+            walk_prices(&asks.asks, &limit(10, Side::Bid, 100, 10)),
+            vec![99, 100]
+        );
+        assert_eq!(
+            walk_prices(&asks.asks, &limit(11, Side::Bid, 98, 10)),
+            Vec::<u64>::new()
+        );
+        assert_eq!(
+            walk_prices(&asks.asks, &market(15, Side::Bid, 10)),
+            vec![99, 100, 101, 102]
+        );
+
+        let mut bids = OrderBook::new();
+        for (id, price) in [98u64, 99, 100, 101].into_iter().enumerate() {
+            bids.submit_limit_order(limit(id as u64 + 20, Side::Bid, price, 1));
+        }
+
+        // Bid side: eligible bids are >= the incoming ask's limit, highest first.
+        assert_eq!(
+            walk_prices(&bids.bids, &limit(12, Side::Ask, 100, 10)),
+            vec![101, 100]
+        );
+        assert_eq!(
+            walk_prices(&bids.bids, &limit(13, Side::Ask, 102, 10)),
+            Vec::<u64>::new()
+        );
+        assert_eq!(
+            walk_prices(&bids.bids, &market(14, Side::Ask, 10)),
+            vec![101, 100, 99, 98]
+        );
+    }
+
+    #[test]
+    fn can_fill_completely_counts_partially_filled_maker_at_last_crossing_level() {
+        let mut book = OrderBook::new();
+        book.submit_limit_order(limit(1, Side::Ask, 100, 5));
+        book.submit_limit_order(limit(2, Side::Ask, 101, 2));
+
+        // Partially fill the 100 level: maker 1 stays at the front with 2 left.
+        book.submit_limit_order(limit(3, Side::Bid, 100, 3));
+        assert_eq!(order_ids_at(&book, Side::Ask, 100), vec![1]);
+        assert_eq!(level_volume(&book, Side::Ask, 100), 2);
+
+        // 2 left at 100 + 2 at 101: enough for 4, not for 5.
+        assert!(book.can_fill_completely(&limit(4, Side::Bid, 101, 4)));
+        assert!(!book.can_fill_completely(&limit(5, Side::Bid, 101, 5)));
+        // The limit price still excludes 101 when bidding 100.
+        assert!(!book.can_fill_completely(&limit(6, Side::Bid, 100, 3)));
+
+        // The matcher agrees with the probe at the boundary.
+        let result = book.execute_limit_order(limit(7, Side::Bid, 101, 4), false);
+        assert_eq!(result.remaining_quantity, 0);
+        assert_eq!(
+            result
+                .fills
+                .iter()
+                .map(|fill| (fill.price, fill.quantity))
+                .collect::<Vec<_>>(),
+            vec![(100, 2), (101, 2)]
+        );
+        assert!(book.asks.price_levels.is_empty());
     }
 
     fn dry_run_fills_completely(book: &OrderBook, order: &Order) -> bool {
