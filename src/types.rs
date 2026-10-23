@@ -1,5 +1,13 @@
 //! Shared data types for the order book and matching engine.
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimeInForce {
+    #[default]
+    GTC,
+    IOC,
+    FOK,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderType {
     Limit,
@@ -87,6 +95,8 @@ pub struct OrderRequest {
     pub quantity: u64,
     pub timestamp: u64,
     pub order_type: OrderType,
+    pub time_in_force: TimeInForce,
+    pub post_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +156,9 @@ pub enum EngineError {
     QuantityOutOfRange,
     PriceNotOnTick,
     WrongOrderType,
+    InvalidTimeInForce,
+    PostOnlyWouldCross,
+    InsufficientLiquidity,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -179,4 +192,23 @@ pub enum EngineEvent {
         sequence_id: u64,
         reason: EngineError,
     },
+}
+
+impl EngineEvent {
+    pub fn sequence_id(&self) -> u64 {
+        match self {
+            EngineEvent::OrderAccepted { sequence_id, .. } => *sequence_id,
+            EngineEvent::TradeExecuted { sequence_id, .. } => *sequence_id,
+            EngineEvent::OrderCanceled { sequence_id, .. } => *sequence_id,
+            EngineEvent::OrderRejected { sequence_id, .. } => *sequence_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BookSnapshot {
+    pub symbol: String,
+    pub sequence: u64,
+    pub bids: Vec<(u64, u64)>, // (price, quantity)，从高到低
+    pub asks: Vec<(u64, u64)>, // (price, quantity)，从低到高
 }

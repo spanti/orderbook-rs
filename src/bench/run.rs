@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 
 use crate::engine::MatchingEngine;
 use crate::orderbook::OrderBook;
-use crate::types::{EngineConfig, EngineError, ExecutionReport, OrderRequest, OrderType, Side};
+use crate::types::{
+    EngineConfig, EngineError, ExecutionReport, OrderRequest, OrderType, Side, TimeInForce,
+};
 
 use super::config::{BenchConfig, BenchError};
 use super::report::{BenchReport, CategoryStats, DepthLevels, EnvInfo, LatencyReport, RunStats};
@@ -169,6 +171,11 @@ impl PreparedCommand {
                 CommandKind::Market => OrderType::Market,
                 CommandKind::Cancel => OrderType::Limit,
             },
+            time_in_force: match action.kind {
+                CommandKind::Market => TimeInForce::IOC,
+                _ => TimeInForce::GTC,
+            },
+            post_only: false,
         };
 
         match action.kind {
