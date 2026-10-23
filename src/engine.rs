@@ -6,7 +6,8 @@ use uuid::{Uuid, timestamp};
 
 use crate::orderbook::OrderBook;
 use crate::types::{
-    BookSnapshot, EngineCommand, EngineConfig, EngineError, EngineEvent, ExecutionReport, Fill, Order, OrderBookId, OrderRecord, OrderRequest, OrderStatus, OrderType, Side, TimeInForce, Trade,
+    BookSnapshot, EngineCommand, EngineConfig, EngineError, EngineEvent, ExecutionReport, Fill,
+    OrderBookId, OrderRecord, OrderRequest, OrderStatus, OrderType, Side, TimeInForce, Trade,
 };
 
 // I want to implement a matching engine for the order book system
@@ -82,30 +83,24 @@ impl MatchingEngine {
             request,
         });
 
-        self.apply_limit_order(symbol, request)
+        self.apply_submit(symbol, request, OrderType::Limit)
     }
 
     fn can_fill_completely(&self, symbol: &str, request: &OrderRequest) -> bool {
         let Some(book) = self.order_books.get(symbol) else {
             return false;
         };
-        let probe = Order {
-            id: 0, // 仅用于预检查
-            side: request.side,
-            price: request.price,
-            quantity: request.quantity,
-            timestamp: request.timestamp,
-            order_type: request.order_type,
-        };
+        let probe = request.to_order(0); // 仅用于预检查
         book.can_fill_completely(&probe)
     }
 
-    fn apply_limit_order(
+    fn apply_submit(
         &mut self,
         symbol: &str,
         request: OrderRequest,
+        order_type: OrderType,
     ) -> Result<ExecutionReport, EngineError> {
-        if let Err(err) = self.validate(&request, OrderType::Limit) {
+        if let Err(err) = self.validate(&request, order_type) {
             self.emit_order_rejected(err);
             return Err(err);
         }
@@ -124,14 +119,7 @@ impl MatchingEngine {
 
         let order_id = self.next_order_id;
         self.next_order_id += 1;
-        let order = Order {
-            id: order_id,
-            side: request.side,
-            price: request.price,
-            quantity: request.quantity,
-            timestamp: request.timestamp,
-            order_type: request.order_type,
-        };
+        let order = request.to_order(order_id);
         let original_quantity = request.quantity;
         let timestamp = request.timestamp;
         let symbol_owned = symbol.to_string();
@@ -141,8 +129,13 @@ impl MatchingEngine {
             .entry(symbol.to_string())
             .or_insert_with(OrderBook::new);
 
-        let rest_remainder = request.time_in_force == TimeInForce::GTC;
-        let result = order_book.execute_limit_order(order, rest_remainder);
+        // 只有限价 GTC 会把未成交部分挂回簿上；IOC/FOK 和市价单的剩余量都取消
+        let rest_remainder =
+            order_type == OrderType::Limit && request.time_in_force == TimeInForce::GTC;
+        let result = match order_type {
+            OrderType::Limit => order_book.execute_limit_order(order, rest_remainder),
+            OrderType::Market => order_book.submit_market_order(order),
+        };
 
         let fills = self.record_fills(symbol, timestamp, result.fills);
 
@@ -172,17 +165,20 @@ impl MatchingEngine {
 
         let report = ExecutionReport {
             order_id,
-            symbol: symbol_owned.clone(),
-            status: status,
+            symbol: symbol_owned,
+            status,
             original_quantity,
-            filled_quantity: filled_quantity,
+            filled_quantity,
             remaining_quantity: result.remaining_quantity,
-            fills: fills.clone(),
+            fills,
         };
 
         self.emit_accepted(report.clone());
-        report.fills.iter().for_each(|fill| self.emit_trade_executed(fill.clone()));
-        
+        report
+            .fills
+            .iter()
+            .for_each(|fill| self.emit_trade_executed(fill.clone()));
+
         Ok(report)
     }
 
@@ -198,7 +194,7 @@ impl MatchingEngine {
             request,
         });
 
-        self.apply_market_order(symbol, request)
+        self.apply_submit(symbol, request, OrderType::Market)
     }
 
     fn would_cross(&self, symbol: &str, request: &OrderRequest) -> bool {
@@ -209,80 +205,6 @@ impl MatchingEngine {
             Side::Bid => book.best_ask().is_some_and(|ask| request.price >= ask),
             Side::Ask => book.best_bid().is_some_and(|bid| request.price <= bid),
         }
-    }
-
-    fn apply_market_order(
-        &mut self,
-        symbol: &str,
-        request: OrderRequest,
-    ) -> Result<ExecutionReport, EngineError> {
-        if let Err(err) = self.validate(&request, OrderType::Market) {
-            self.emit_order_rejected(err);
-            return Err(err);
-        }
-        
-        if request.time_in_force == TimeInForce::FOK && !self.can_fill_completely(symbol, &request) {
-            let err = EngineError::InsufficientLiquidity;
-            self.emit_order_rejected(err);
-            return Err(err);
-        }
-
-        let order_id = self.next_order_id;
-        self.next_order_id += 1;
-        let order = Order {
-            id: order_id,
-            side: request.side,
-            price: request.price,
-            quantity: request.quantity,
-            timestamp: request.timestamp,
-            order_type: request.order_type,
-        };
-        let original_quantity = request.quantity;
-        let timestamp = request.timestamp;
-        let symbol_owned = symbol.to_string();
-
-        let order_book = self
-            .order_books
-            .entry(symbol.to_string())
-            .or_insert_with(OrderBook::new);
-
-        let result = order_book.submit_market_order(order);
-
-        let fills = self.record_fills(symbol, timestamp, result.fills);
-
-        let filled_quantity = original_quantity - result.remaining_quantity;
-        // 市价单不回挂，剩余量视为取消
-        let status = if result.remaining_quantity == 0 {
-            OrderStatus::Filled
-        } else {
-            OrderStatus::Canceled
-        };
-
-        self.orders.insert(
-            order_id,
-            OrderRecord {
-                symbol: symbol_owned.clone(),
-                status,
-                original_quantity,
-                filled_quantity,
-                remaining_quantity: result.remaining_quantity,
-            },
-        );
-
-        let report = ExecutionReport {
-            order_id,
-            symbol: symbol_owned.clone(),
-            status,
-            original_quantity,
-            filled_quantity,
-            remaining_quantity: result.remaining_quantity,
-            fills: fills.clone(),
-        };
-
-        self.emit_accepted(report.clone());
-        report.fills.iter().for_each(|fill| self.emit_trade_executed(fill.clone()));
-
-        Ok(report)
     }
 
     pub fn cancel_order(&mut self, symbol: &str, order_id: u64) -> Option<ExecutionReport> {
@@ -377,11 +299,12 @@ impl MatchingEngine {
     /// 将一条历史命令应用到当前引擎，不写入命令日志。
     pub fn replay(&mut self, command: EngineCommand) {
         match command {
-            EngineCommand::SubmitOrder { order_type, symbol, request } => {
-                let _ = match order_type {
-                    OrderType::Limit => self.apply_limit_order(&symbol, request),
-                    OrderType::Market => self.apply_market_order(&symbol, request),
-                };
+            EngineCommand::SubmitOrder {
+                order_type,
+                symbol,
+                request,
+            } => {
+                let _ = self.apply_submit(&symbol, request, order_type);
             }
             EngineCommand::CancelOrder { symbol, order_id } => {
                 let _ = self.apply_cancel_order(&symbol, order_id);
@@ -1649,6 +1572,37 @@ mod tests {
 
         assert!(engine.trades().is_empty());
         assert!(engine.book("BTC-USDT").is_none());
+    }
+
+    #[test]
+    fn post_only_market_order_is_rejected_before_crossing_check() {
+        let mut engine = MatchingEngine::new(EngineConfig::default());
+        engine
+            .submit_limit_order("BTC-USDT", limit(1, Side::Ask, 100, 5))
+            .unwrap();
+
+        let request = OrderRequest {
+            post_only: true,
+            ..market(2, Side::Bid, 5)
+        };
+        assert_eq!(
+            engine
+                .submit_market_order("BTC-USDT", request)
+                .unwrap_err(),
+            EngineError::InvalidTimeInForce
+        );
+
+        // 校验先于 would_cross：即使簿上有可交叉的卖单，也应报 InvalidTimeInForce
+        assert!(engine.trades().is_empty());
+        assert_eq!(engine.book("BTC-USDT").unwrap().best_ask(), Some(100));
+        assert_eq!(engine.commands().len(), 2);
+        assert_eq!(engine.events().len(), 2);
+        match engine.events().last().unwrap() {
+            EngineEvent::OrderRejected { reason, .. } => {
+                assert_eq!(*reason, EngineError::InvalidTimeInForce)
+            }
+            _ => panic!("expected OrderRejected"),
+        }
     }
 
     #[test]

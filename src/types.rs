@@ -52,6 +52,11 @@ impl Order {
             Side::Ask => self.price <= best_price,
         }
     }
+
+    // 市价单接受任意价格；限价单必须穿过该价格
+    pub fn matches_price(&self, price: u64) -> bool {
+        self.order_type == OrderType::Market || self.crosses(price)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -97,6 +102,20 @@ pub struct OrderRequest {
     pub order_type: OrderType,
     pub time_in_force: TimeInForce,
     pub post_only: bool,
+}
+
+impl OrderRequest {
+    // 由引擎分配 id 后转成簿内订单
+    pub fn to_order(&self, id: OrderBookId) -> Order {
+        Order {
+            id,
+            side: self.side,
+            price: self.price,
+            quantity: self.quantity,
+            timestamp: self.timestamp,
+            order_type: self.order_type,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

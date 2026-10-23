@@ -78,6 +78,25 @@ impl PriceLevel {
         self.total_quantity
     }
 }
+
+// 按价格优先顺序累加可成交档位的数量，遇到第一档不可成交价格即停止
+fn sum_matchable_quantity<'a>(
+    levels: impl Iterator<Item = (&'a u64, &'a PriceLevel)>,
+    order: &Order,
+) -> u64 {
+    let mut available = 0u64;
+    for (price, level) in levels {
+        if !order.matches_price(*price) {
+            break;
+        }
+        available = available.saturating_add(level.total_quantity);
+        if available >= order.quantity {
+            break;
+        }
+    }
+    available
+}
+
 // One side of the OrderBook (either Bid or Ask)
 #[derive(Debug, Clone, PartialEq)]
 pub struct BookSide {
@@ -96,32 +115,10 @@ impl BookSide {
     }
 
     pub fn available_quantity(&self, order: &Order) -> u64 {
-        let mut available = 0u64;
         match self.side {
-            Side::Bid => {
-                for (price, level) in self.price_levels.iter().rev() {
-                    if order.order_type == OrderType::Limit && !order.crosses(*price) {
-                        break;
-                    }
-                    available = available.saturating_add(level.total_quantity);
-                    if available >= order.quantity {
-                        break;
-                    }
-                }
-            }
-            Side::Ask => {
-                for (price, level) in self.price_levels.iter() {
-                    if order.order_type == OrderType::Limit && !order.crosses(*price) {
-                        break;
-                    }
-                    available = available.saturating_add(level.total_quantity);
-                    if available >= order.quantity {
-                        break;
-                    }
-                }
-            }
+            Side::Bid => sum_matchable_quantity(self.price_levels.iter().rev(), order),
+            Side::Ask => sum_matchable_quantity(self.price_levels.iter(), order),
         }
-        available
     }
 
     pub fn snapshot(&self, depth: usize) -> Vec<(u64, u64)> {
@@ -200,7 +197,7 @@ impl BookSide {
             };
             
             // Check if the best price is matchable
-            if order.order_type == OrderType::Limit && !order.crosses(best_price) {
+            if !order.matches_price(best_price) {
                 break;
             }
 
@@ -602,6 +599,65 @@ mod tests {
         assert!(!book.can_fill_completely(&limit(6, Side::Bid, 100, 3)));
         assert!(book.can_fill_completely(&market(7, Side::Bid, 5)));
         assert!(!book.can_fill_completely(&market(8, Side::Bid, 6)));
+    }
+
+    fn dry_run_fills_completely(book: &OrderBook, order: &Order) -> bool {
+        let probe = order.clone();
+        let mut copy = book.clone();
+        let result = match probe.order_type {
+            OrderType::Limit => copy.execute_limit_order(probe, false),
+            OrderType::Market => copy.submit_market_order(probe),
+        };
+        result.remaining_quantity == 0
+    }
+
+    #[test]
+    fn can_fill_completely_agrees_with_actual_matching() {
+        fn check(book: &OrderBook, order: &Order) {
+            assert_eq!(
+                book.can_fill_completely(order),
+                dry_run_fills_completely(book, order),
+                "precheck diverged from matcher for {order:?}"
+            );
+        }
+
+        // 空簿：限价单和市价单都无法成交
+        let empty = OrderBook::new();
+        check(&empty, &limit(1, Side::Bid, 100, 1));
+        check(&empty, &market(2, Side::Bid, 1));
+
+        // 单档：刚好够 / 不够
+        let mut book = OrderBook::new();
+        book.submit_limit_order(limit(1, Side::Ask, 100, 5));
+        check(&book, &limit(2, Side::Bid, 100, 5));
+        check(&book, &limit(3, Side::Bid, 100, 6));
+        check(&book, &market(4, Side::Bid, 5));
+        check(&book, &market(5, Side::Bid, 6));
+
+        // 多档：限价决定能吃多远
+        let mut book = OrderBook::new();
+        book.submit_limit_order(limit(1, Side::Ask, 100, 2));
+        book.submit_limit_order(limit(2, Side::Ask, 101, 3));
+        check(&book, &limit(3, Side::Bid, 101, 5));
+        check(&book, &limit(4, Side::Bid, 101, 6));
+        check(&book, &limit(5, Side::Bid, 100, 3));
+
+        // 买方向的镜像
+        let mut book = OrderBook::new();
+        book.submit_limit_order(limit(1, Side::Bid, 100, 2));
+        book.submit_limit_order(limit(2, Side::Bid, 99, 3));
+        check(&book, &limit(3, Side::Ask, 99, 5));
+        check(&book, &limit(4, Side::Ask, 100, 3));
+        check(&book, &market(5, Side::Ask, 6));
+
+        // 部分成交后：100 档剩 3，101 档剩 2
+        let mut book = OrderBook::new();
+        book.submit_limit_order(limit(1, Side::Ask, 100, 5));
+        book.submit_limit_order(limit(2, Side::Ask, 101, 2));
+        book.submit_limit_order(limit(3, Side::Bid, 100, 2));
+        check(&book, &limit(4, Side::Bid, 100, 3));
+        check(&book, &limit(5, Side::Bid, 100, 4));
+        check(&book, &limit(6, Side::Bid, 101, 5));
     }
 
     #[test]
