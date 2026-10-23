@@ -135,6 +135,108 @@ pub struct OrderRecord {
     pub remaining_quantity: u64,
 }
 
+impl OrderRecord {
+    /// Fresh record for a taker order, before its match result is applied.
+    pub(crate) fn new(symbol: String, original_quantity: u64) -> Self {
+        let record = Self {
+            symbol,
+            status: OrderStatus::New,
+            original_quantity,
+            filled_quantity: 0,
+            remaining_quantity: original_quantity,
+        };
+        record.debug_assert_invariant();
+        record
+    }
+
+    /// Whether the order is still working on the book.
+    pub fn is_open(&self) -> bool {
+        matches!(
+            self.status,
+            OrderStatus::New | OrderStatus::PartiallyFilled
+        )
+    }
+
+    /// Record a maker fill delta reported by the book.
+    pub(crate) fn apply_maker_fill(&mut self, quantity: u64) {
+        debug_assert!(
+            quantity <= self.remaining_quantity,
+            "maker fill {quantity} exceeds remaining {}",
+            self.remaining_quantity
+        );
+        self.filled_quantity = self.filled_quantity.saturating_add(quantity);
+        self.remaining_quantity = self.original_quantity.saturating_sub(self.filled_quantity);
+        self.status = if self.remaining_quantity == 0 {
+            OrderStatus::Filled
+        } else {
+            OrderStatus::PartiallyFilled
+        };
+        self.debug_assert_invariant();
+    }
+
+    /// Record the taker's final match result. `rests` is true when the
+    /// leftover was placed on the book, as opposed to discarded (IOC/market).
+    pub(crate) fn complete_taker(&mut self, remaining_quantity: u64, rests: bool) {
+        debug_assert!(
+            remaining_quantity <= self.original_quantity,
+            "remaining {remaining_quantity} exceeds original {}",
+            self.original_quantity
+        );
+        self.filled_quantity = self.original_quantity.saturating_sub(remaining_quantity);
+        self.remaining_quantity = remaining_quantity;
+        self.status = if remaining_quantity == 0 {
+            OrderStatus::Filled
+        } else if rests {
+            if self.filled_quantity > 0 {
+                OrderStatus::PartiallyFilled
+            } else {
+                OrderStatus::New
+            }
+        } else {
+            OrderStatus::Canceled
+        };
+        self.debug_assert_invariant();
+    }
+
+    /// Record a cancel. The remaining quantity comes from the book.
+    pub(crate) fn mark_canceled(&mut self, canceled_quantity: u64) {
+        debug_assert!(self.is_open(), "only open orders can be canceled");
+        debug_assert_eq!(
+            self.remaining_quantity, canceled_quantity,
+            "book canceled quantity differs from the ledger's remaining quantity"
+        );
+        self.status = OrderStatus::Canceled;
+        self.remaining_quantity = canceled_quantity;
+        self.debug_assert_invariant();
+    }
+
+    /// The single projection from a record to an execution report.
+    pub(crate) fn to_report(&self, order_id: OrderBookId, fills: Vec<Trade>) -> ExecutionReport {
+        ExecutionReport {
+            order_id,
+            symbol: self.symbol.clone(),
+            status: self.status,
+            original_quantity: self.original_quantity,
+            filled_quantity: self.filled_quantity,
+            remaining_quantity: self.remaining_quantity,
+            fills,
+        }
+    }
+
+    /// Every mutation must preserve `filled + remaining == original`.
+    fn debug_assert_invariant(&self) {
+        debug_assert_eq!(
+            self.filled_quantity + self.remaining_quantity,
+            self.original_quantity,
+            "order invariant violated: filled {} + remaining {} != original {} (status {:?})",
+            self.filled_quantity,
+            self.remaining_quantity,
+            self.original_quantity,
+            self.status
+        );
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutionReport {
     pub order_id: u64,

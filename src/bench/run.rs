@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 use crate::engine::MatchingEngine;
 use crate::orderbook::OrderBook;
 use crate::types::{
-    CommandOutcome, EngineCommand, EngineConfig, OrderRequest, OrderType, Side, TimeInForce,
+    CommandOutcome, EngineCommand, EngineConfig, OrderBookId, OrderRequest, OrderType, Side,
+    TimeInForce,
 };
 
 use super::config::{BenchConfig, BenchError};
@@ -35,7 +36,7 @@ pub fn run(config: &BenchConfig) -> Result<BenchReport, BenchError> {
         }
         let outcome = engine.execute(command);
         std::hint::black_box(&outcome);
-        record_workload(&mut workload, &action, outcome);
+        record_workload(&mut workload, &action, outcome, |id| engine.is_open(id));
     }
 
     let mut total_all = Samples::default();
@@ -96,7 +97,7 @@ pub fn run(config: &BenchConfig) -> Result<BenchReport, BenchError> {
             }
         }
 
-        record_workload(&mut workload, &action, outcome);
+        record_workload(&mut workload, &action, outcome, |id| engine.is_open(id));
     }
 
     let wall_time_ns = duration_ns(measured_start.elapsed());
@@ -185,15 +186,23 @@ fn command_from_action(action: &Action, symbols: &[String]) -> EngineCommand {
     }
 }
 
-fn record_workload(workload: &mut Workload, action: &Action, outcome: CommandOutcome) {
+/// Feed one command outcome back into the workload after the timed command
+/// window has closed. The engine's lifecycle query is deliberately evaluated
+/// here, not inside `send..done`, so bookkeeping never enters a latency sample.
+fn record_workload(
+    workload: &mut Workload,
+    action: &Action,
+    outcome: CommandOutcome,
+    is_open: impl Fn(OrderBookId) -> bool,
+) {
     match outcome {
-        CommandOutcome::Accepted(report) => workload.on_submit_result(action, &Ok(report)),
+        CommandOutcome::Accepted(report) => workload.on_submit_result(action, &Ok(report), is_open),
         CommandOutcome::Canceled(report) => workload.on_cancel_result(action, Some(&report)),
         CommandOutcome::Rejected(reason) => {
             if action.kind == CommandKind::Cancel {
                 workload.on_cancel_result(action, None);
             } else {
-                workload.on_submit_result(action, &Err(reason));
+                workload.on_submit_result(action, &Err(reason), is_open);
             }
         }
     }

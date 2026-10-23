@@ -2,5 +2,6 @@
 
 pub mod bench;
 pub mod engine;
+mod ledger;
 pub mod orderbook;
 pub mod types;

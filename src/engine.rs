@@ -4,11 +4,12 @@ use colored::Colorize;
 use rust_decimal::Decimal;
 use uuid::{Uuid, timestamp};
 
+use crate::ledger::OrderLedger;
 use crate::orderbook::OrderBook;
 use crate::types::{
     BookSnapshot, CommandOutcome, EngineCommand, EngineConfig, EngineError, EngineEvent,
-    ExecutionReport, Fill, OrderBookId, OrderRecord, OrderRequest, OrderStatus, OrderType, Side,
-    TimeInForce, Trade,
+    ExecutionReport, Fill, OrderBookId, OrderRecord, OrderRequest, OrderType, Side, TimeInForce,
+    Trade,
 };
 
 // I want to implement a matching engine for the order book system
@@ -19,7 +20,7 @@ pub struct MatchingEngine {
     trades: Vec<Trade>,
     next_trade_id: u64,
     config: EngineConfig,
-    orders: HashMap<OrderBookId, OrderRecord>,
+    ledger: OrderLedger,
     next_order_id: u64,
     events: Vec<EngineEvent>,
     commands: Vec<EngineCommand>,
@@ -33,7 +34,7 @@ impl Default for MatchingEngine {
             trades: Vec::new(),
             next_trade_id: 1,
             config: EngineConfig::default(),
-            orders: HashMap::new(),
+            ledger: OrderLedger::default(),
             next_order_id: 1,
             events: Vec::new(),
             commands: Vec::new(),
@@ -49,7 +50,7 @@ impl MatchingEngine {
             trades: Vec::new(),
             next_trade_id: 1,
             config,
-            orders: HashMap::new(),
+            ledger: OrderLedger::default(),
             next_order_id: 1,
             events: Vec::new(),
             commands: Vec::new(),
@@ -141,39 +142,16 @@ impl MatchingEngine {
 
         let fills = self.record_fills(symbol, timestamp, result.fills);
 
-        let filled_quantity = original_quantity - result.remaining_quantity;
-        let status = if result.remaining_quantity == 0 {
-            OrderStatus::Filled
-        } else if rest_remainder {
-            if filled_quantity > 0 {
-                OrderStatus::PartiallyFilled
-            } else {
-                OrderStatus::New
-            }
-        } else {
-            OrderStatus::Canceled
-        };
-
-        self.orders.insert(
-            order_id,
-            OrderRecord {
-                symbol: symbol_owned.clone(),
-                status,
+        let report = self
+            .ledger
+            .insert_taker(
+                order_id,
+                symbol_owned,
                 original_quantity,
-                filled_quantity,
-                remaining_quantity: result.remaining_quantity,
-            },
-        );
-
-        let report = ExecutionReport {
-            order_id,
-            symbol: symbol_owned,
-            status,
-            original_quantity,
-            filled_quantity,
-            remaining_quantity: result.remaining_quantity,
-            fills,
-        };
+                result.remaining_quantity,
+                rest_remainder,
+            )
+            .to_report(order_id, fills);
 
         self.emit_accepted(report.clone());
         report
@@ -204,36 +182,42 @@ impl MatchingEngine {
     /// Cancel an open order. Every failure mode (unknown id, wrong symbol,
     /// already filled or canceled) returns `None` and emits no event.
     fn try_cancel_order(&mut self, symbol: &str, order_id: OrderBookId) -> Option<ExecutionReport> {
-        let record = self.orders.get_mut(&order_id)?;
-        if record.symbol != symbol
-            || !matches!(
-                record.status,
-                OrderStatus::New | OrderStatus::PartiallyFilled
-            )
-        {
+        let record = self.ledger.get(order_id)?;
+        if record.symbol != symbol || !record.is_open() {
             return None;
         }
 
         let order = self.order_books.get_mut(symbol)?.cancel_limit_order(order_id)?;
 
         let canceled_quantity = order.quantity;
-        let record = self.orders.get_mut(&order_id)?;
-        record.status = OrderStatus::Canceled;
-        record.remaining_quantity = canceled_quantity;
-
-        let report = ExecutionReport {
-            order_id,
-            symbol: symbol.to_string(),
-            status: OrderStatus::Canceled,
-            original_quantity: record.original_quantity,
-            filled_quantity: record.filled_quantity,
-            remaining_quantity: record.remaining_quantity,
-            fills: Vec::new(),
-        };
+        let report = self
+            .ledger
+            .mark_canceled(order_id, canceled_quantity)?
+            .to_report(order_id, Vec::new());
 
         self.emit_order_canceled(report.clone());
 
         Some(report)
+    }
+
+    /// Lifecycle record for `order_id`, if the engine has accepted it.
+    pub fn order_record(&self, order_id: OrderBookId) -> Option<&OrderRecord> {
+        self.ledger.get(order_id)
+    }
+
+    /// Whether `order_id` is currently open (`New` or `PartiallyFilled`).
+    pub fn is_open(&self, order_id: OrderBookId) -> bool {
+        self.ledger.is_open(order_id)
+    }
+
+    /// Every lifecycle record, keyed by order id.
+    pub fn order_records(&self) -> impl Iterator<Item = (OrderBookId, &OrderRecord)> {
+        self.ledger.iter()
+    }
+
+    /// Number of records retained by the ledger.
+    pub fn order_count(&self) -> usize {
+        self.ledger.len()
     }
 
     pub fn trades(&self) -> &Vec<Trade> {
@@ -305,15 +289,8 @@ impl MatchingEngine {
     fn record_fills(&mut self, symbol: &str, timestamp: u64, fills: Vec<Fill>) -> Vec<Trade> {
         let mut record_trades = Vec::with_capacity(fills.len());
         fills.iter().for_each(|fill| {
-            if let Some(record) = self.orders.get_mut(&fill.maker_order_id) {
-                record.filled_quantity += fill.quantity;
-                record.remaining_quantity -= fill.quantity;
-                record.status = if record.remaining_quantity == 0 {
-                    OrderStatus::Filled
-                } else {
-                    OrderStatus::PartiallyFilled
-                };
-            }
+            self.ledger
+                .apply_maker_fill(fill.maker_order_id, fill.quantity);
 
             let trade = Trade {
                 id: self.next_trade_id,
@@ -383,6 +360,7 @@ impl MatchingEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::OrderStatus;
 
     fn limit(timestamp: u64, side: Side, price: u64, quantity: u64) -> OrderRequest {
         OrderRequest {
@@ -464,6 +442,15 @@ mod tests {
             CommandOutcome::Rejected(_) => None,
             CommandOutcome::Accepted(_) => panic!("cancel produced an accepted outcome"),
         }
+    }
+
+    /// Snapshot the ledger through the public query so replay comparisons are
+    /// independent of hash-map iteration order.
+    fn records(engine: &MatchingEngine) -> HashMap<OrderBookId, OrderRecord> {
+        engine
+            .order_records()
+            .map(|(order_id, record)| (order_id, record.clone()))
+            .collect()
     }
 
     #[test]
@@ -575,7 +562,10 @@ mod tests {
         assert_eq!(report.remaining_quantity, 5);
         assert!(report.fills.is_empty());
 
-        assert_eq!(engine.orders.get(&1).unwrap().status, OrderStatus::Canceled);
+        assert_eq!(
+            engine.order_record(1).unwrap().status,
+            OrderStatus::Canceled
+        );
         assert!(cancel(&mut engine, "BTC-USDT", 1).is_none());
         assert!(cancel(&mut engine, "ETH-USDT", 1).is_none());
     }
@@ -689,7 +679,7 @@ mod tests {
         assert_eq!(report.remaining_quantity, 3);
         assert!(report.fills.is_empty());
 
-        let record = engine.orders.get(&2).unwrap();
+        let record = engine.order_record(2).unwrap();
         assert_eq!(record.status, OrderStatus::Canceled);
         assert_eq!(record.filled_quantity, 2);
         assert_eq!(record.remaining_quantity, 3);
@@ -724,13 +714,13 @@ mod tests {
         // taker 成交 3，剩余 2 挂在 100
         submit(&mut engine, "BTC-USDT", limit(2, Side::Bid, 100, 5)).unwrap();
 
-        let maker = engine.orders.get(&1).unwrap();
+        let maker = engine.order_record(1).unwrap();
         assert_eq!(maker.status, OrderStatus::Filled);
         assert_eq!(maker.original_quantity, 3);
         assert_eq!(maker.filled_quantity, 3);
         assert_eq!(maker.remaining_quantity, 0);
 
-        let taker = engine.orders.get(&2).unwrap();
+        let taker = engine.order_record(2).unwrap();
         assert_eq!(taker.status, OrderStatus::PartiallyFilled);
         assert_eq!(taker.original_quantity, 5);
         assert_eq!(taker.filled_quantity, 3);
@@ -743,13 +733,13 @@ mod tests {
         submit(&mut engine, "BTC-USDT", limit(1, Side::Ask, 100, 5)).unwrap();
 
         submit(&mut engine, "BTC-USDT", limit(2, Side::Bid, 100, 2)).unwrap();
-        let maker = engine.orders.get(&1).unwrap();
+        let maker = engine.order_record(1).unwrap();
         assert_eq!(maker.status, OrderStatus::PartiallyFilled);
         assert_eq!(maker.filled_quantity, 2);
         assert_eq!(maker.remaining_quantity, 3);
 
         submit(&mut engine, "BTC-USDT", limit(3, Side::Bid, 100, 3)).unwrap();
-        let maker = engine.orders.get(&1).unwrap();
+        let maker = engine.order_record(1).unwrap();
         assert_eq!(maker.status, OrderStatus::Filled);
         assert_eq!(maker.filled_quantity, 5);
         assert_eq!(maker.remaining_quantity, 0);
@@ -762,7 +752,7 @@ mod tests {
 
         let report = submit(&mut engine, "BTC-USDT", market(2, Side::Bid, 5)).unwrap();
 
-        let record = engine.orders.get(&report.order_id).unwrap();
+        let record = engine.order_record(report.order_id).unwrap();
         assert_eq!(record.symbol, "BTC-USDT");
         assert_eq!(record.status, OrderStatus::Canceled);
         assert_eq!(record.original_quantity, 5);
@@ -1097,7 +1087,7 @@ mod tests {
         let replayed = MatchingEngine::from_commands(EngineConfig::default(), engine.commands());
         assert_eq!(replayed.commands(), engine.commands());
         assert_eq!(replayed.events(), engine.events());
-        assert_eq!(replayed.orders, engine.orders);
+        assert_eq!(records(&replayed), records(&engine));
         assert_eq!(replayed.book("BTC-USDT"), engine.book("BTC-USDT"));
     }
 
@@ -1123,7 +1113,7 @@ mod tests {
         assert_eq!(replayed.commands(), engine.commands());
         assert_eq!(replayed.events(), engine.events());
         assert_eq!(replayed.trades(), engine.trades());
-        assert_eq!(replayed.orders, engine.orders);
+        assert_eq!(records(&replayed), records(&engine));
         assert_eq!(replayed.book("BTC-USDT"), engine.book("BTC-USDT"));
         assert_eq!(replayed.next_order_id, engine.next_order_id);
         assert_eq!(replayed.next_trade_id, engine.next_trade_id);
@@ -1151,7 +1141,7 @@ mod tests {
 
         assert_eq!(replayed.commands(), engine.commands());
         assert_eq!(replayed.events(), engine.events());
-        assert!(replayed.orders.is_empty());
+        assert_eq!(replayed.order_count(), 0);
         assert_eq!(replayed.next_order_id, 1);
         assert_eq!(replayed.next_sequence_id, 2);
     }
@@ -1178,7 +1168,7 @@ mod tests {
         assert_eq!(replayed.commands(), engine.commands());
         assert_eq!(replayed.trades(), engine.trades());
         assert_eq!(replayed.events(), engine.events());
-        assert_eq!(replayed.orders, engine.orders);
+        assert_eq!(records(&replayed), records(&engine));
         assert_eq!(replayed.book("BTC-USDT"), engine.book("BTC-USDT"));
         assert_eq!(replayed.book("ETH-USDT"), engine.book("ETH-USDT"));
         assert_eq!(
@@ -1209,7 +1199,7 @@ mod tests {
         // 但状态和事件与原始引擎一致
         assert_eq!(replayed.trades(), engine.trades());
         assert_eq!(replayed.events(), engine.events());
-        assert_eq!(replayed.orders, engine.orders);
+        assert_eq!(records(&replayed), records(&engine));
         assert_eq!(replayed.book("BTC-USDT"), engine.book("BTC-USDT"));
     }
 
@@ -1304,7 +1294,7 @@ mod tests {
         assert_eq!(book.best_bid(), None);
         assert_eq!(book.best_ask(), None);
 
-        let record = engine.orders.get(&report.order_id).unwrap();
+        let record = engine.order_record(report.order_id).unwrap();
         assert_eq!(record.status, OrderStatus::Canceled);
         assert_eq!(record.filled_quantity, 2);
         assert_eq!(record.remaining_quantity, 3);
@@ -1355,7 +1345,7 @@ mod tests {
 
         assert_eq!(error, EngineError::InsufficientLiquidity);
         assert_eq!(engine.next_order_id, next_id_before);
-        assert_eq!(engine.orders.len(), 1);
+        assert_eq!(engine.order_count(), 1);
         assert!(engine.trades().is_empty());
         assert_eq!(
             engine.book("BTC-USDT").unwrap().depth(Side::Ask, 0),
@@ -1533,11 +1523,124 @@ mod tests {
         assert_eq!(replayed.commands(), engine.commands());
         assert_eq!(replayed.events(), engine.events());
         assert_eq!(replayed.trades(), engine.trades());
-        assert_eq!(replayed.orders, engine.orders);
+        assert_eq!(records(&replayed), records(&engine));
         assert_eq!(replayed.book("BTC-USDT"), engine.book("BTC-USDT"));
         assert_eq!(
             replayed.snapshot("BTC-USDT", 10),
             engine.snapshot("BTC-USDT", 10)
         );
+    }
+
+    #[test]
+    fn ledger_invariant_holds_across_mixed_lifecycles() {
+        let mut engine = MatchingEngine::new(EngineConfig::default());
+
+        // Resting ask, partially filled by a taker that rests its own remainder.
+        submit(&mut engine, "BTC-USDT", limit(1, Side::Ask, 100, 5)).unwrap();
+        submit(&mut engine, "BTC-USDT", limit(2, Side::Bid, 100, 2)).unwrap();
+        // The same ask is fully filled by a later taker that also rests.
+        submit(&mut engine, "BTC-USDT", limit(3, Side::Bid, 100, 4)).unwrap();
+        cancel(&mut engine, "BTC-USDT", 3).unwrap();
+        // Market taker leaves an unfilled remainder that is canceled.
+        submit(&mut engine, "BTC-USDT", limit(4, Side::Ask, 101, 1)).unwrap();
+        submit(&mut engine, "BTC-USDT", market(5, Side::Bid, 5)).unwrap();
+        // IOC taker leaves an unfilled remainder that is canceled.
+        submit(&mut engine, "BTC-USDT", limit(6, Side::Ask, 102, 2)).unwrap();
+        submit(&mut engine, "BTC-USDT", ioc_limit(7, Side::Bid, 102, 5)).unwrap();
+        // Plain resting order canceled without a fill.
+        submit(&mut engine, "BTC-USDT", limit(8, Side::Bid, 99, 1)).unwrap();
+        cancel(&mut engine, "BTC-USDT", 8).unwrap();
+
+        assert_eq!(engine.order_count(), 8);
+        for (order_id, record) in engine.order_records() {
+            assert_eq!(
+                record.filled_quantity + record.remaining_quantity,
+                record.original_quantity,
+                "order {order_id} violated filled + remaining == original"
+            );
+        }
+    }
+
+    #[test]
+    fn order_record_returns_none_for_unknown_id() {
+        let mut engine = MatchingEngine::new(EngineConfig::default());
+
+        assert!(engine.order_record(42).is_none());
+        assert!(!engine.is_open(42));
+
+        let report = submit(&mut engine, "BTC-USDT", limit(1, Side::Bid, 100, 5)).unwrap();
+        assert!(engine.order_record(report.order_id).is_some());
+        assert!(engine.order_record(report.order_id + 1).is_none());
+    }
+
+    #[test]
+    fn is_open_tracks_new_partial_filled_and_canceled() {
+        let mut engine = MatchingEngine::new(EngineConfig::default());
+
+        let resting = submit(&mut engine, "BTC-USDT", limit(1, Side::Ask, 100, 5)).unwrap();
+        assert_eq!(resting.status, OrderStatus::New);
+        assert!(engine.is_open(resting.order_id));
+
+        // Maker partially filled, taker fully filled.
+        submit(&mut engine, "BTC-USDT", limit(2, Side::Bid, 100, 3)).unwrap();
+        assert!(engine.is_open(1));
+        assert!(!engine.is_open(2));
+
+        // A taker fills the maker's remainder and rests its own remainder.
+        let partial = submit(&mut engine, "BTC-USDT", limit(3, Side::Bid, 100, 10)).unwrap();
+        assert_eq!(partial.status, OrderStatus::PartiallyFilled);
+        assert!(!engine.is_open(1));
+        assert!(engine.is_open(partial.order_id));
+
+        // Market leftovers are canceled, never open.
+        let market = submit(&mut engine, "BTC-USDT", market(4, Side::Bid, 1)).unwrap();
+        assert_eq!(market.status, OrderStatus::Canceled);
+        assert!(!engine.is_open(market.order_id));
+
+        let canceled = cancel(&mut engine, "BTC-USDT", partial.order_id).unwrap();
+        assert_eq!(canceled.status, OrderStatus::Canceled);
+        assert!(!engine.is_open(partial.order_id));
+    }
+
+    #[test]
+    fn maker_and_taker_statuses_are_observable_through_order_record() {
+        let mut engine = MatchingEngine::new(EngineConfig::default());
+
+        submit(&mut engine, "BTC-USDT", limit(1, Side::Ask, 100, 5)).unwrap();
+        // Taker fills 3 of the maker and is itself fully filled.
+        submit(&mut engine, "BTC-USDT", limit(2, Side::Bid, 100, 3)).unwrap();
+
+        let maker = engine.order_record(1).unwrap();
+        assert_eq!(maker.status, OrderStatus::PartiallyFilled);
+        assert_eq!(maker.original_quantity, 5);
+        assert_eq!(maker.filled_quantity, 3);
+        assert_eq!(maker.remaining_quantity, 2);
+
+        let taker = engine.order_record(2).unwrap();
+        assert_eq!(taker.status, OrderStatus::Filled);
+        assert_eq!(taker.filled_quantity, 3);
+        assert_eq!(taker.remaining_quantity, 0);
+
+        // Next taker fills the maker's remainder and rests its own remainder.
+        submit(&mut engine, "BTC-USDT", limit(3, Side::Bid, 100, 4)).unwrap();
+
+        let maker = engine.order_record(1).unwrap();
+        assert_eq!(maker.status, OrderStatus::Filled);
+        assert_eq!(maker.filled_quantity, 5);
+        assert_eq!(maker.remaining_quantity, 0);
+
+        let taker = engine.order_record(3).unwrap();
+        assert_eq!(taker.status, OrderStatus::PartiallyFilled);
+        assert_eq!(taker.original_quantity, 4);
+        assert_eq!(taker.filled_quantity, 2);
+        assert_eq!(taker.remaining_quantity, 2);
+
+        // Cancel projects the canceled status and the book's remaining quantity.
+        cancel(&mut engine, "BTC-USDT", 3).unwrap();
+        let canceled = engine.order_record(3).unwrap();
+        assert_eq!(canceled.status, OrderStatus::Canceled);
+        assert_eq!(canceled.filled_quantity, 2);
+        assert_eq!(canceled.remaining_quantity, 2);
+        assert!(!engine.is_open(3));
     }
 }
