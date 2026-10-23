@@ -42,6 +42,7 @@ pub struct Order {
     pub quantity: u64,  // Remaining quantity of the order
     pub timestamp: u64, // Timestamp of the order in milliseconds since epoch
     pub order_type: OrderType,
+    pub time_in_force: TimeInForce,
 }
 
 impl Order {
@@ -57,6 +58,11 @@ impl Order {
     pub fn matches_price(&self, price: u64) -> bool {
         self.order_type == OrderType::Market || self.crosses(price)
     }
+
+    // Only a GTC limit order keeps its unfilled remainder on the book.
+    pub fn rests(&self) -> bool {
+        self.order_type == OrderType::Limit && self.time_in_force == TimeInForce::GTC
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -69,15 +75,10 @@ pub struct Fill {
 }
 
 #[derive(Debug, Default)]
-pub struct MatchOutcome {
-    pub fills: Vec<Fill>,
-    pub filled_order_ids: Vec<OrderBookId>, // 完全成交的，需要从 order_map 移除
-}
-
-#[derive(Debug, Default)]
 pub struct SubmitResult {
     pub remaining_quantity: u64,
     pub fills: Vec<Fill>,
+    pub rested: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -114,6 +115,7 @@ impl OrderRequest {
             quantity: self.quantity,
             timestamp: self.timestamp,
             order_type: self.order_type,
+            time_in_force: self.time_in_force,
         }
     }
 }
@@ -151,10 +153,7 @@ impl OrderRecord {
 
     /// Whether the order is still working on the book.
     pub fn is_open(&self) -> bool {
-        matches!(
-            self.status,
-            OrderStatus::New | OrderStatus::PartiallyFilled
-        )
+        matches!(self.status, OrderStatus::New | OrderStatus::PartiallyFilled)
     }
 
     /// Record a maker fill delta reported by the book.

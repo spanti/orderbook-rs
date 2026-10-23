@@ -1,5 +1,5 @@
 use orderbook_rs::orderbook::OrderBook;
-use orderbook_rs::types::{Order, OrderType, Side};
+use orderbook_rs::types::{Order, OrderType, Side, TimeInForce};
 
 fn main() {
     let mut book = OrderBook::new();
@@ -11,8 +11,9 @@ fn main() {
         quantity: 5,
         timestamp: 1,
         order_type: OrderType::Limit,
+        time_in_force: TimeInForce::GTC,
     };
-    book.submit_limit_order(order1);
+    book.submit(order1);
 
     let taker = Order {
         id: 6,
@@ -21,6 +22,7 @@ fn main() {
         quantity: 10,
         timestamp: 2,
         order_type: OrderType::Limit,
+        time_in_force: TimeInForce::GTC,
     };
 
     let market_order_1 = Order {
@@ -30,11 +32,12 @@ fn main() {
         quantity: 2,
         timestamp: 3,
         order_type: OrderType::Market,
+        time_in_force: TimeInForce::IOC,
     };
 
-    let remaining = book.submit_limit_order(taker).remaining_quantity;
+    let remaining = book.submit(taker).remaining_quantity;
 
-    let remaining_market = book.submit_market_order(market_order_1).remaining_quantity;
+    let remaining_market = book.submit(market_order_1).remaining_quantity;
 
     println!("Taker remaining: {}", remaining);
     println!("Market order remaining: {}", remaining_market);

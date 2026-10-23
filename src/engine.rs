@@ -59,7 +59,10 @@ impl MatchingEngine {
     }
 
     pub fn last_sequence(&self) -> u64 {
-        self.events.last().map(EngineEvent::sequence_id).unwrap_or(0)
+        self.events
+            .last()
+            .map(EngineEvent::sequence_id)
+            .unwrap_or(0)
     }
 
     pub fn snapshot(&self, symbol: &str, depth: usize) -> Option<BookSnapshot> {
@@ -132,13 +135,7 @@ impl MatchingEngine {
             .entry(symbol.to_string())
             .or_insert_with(OrderBook::new);
 
-        // 只有限价 GTC 会把未成交部分挂回簿上；IOC/FOK 和市价单的剩余量都取消
-        let rest_remainder =
-            request.order_type == OrderType::Limit && request.time_in_force == TimeInForce::GTC;
-        let result = match request.order_type {
-            OrderType::Limit => order_book.execute_limit_order(order, rest_remainder),
-            OrderType::Market => order_book.submit_market_order(order),
-        };
+        let result = order_book.submit(order);
 
         let fills = self.record_fills(symbol, timestamp, result.fills);
 
@@ -149,7 +146,7 @@ impl MatchingEngine {
                 symbol_owned,
                 original_quantity,
                 result.remaining_quantity,
-                rest_remainder,
+                result.rested,
             )
             .to_report(order_id, fills);
 
@@ -187,7 +184,10 @@ impl MatchingEngine {
             return None;
         }
 
-        let order = self.order_books.get_mut(symbol)?.cancel_limit_order(order_id)?;
+        let order = self
+            .order_books
+            .get_mut(symbol)?
+            .cancel_limit_order(order_id)?;
 
         let canceled_quantity = order.quantity;
         let report = self
@@ -331,13 +331,11 @@ impl MatchingEngine {
             report,
         });
     }
-    
+
     fn emit_trade_executed(&mut self, trade: Trade) {
         let sequence_id = self.allocate_sequence_id();
-        self.events.push(EngineEvent::TradeExecuted {
-            sequence_id,
-            trade,
-        });
+        self.events
+            .push(EngineEvent::TradeExecuted { sequence_id, trade });
     }
 
     fn emit_order_canceled(&mut self, report: ExecutionReport) {
@@ -810,7 +808,10 @@ mod tests {
         assert_eq!(events.len(), 3);
 
         match &events[0] {
-            EngineEvent::OrderAccepted { sequence_id, report } => {
+            EngineEvent::OrderAccepted {
+                sequence_id,
+                report,
+            } => {
                 assert_eq!(*sequence_id, 1);
                 assert_eq!(report.order_id, 1);
                 assert_eq!(report.status, OrderStatus::New);
@@ -820,7 +821,10 @@ mod tests {
         }
 
         match &events[1] {
-            EngineEvent::OrderAccepted { sequence_id, report } => {
+            EngineEvent::OrderAccepted {
+                sequence_id,
+                report,
+            } => {
                 assert_eq!(*sequence_id, 2);
                 assert_eq!(report.order_id, 2);
                 assert_eq!(report.status, OrderStatus::Filled);
@@ -841,9 +845,11 @@ mod tests {
             _ => panic!("expected TradeExecuted"),
         }
 
-        assert!(events
-            .windows(2)
-            .all(|window| event_sequence(&window[0]) + 1 == event_sequence(&window[1])));
+        assert!(
+            events
+                .windows(2)
+                .all(|window| event_sequence(&window[0]) + 1 == event_sequence(&window[1]))
+        );
     }
 
     #[test]
@@ -855,7 +861,10 @@ mod tests {
 
         assert_eq!(engine.events().len(), 1);
         match &engine.events()[0] {
-            EngineEvent::OrderRejected { sequence_id, reason } => {
+            EngineEvent::OrderRejected {
+                sequence_id,
+                reason,
+            } => {
                 assert_eq!(*sequence_id, 1);
                 assert_eq!(*reason, EngineError::QuantityOutOfRange);
             }
@@ -1404,7 +1413,12 @@ mod tests {
         let mut engine = MatchingEngine::new(EngineConfig::default());
         submit(&mut engine, "BTC-USDT", limit(1, Side::Ask, 100, 5)).unwrap();
 
-        let error = submit(&mut engine, "BTC-USDT", post_only_limit(2, Side::Bid, 100, 5)).unwrap_err();
+        let error = submit(
+            &mut engine,
+            "BTC-USDT",
+            post_only_limit(2, Side::Bid, 100, 5),
+        )
+        .unwrap_err();
 
         assert_eq!(error, EngineError::PostOnlyWouldCross);
         assert_eq!(engine.next_order_id, 2);
@@ -1420,7 +1434,12 @@ mod tests {
         let mut engine = MatchingEngine::new(EngineConfig::default());
         submit(&mut engine, "BTC-USDT", limit(1, Side::Bid, 100, 5)).unwrap();
 
-        let error = submit(&mut engine, "BTC-USDT", post_only_limit(2, Side::Ask, 100, 5)).unwrap_err();
+        let error = submit(
+            &mut engine,
+            "BTC-USDT",
+            post_only_limit(2, Side::Ask, 100, 5),
+        )
+        .unwrap_err();
 
         assert_eq!(error, EngineError::PostOnlyWouldCross);
         assert!(engine.trades().is_empty());
@@ -1435,7 +1454,12 @@ mod tests {
         let mut engine = MatchingEngine::new(EngineConfig::default());
         submit(&mut engine, "BTC-USDT", limit(1, Side::Ask, 101, 5)).unwrap();
 
-        let report = submit(&mut engine, "BTC-USDT", post_only_limit(2, Side::Bid, 100, 5)).unwrap();
+        let report = submit(
+            &mut engine,
+            "BTC-USDT",
+            post_only_limit(2, Side::Bid, 100, 5),
+        )
+        .unwrap();
 
         assert_eq!(report.status, OrderStatus::New);
         assert_eq!(report.filled_quantity, 0);
@@ -1515,7 +1539,12 @@ mod tests {
         submit(&mut engine, "BTC-USDT", limit(1, Side::Ask, 100, 5)).unwrap();
         submit(&mut engine, "BTC-USDT", ioc_limit(2, Side::Bid, 100, 10)).unwrap();
         assert!(submit(&mut engine, "BTC-USDT", fok_limit(3, Side::Bid, 101, 10)).is_err());
-        let post_only = submit(&mut engine, "BTC-USDT", post_only_limit(4, Side::Bid, 99, 1)).unwrap();
+        let post_only = submit(
+            &mut engine,
+            "BTC-USDT",
+            post_only_limit(4, Side::Bid, 99, 1),
+        )
+        .unwrap();
         cancel(&mut engine, "BTC-USDT", post_only.order_id).unwrap();
 
         let replayed = MatchingEngine::from_commands(EngineConfig::default(), engine.commands());
