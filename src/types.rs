@@ -281,14 +281,26 @@ pub enum EngineError {
     InsufficientLiquidity,
 }
 
-/// The engine's submission vocabulary: every state change enters through a
-/// command. Order type and time-in-force travel inside `request`, so a command
-/// cannot disagree with the engine method it is sent to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModifyRequest {
+    pub price: u64,
+    pub quantity: u64,
+    pub timestamp: u64,
+}
+
+/// The engine's command vocabulary: every state change enters through a
+/// command. For submissions, order type and time-in-force travel inside
+/// `request`, so a command cannot disagree with the engine method it is sent to.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EngineCommand {
     SubmitOrder {
         symbol: String,
         request: OrderRequest,
+    },
+    ModifyOrder {
+        symbol: String,
+        order_id: OrderBookId,
+        request: ModifyRequest,
     },
     CancelOrder {
         symbol: String,

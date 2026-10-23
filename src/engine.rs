@@ -8,8 +8,8 @@ use crate::ledger::OrderLedger;
 use crate::orderbook::OrderBook;
 use crate::types::{
     BookSnapshot, CommandOutcome, EngineCommand, EngineConfig, EngineError, EngineEvent,
-    ExecutionReport, Fill, OrderBookId, OrderRecord, OrderRequest, OrderType, Side, TimeInForce,
-    Trade,
+    ExecutionReport, Fill, ModifyRequest, Order, OrderBookId, OrderRecord, OrderRequest, OrderType,
+    Side, TimeInForce, Trade,
 };
 
 // I want to implement a matching engine for the order book system
@@ -94,6 +94,11 @@ impl MatchingEngine {
             EngineCommand::CancelOrder { symbol, order_id } => {
                 self.apply_cancel_order(symbol, *order_id)
             }
+            EngineCommand::ModifyOrder {
+                symbol,
+                order_id,
+                request,
+            } => self.apply_modify_order(symbol, *order_id, request),
         }
     }
 
@@ -176,9 +181,75 @@ impl MatchingEngine {
         }
     }
 
-    /// Cancel an open order. Every failure mode (unknown id, wrong symbol,
-    /// already filled or canceled) returns `None` and emits no event.
-    fn try_cancel_order(&mut self, symbol: &str, order_id: OrderBookId) -> Option<ExecutionReport> {
+    fn validate_quantity(&self, quantity: u64) -> Result<(), EngineError> {
+        if quantity < self.config.min_order_quantity || quantity > self.config.max_order_quantity {
+            return Err(EngineError::QuantityOutOfRange);
+        }
+        Ok(())
+    }
+
+    fn validate_price_on_tick(&self, price: u64) -> Result<(), EngineError> {
+        if !price.is_multiple_of(self.config.tick_size) {
+            return Err(EngineError::PriceNotOnTick);
+        }
+        Ok(())
+    }
+
+    fn validate_limit(&self, price: u64, quantity: u64) -> Result<(), EngineError> {
+        self.validate_quantity(quantity)?;
+        self.validate_price_on_tick(price)
+    }
+
+    fn apply_modify_order(
+        &mut self,
+        symbol: &str,
+        order_id: OrderBookId,
+        request: &ModifyRequest,
+    ) -> CommandOutcome {
+        // 1. order must be limit + gtc, and need check validity of price and quantity
+        if let Err(err) = self.validate_limit(request.price, request.quantity) {
+            self.emit_order_rejected(err);
+            return CommandOutcome::Rejected(err);
+        }
+
+        // 2. order must exist and be open in the ledger for the given symbol
+        let is_open = self
+            .ledger
+            .get(order_id)
+            .is_some_and(|record| record.symbol == symbol && record.is_open());
+
+        if !is_open {
+            let err = EngineError::UnknownOrder;
+            self.emit_order_rejected(err);
+            return CommandOutcome::Rejected(err);
+        }
+
+        // 3. delete the open order from the order book and mark it as canceled in the ledger
+        let Some((old_order, _canceled_report)) = self.remove_open_order(symbol, order_id) else {
+            let err = EngineError::UnknownOrder;
+            self.emit_order_rejected(err);
+            return CommandOutcome::Rejected(err);
+        };
+
+        // 4. create a new order with the modified parameters and add it to the order book
+        let submit_request = OrderRequest {
+            side: old_order.side,
+            price: request.price,
+            quantity: request.quantity,
+            timestamp: request.timestamp,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            post_only: false,
+        };
+
+        self.apply_submit(symbol, &submit_request)
+    }
+
+    fn remove_open_order(
+        &mut self,
+        symbol: &str,
+        order_id: OrderBookId,
+    ) -> Option<(Order, ExecutionReport)> {
         let record = self.ledger.get(order_id)?;
         if record.symbol != symbol || !record.is_open() {
             return None;
@@ -188,7 +259,6 @@ impl MatchingEngine {
             .order_books
             .get_mut(symbol)?
             .cancel_limit_order(order_id)?;
-
         let canceled_quantity = order.quantity;
         let report = self
             .ledger
@@ -196,8 +266,14 @@ impl MatchingEngine {
             .to_report(order_id, Vec::new());
 
         self.emit_order_canceled(report.clone());
+        Some((order, report))
+    }
 
-        Some(report)
+    /// Cancel an open order. Every failure mode (unknown id, wrong symbol,
+    /// already filled or canceled) returns `None` and emits no event.
+    fn try_cancel_order(&mut self, symbol: &str, order_id: OrderBookId) -> Option<ExecutionReport> {
+        self.remove_open_order(symbol, order_id)
+            .map(|(_, report)| report)
     }
 
     /// Lifecycle record for `order_id`, if the engine has accepted it.
@@ -242,13 +318,9 @@ impl MatchingEngine {
     }
 
     fn validate(&self, request: &OrderRequest) -> Result<(), EngineError> {
-        if request.quantity < self.config.min_order_quantity
-            || request.quantity > self.config.max_order_quantity
-        {
-            return Err(EngineError::QuantityOutOfRange);
-        }
-        if request.order_type == OrderType::Limit && request.price % self.config.tick_size != 0 {
-            return Err(EngineError::PriceNotOnTick);
+        self.validate_quantity(request.quantity)?;
+        if request.order_type == OrderType::Limit {
+            self.validate_price_on_tick(request.price)?;
         }
         // 市价单本质上是 IOC，GTC 市价单没有意义
         if request.order_type == OrderType::Market && request.time_in_force == TimeInForce::GTC {
@@ -439,6 +511,31 @@ mod tests {
             CommandOutcome::Canceled(report) => Some(report),
             CommandOutcome::Rejected(_) => None,
             CommandOutcome::Accepted(_) => panic!("cancel produced an accepted outcome"),
+        }
+    }
+
+    /// Modify through the public command seam. A successful modify returns the
+    /// report of the replacement order; the canceled half remains in the events.
+    fn modify(
+        engine: &mut MatchingEngine,
+        symbol: &str,
+        order_id: u64,
+        price: u64,
+        quantity: u64,
+        timestamp: u64,
+    ) -> Result<ExecutionReport, EngineError> {
+        match engine.execute(EngineCommand::ModifyOrder {
+            symbol: symbol.to_string(),
+            order_id,
+            request: ModifyRequest {
+                price,
+                quantity,
+                timestamp,
+            },
+        }) {
+            CommandOutcome::Accepted(report) => Ok(report),
+            CommandOutcome::Rejected(error) => Err(error),
+            CommandOutcome::Canceled(_) => panic!("modify produced a cancel outcome"),
         }
     }
 
@@ -1671,5 +1768,310 @@ mod tests {
         assert_eq!(canceled.filled_quantity, 2);
         assert_eq!(canceled.remaining_quantity, 2);
         assert!(!engine.is_open(3));
+    }
+
+    #[test]
+    fn modify_price_moves_order_to_new_level() {
+        let mut engine = MatchingEngine::new(EngineConfig::default());
+        let first = submit(&mut engine, "BTC-USDT", limit(1, Side::Ask, 100, 5)).unwrap();
+        submit(&mut engine, "BTC-USDT", limit(2, Side::Ask, 101, 2)).unwrap();
+
+        let modified = modify(&mut engine, "BTC-USDT", first.order_id, 102, 5, 3).unwrap();
+
+        assert_eq!(modified.order_id, 3);
+        assert_eq!(modified.status, OrderStatus::New);
+        assert_eq!(modified.original_quantity, 5);
+        assert_eq!(modified.remaining_quantity, 5);
+        assert!(modified.fills.is_empty());
+
+        // The old id is canceled; the replacement is open at the new price.
+        let old = engine.order_record(first.order_id).unwrap();
+        assert_eq!(old.status, OrderStatus::Canceled);
+        assert_eq!(old.remaining_quantity, 5);
+        assert!(!engine.is_open(first.order_id));
+        assert!(engine.is_open(modified.order_id));
+
+        let book = engine.book("BTC-USDT").unwrap();
+        assert_eq!(book.depth(Side::Ask, 0), Some((101, 2)));
+        assert_eq!(book.depth(Side::Ask, 1), Some((102, 5)));
+        assert_eq!(book.depth(Side::Ask, 2), None);
+    }
+
+    #[test]
+    fn modify_quantity_only_loses_queue_priority() {
+        let mut engine = MatchingEngine::new(EngineConfig::default());
+        let first = submit(&mut engine, "BTC-USDT", limit(1, Side::Bid, 100, 2)).unwrap();
+        submit(&mut engine, "BTC-USDT", limit(2, Side::Bid, 100, 3)).unwrap();
+
+        // Same price and quantity, but the replacement is a new order at the back.
+        let modified = modify(&mut engine, "BTC-USDT", first.order_id, 100, 2, 3).unwrap();
+        assert_eq!(modified.order_id, 3);
+
+        // Sell into the level in three slices. The first two must hit order 2,
+        // proving the replacement sits behind it; the last hits the replacement.
+        submit(&mut engine, "BTC-USDT", limit(4, Side::Ask, 100, 1)).unwrap();
+        submit(&mut engine, "BTC-USDT", limit(5, Side::Ask, 100, 2)).unwrap();
+        submit(&mut engine, "BTC-USDT", limit(6, Side::Ask, 100, 2)).unwrap();
+
+        let fills: Vec<(OrderBookId, u64)> = engine
+            .trades()
+            .iter()
+            .map(|trade| (trade.maker_order_id, trade.quantity))
+            .collect();
+        assert_eq!(fills, vec![(2, 1), (2, 2), (3, 2)]);
+        assert_eq!(
+            engine.order_record(1).unwrap().status,
+            OrderStatus::Canceled
+        );
+        assert_eq!(engine.order_record(2).unwrap().status, OrderStatus::Filled);
+        assert_eq!(engine.order_record(3).unwrap().status, OrderStatus::Filled);
+    }
+
+    #[test]
+    fn modify_to_crossing_price_trades_and_rests_remainder() {
+        let mut engine = MatchingEngine::new(EngineConfig::default());
+        submit(&mut engine, "BTC-USDT", limit(1, Side::Ask, 100, 2)).unwrap();
+        submit(&mut engine, "BTC-USDT", limit(2, Side::Bid, 99, 5)).unwrap();
+
+        // The replacement bid crosses the resting ask, fills 2, and rests 3.
+        let modified = modify(&mut engine, "BTC-USDT", 2, 100, 5, 3).unwrap();
+
+        assert_eq!(modified.order_id, 3);
+        assert_eq!(modified.status, OrderStatus::PartiallyFilled);
+        assert_eq!(modified.filled_quantity, 2);
+        assert_eq!(modified.remaining_quantity, 3);
+        assert_eq!(modified.fills.len(), 1);
+        assert_eq!(modified.fills[0].maker_order_id, 1);
+        assert_eq!(modified.fills[0].taker_order_id, 3);
+        assert_eq!(modified.fills[0].quantity, 2);
+
+        assert_eq!(engine.trades().len(), 1);
+        let trade = &engine.trades()[0];
+        assert_eq!(trade.maker_order_id, 1);
+        assert_eq!(trade.taker_order_id, 3);
+        assert_eq!(trade.taker_side, Side::Bid);
+        assert_eq!(trade.timestamp, 3);
+
+        assert_eq!(engine.order_record(1).unwrap().status, OrderStatus::Filled);
+        assert_eq!(
+            engine.order_record(2).unwrap().status,
+            OrderStatus::Canceled
+        );
+        assert!(engine.is_open(3));
+
+        let book = engine.book("BTC-USDT").unwrap();
+        assert_eq!(book.best_ask(), None);
+        assert_eq!(book.best_bid(), Some(100));
+        assert_eq!(book.depth(Side::Bid, 0), Some((100, 3)));
+    }
+
+    #[test]
+    fn modify_to_crossing_price_can_fully_fill() {
+        let mut engine = MatchingEngine::new(EngineConfig::default());
+        submit(&mut engine, "BTC-USDT", limit(1, Side::Ask, 100, 5)).unwrap();
+        submit(&mut engine, "BTC-USDT", limit(2, Side::Bid, 99, 3)).unwrap();
+
+        let modified = modify(&mut engine, "BTC-USDT", 2, 100, 3, 3).unwrap();
+
+        assert_eq!(modified.order_id, 3);
+        assert_eq!(modified.status, OrderStatus::Filled);
+        assert_eq!(modified.filled_quantity, 3);
+        assert_eq!(modified.remaining_quantity, 0);
+        assert_eq!(modified.fills.len(), 1);
+
+        let maker = engine.order_record(1).unwrap();
+        assert_eq!(maker.status, OrderStatus::PartiallyFilled);
+        assert_eq!(maker.filled_quantity, 3);
+        assert_eq!(maker.remaining_quantity, 2);
+        assert_eq!(
+            engine.order_record(2).unwrap().status,
+            OrderStatus::Canceled
+        );
+        assert!(!engine.is_open(2));
+        assert!(!engine.is_open(3));
+
+        let book = engine.book("BTC-USDT").unwrap();
+        assert_eq!(book.best_bid(), None);
+        assert_eq!(book.best_ask(), Some(100));
+        assert_eq!(book.depth(Side::Ask, 0), Some((100, 2)));
+    }
+
+    #[test]
+    fn modify_partially_filled_order_keeps_history_on_old_id() {
+        let mut engine = MatchingEngine::new(EngineConfig::default());
+        submit(&mut engine, "BTC-USDT", limit(1, Side::Ask, 100, 5)).unwrap();
+        submit(&mut engine, "BTC-USDT", limit(2, Side::Bid, 100, 2)).unwrap();
+
+        // The old id keeps its partial-fill history; the replacement starts fresh.
+        let modified = modify(&mut engine, "BTC-USDT", 1, 101, 6, 3).unwrap();
+
+        assert_eq!(modified.order_id, 3);
+        assert_eq!(modified.status, OrderStatus::New);
+        assert_eq!(modified.original_quantity, 6);
+        assert_eq!(modified.filled_quantity, 0);
+        assert_eq!(modified.remaining_quantity, 6);
+
+        let old = engine.order_record(1).unwrap();
+        assert_eq!(old.status, OrderStatus::Canceled);
+        assert_eq!(old.original_quantity, 5);
+        assert_eq!(old.filled_quantity, 2);
+        assert_eq!(old.remaining_quantity, 3);
+
+        let book = engine.book("BTC-USDT").unwrap();
+        assert_eq!(book.best_ask(), Some(101));
+        assert_eq!(book.depth(Side::Ask, 0), Some((101, 6)));
+        assert_eq!(book.best_bid(), None);
+    }
+
+    #[test]
+    fn invalid_modify_leaves_original_order_untouched() {
+        let mut engine = MatchingEngine::new(EngineConfig::default());
+        let original = submit(&mut engine, "BTC-USDT", limit(1, Side::Bid, 100, 5)).unwrap();
+        let events_before = engine.events().len();
+
+        let error = modify(&mut engine, "BTC-USDT", original.order_id, 100, 0, 2).unwrap_err();
+
+        assert_eq!(error, EngineError::QuantityOutOfRange);
+        assert_eq!(engine.events().len(), events_before + 1);
+        match engine.events().last().unwrap() {
+            EngineEvent::OrderRejected { reason, .. } => {
+                assert_eq!(*reason, EngineError::QuantityOutOfRange)
+            }
+            other => panic!("expected OrderRejected, got {other:?}"),
+        }
+
+        assert!(engine.is_open(original.order_id));
+        let record = engine.order_record(original.order_id).unwrap();
+        assert_eq!(record.status, OrderStatus::New);
+        assert_eq!(record.remaining_quantity, 5);
+        assert_eq!(engine.next_order_id, 2);
+
+        let book = engine.book("BTC-USDT").unwrap();
+        assert_eq!(book.best_bid(), Some(100));
+        assert_eq!(book.depth(Side::Bid, 0), Some((100, 5)));
+
+        // An off-tick modify fails the same way, before the old order is touched.
+        let mut tick_engine = MatchingEngine::new(EngineConfig {
+            min_order_quantity: 1,
+            max_order_quantity: u64::MAX,
+            tick_size: 5,
+        });
+        let tick_order = submit(&mut tick_engine, "BTC-USDT", limit(1, Side::Bid, 100, 5)).unwrap();
+        let error =
+            modify(&mut tick_engine, "BTC-USDT", tick_order.order_id, 101, 5, 2).unwrap_err();
+
+        assert_eq!(error, EngineError::PriceNotOnTick);
+        assert!(tick_engine.is_open(tick_order.order_id));
+        let book = tick_engine.book("BTC-USDT").unwrap();
+        assert_eq!(book.best_bid(), Some(100));
+        assert_eq!(book.depth(Side::Bid, 0), Some((100, 5)));
+    }
+
+    #[test]
+    fn modify_unknown_wrong_symbol_or_closed_order_is_rejected() {
+        let mut engine = MatchingEngine::new(EngineConfig::default());
+
+        let events_before = engine.events().len();
+        assert_eq!(
+            modify(&mut engine, "BTC-USDT", 42, 100, 5, 1).unwrap_err(),
+            EngineError::UnknownOrder
+        );
+        assert_eq!(engine.events().len(), events_before + 1);
+
+        // Fully filled orders are closed.
+        submit(&mut engine, "BTC-USDT", limit(1, Side::Ask, 100, 2)).unwrap();
+        submit(&mut engine, "BTC-USDT", limit(2, Side::Bid, 100, 2)).unwrap();
+        let events_before = engine.events().len();
+        assert_eq!(
+            modify(&mut engine, "BTC-USDT", 1, 101, 1, 3).unwrap_err(),
+            EngineError::UnknownOrder
+        );
+        assert_eq!(engine.events().len(), events_before + 1);
+
+        // A wrong symbol leaves an otherwise open order untouched.
+        let open = submit(&mut engine, "BTC-USDT", limit(4, Side::Bid, 99, 1)).unwrap();
+        assert_eq!(
+            modify(&mut engine, "ETH-USDT", open.order_id, 98, 1, 5).unwrap_err(),
+            EngineError::UnknownOrder
+        );
+        assert!(engine.is_open(open.order_id));
+        assert_eq!(engine.book("BTC-USDT").unwrap().best_bid(), Some(99));
+        assert!(engine.book("ETH-USDT").is_none());
+    }
+
+    #[test]
+    fn modify_emits_cancel_then_accept_and_is_logged_once() {
+        let mut engine = MatchingEngine::new(EngineConfig::default());
+        submit(&mut engine, "BTC-USDT", limit(1, Side::Ask, 100, 5)).unwrap();
+
+        let events_before = engine.events().len();
+        let modified = modify(&mut engine, "BTC-USDT", 1, 101, 5, 2).unwrap();
+
+        assert_eq!(engine.events().len(), events_before + 2);
+        match &engine.events()[events_before] {
+            EngineEvent::OrderCanceled {
+                sequence_id,
+                report,
+            } => {
+                assert_eq!(*sequence_id, 2);
+                assert_eq!(report.order_id, 1);
+                assert_eq!(report.status, OrderStatus::Canceled);
+                assert_eq!(report.remaining_quantity, 5);
+            }
+            other => panic!("expected OrderCanceled, got {other:?}"),
+        }
+        match &engine.events()[events_before + 1] {
+            EngineEvent::OrderAccepted {
+                sequence_id,
+                report,
+            } => {
+                assert_eq!(*sequence_id, 3);
+                assert_eq!(report.order_id, modified.order_id);
+                assert_eq!(report.status, OrderStatus::New);
+            }
+            other => panic!("expected OrderAccepted, got {other:?}"),
+        }
+
+        // One client command is logged; the internal cancel and submit are not.
+        assert_eq!(engine.commands().len(), 2);
+        match &engine.commands()[1] {
+            EngineCommand::ModifyOrder {
+                symbol,
+                order_id,
+                request,
+            } => {
+                assert_eq!(symbol, "BTC-USDT");
+                assert_eq!(*order_id, 1);
+                assert_eq!(
+                    *request,
+                    ModifyRequest {
+                        price: 101,
+                        quantity: 5,
+                        timestamp: 2,
+                    }
+                );
+            }
+            other => panic!("expected ModifyOrder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_reproduces_modify_commands() {
+        let mut engine = MatchingEngine::new(EngineConfig::default());
+        submit(&mut engine, "BTC-USDT", limit(1, Side::Ask, 100, 5)).unwrap();
+        submit(&mut engine, "BTC-USDT", limit(2, Side::Bid, 99, 2)).unwrap();
+        modify(&mut engine, "BTC-USDT", 2, 100, 2, 3).unwrap();
+        submit(&mut engine, "BTC-USDT", limit(4, Side::Bid, 98, 1)).unwrap();
+
+        let replayed = MatchingEngine::from_commands(EngineConfig::default(), engine.commands());
+
+        assert_eq!(replayed.commands(), engine.commands());
+        assert_eq!(replayed.events(), engine.events());
+        assert_eq!(replayed.trades(), engine.trades());
+        assert_eq!(records(&replayed), records(&engine));
+        assert_eq!(replayed.book("BTC-USDT"), engine.book("BTC-USDT"));
+        assert_eq!(replayed.next_order_id, engine.next_order_id);
+        assert_eq!(replayed.next_trade_id, engine.next_trade_id);
+        assert_eq!(replayed.next_sequence_id, engine.next_sequence_id);
     }
 }
