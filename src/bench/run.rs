@@ -1,0 +1,428 @@
+//! Benchmark orchestration: warmup, paced measurement, and latency collection.
+
+use std::time::{Duration, Instant};
+
+use crate::engine::MatchingEngine;
+use crate::orderbook::OrderBook;
+use crate::types::{EngineConfig, EngineError, ExecutionReport, OrderRequest, OrderType, Side};
+
+use super::config::{BenchConfig, BenchError};
+use super::report::{BenchReport, CategoryStats, DepthLevels, EnvInfo, LatencyReport, RunStats};
+use super::stats::Samples;
+use super::workload::{Action, CommandKind, SYMBOL_PREFIX, Workload};
+
+const DEPTH_SCAN_CAP: u64 = 10_000;
+const SPIN_THRESHOLD: Duration = Duration::from_millis(1);
+
+pub fn run(config: &BenchConfig) -> Result<BenchReport, BenchError> {
+    config.validate()?;
+
+    let symbols: Vec<String> = (0..config.symbols)
+        .map(|index| format!("{SYMBOL_PREFIX}{index}"))
+        .collect();
+    let mut engine = MatchingEngine::new(EngineConfig::default());
+    let mut workload = Workload::new(config);
+
+    let warmup_start = Instant::now();
+    for index in 0..config.warmup {
+        let action =
+            workload.next_action(|symbol_index| book_prices(&engine, &symbols, symbol_index));
+        let prepared = Prepared::from_action(&action);
+        if config.rate > 0 {
+            pace(intended_time(warmup_start, index, config.rate));
+        }
+        let executed = execute(&mut engine, &symbols, &prepared);
+        std::hint::black_box(&executed);
+        record_workload(&mut workload, &action, executed);
+    }
+
+    let mut total_all = Samples::default();
+    let mut total_limit = Samples::default();
+    let mut total_market = Samples::default();
+    let mut total_cancel = Samples::default();
+    let mut service_all = Samples::default();
+    let mut service_limit = Samples::default();
+    let mut service_market = Samples::default();
+    let mut service_cancel = Samples::default();
+    let mut send_lag_samples = Samples::default();
+
+    let measured_start = Instant::now();
+    let events_before = engine.events().len();
+    let trades_before = engine.trades().len();
+
+    for index in 0..config.events {
+        let action =
+            workload.next_action(|symbol_index| book_prices(&engine, &symbols, symbol_index));
+        let prepared = Prepared::from_action(&action);
+        let intended = if config.rate > 0 {
+            Some(intended_time(measured_start, index, config.rate))
+        } else {
+            None
+        };
+        if let Some(intended) = intended {
+            pace(intended);
+        }
+
+        let send = Instant::now();
+        let executed = execute(&mut engine, &symbols, &prepared);
+        let done = Instant::now();
+        std::hint::black_box(&executed);
+
+        let service = ns_between(send, done);
+        let (total, send_lag) = match intended {
+            Some(intended) => (ns_between(intended, done), ns_between(intended, send)),
+            None => (service, 0),
+        };
+
+        total_all.push(total);
+        service_all.push(service);
+        send_lag_samples.push(send_lag);
+        match action.kind {
+            CommandKind::Limit => {
+                total_limit.push(total);
+                service_limit.push(service);
+            }
+            CommandKind::Market => {
+                total_market.push(total);
+                service_market.push(service);
+            }
+            CommandKind::Cancel => {
+                total_cancel.push(total);
+                service_cancel.push(service);
+            }
+        }
+
+        record_workload(&mut workload, &action, executed);
+    }
+
+    let wall_time_ns = duration_ns(measured_start.elapsed());
+    let engine_events = (engine.events().len() - events_before) as u64;
+    let trades = (engine.trades().len() - trades_before) as u64;
+    let final_depth_levels = count_depth(&engine, &symbols);
+
+    let latency = LatencyReport {
+        total: CategoryStats {
+            all: total_all.summary(),
+            limit: total_limit.summary(),
+            market: total_market.summary(),
+            cancel: total_cancel.summary(),
+        },
+        service: CategoryStats {
+            all: service_all.summary(),
+            limit: service_limit.summary(),
+            market: service_market.summary(),
+            cancel: service_cancel.summary(),
+        },
+        send_lag: send_lag_samples.summary(),
+    };
+
+    let achieved_rate = if wall_time_ns == 0 {
+        0.0
+    } else {
+        config.events as f64 / (wall_time_ns as f64 / 1e9)
+    };
+
+    Ok(BenchReport {
+        config: config.clone(),
+        run: RunStats {
+            wall_time_ns,
+            achieved_rate,
+            commands: config.events,
+            engine_events,
+            trades,
+            rejections: workload.rejections(),
+            final_open_orders: workload.open_len(),
+            peak_open_orders: workload.peak_open_orders(),
+            final_depth_levels,
+        },
+        latency,
+        env: EnvInfo::current(),
+    })
+}
+
+enum Prepared {
+    Limit {
+        symbol_index: usize,
+        request: OrderRequest,
+    },
+    Market {
+        symbol_index: usize,
+        request: OrderRequest,
+    },
+    Cancel {
+        symbol_index: usize,
+        order_id: u64,
+    },
+}
+
+impl Prepared {
+    fn from_action(action: &Action) -> Self {
+        let request = OrderRequest {
+            side: action.side,
+            price: action.price,
+            quantity: action.quantity,
+            timestamp: action.timestamp,
+            order_type: match action.kind {
+                CommandKind::Limit => OrderType::Limit,
+                CommandKind::Market => OrderType::Market,
+                CommandKind::Cancel => OrderType::Limit,
+            },
+        };
+
+        match action.kind {
+            CommandKind::Limit => Self::Limit {
+                symbol_index: action.symbol_index,
+                request,
+            },
+            CommandKind::Market => Self::Market {
+                symbol_index: action.symbol_index,
+                request,
+            },
+            CommandKind::Cancel => Self::Cancel {
+                symbol_index: action.symbol_index,
+                order_id: action
+                    .target_order_id
+                    .expect("cancel actions carry a target order id"),
+            },
+        }
+    }
+}
+
+enum Executed {
+    Submit(Result<ExecutionReport, EngineError>),
+    Cancel(Option<ExecutionReport>),
+}
+
+fn execute(engine: &mut MatchingEngine, symbols: &[String], prepared: &Prepared) -> Executed {
+    match prepared {
+        Prepared::Limit {
+            symbol_index,
+            request,
+        } => Executed::Submit(engine.submit_limit_order(&symbols[*symbol_index], *request)),
+        Prepared::Market {
+            symbol_index,
+            request,
+        } => Executed::Submit(engine.submit_market_order(&symbols[*symbol_index], *request)),
+        Prepared::Cancel {
+            symbol_index,
+            order_id,
+        } => Executed::Cancel(engine.cancel_order(&symbols[*symbol_index], *order_id)),
+    }
+}
+
+fn record_workload(workload: &mut Workload, action: &Action, executed: Executed) {
+    match executed {
+        Executed::Submit(result) => workload.on_submit_result(action, &result),
+        Executed::Cancel(report) => workload.on_cancel_result(action, report.as_ref()),
+    }
+}
+
+fn book_prices(
+    engine: &MatchingEngine,
+    symbols: &[String],
+    symbol_index: usize,
+) -> (Option<u64>, Option<u64>) {
+    engine
+        .book(&symbols[symbol_index])
+        .map_or((None, None), |book| (book.best_bid(), book.best_ask()))
+}
+
+fn intended_time(start: Instant, index: u64, rate: u64) -> Instant {
+    let offset_ns = (index as u128 * 1_000_000_000u128 / rate as u128).min(u64::MAX as u128) as u64;
+    start
+        .checked_add(Duration::from_nanos(offset_ns))
+        .unwrap_or(start)
+}
+
+fn pace(intended: Instant) {
+    let now = Instant::now();
+    if now >= intended {
+        return;
+    }
+
+    let remaining = intended - now;
+    if remaining > SPIN_THRESHOLD {
+        std::thread::sleep(remaining - SPIN_THRESHOLD);
+    }
+
+    while Instant::now() < intended {
+        std::hint::spin_loop();
+    }
+}
+
+fn ns_between(start: Instant, end: Instant) -> u64 {
+    duration_ns(end.saturating_duration_since(start))
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    duration.as_nanos().min(u64::MAX as u128) as u64
+}
+
+fn count_depth(engine: &MatchingEngine, symbols: &[String]) -> DepthLevels {
+    let mut bids = 0;
+    let mut asks = 0;
+    let mut bids_capped = false;
+    let mut asks_capped = false;
+
+    for symbol in symbols {
+        if let Some(book) = engine.book(symbol) {
+            let (bid_levels, bid_capped) = scan_side(book, Side::Bid);
+            let (ask_levels, ask_capped) = scan_side(book, Side::Ask);
+            bids += bid_levels;
+            asks += ask_levels;
+            bids_capped |= bid_capped;
+            asks_capped |= ask_capped;
+        }
+    }
+
+    DepthLevels {
+        bids,
+        asks,
+        bids_capped,
+        asks_capped,
+    }
+}
+
+fn scan_side(book: &OrderBook, side: Side) -> (u64, bool) {
+    for level in 0..DEPTH_SCAN_CAP {
+        if book.depth(side, level as usize).is_none() {
+            return (level, false);
+        }
+    }
+    (DEPTH_SCAN_CAP, true)
+}
+
+#[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
+mod tests {
+    use super::*;
+
+    fn tiny_config() -> BenchConfig {
+        let mut config = BenchConfig::default();
+        config.events = 500;
+        config.warmup = 50;
+        config.rate = 0;
+        config.symbols = 1;
+        config.seed = 7;
+        config
+    }
+
+    #[test]
+    fn rate_zero_makes_total_equal_service_and_zero_send_lag() {
+        let report = run(&tiny_config()).expect("benchmark run");
+        assert_eq!(report.latency.total.all, report.latency.service.all);
+        assert_eq!(report.latency.send_lag.count, 500);
+        assert_eq!(report.latency.send_lag.max, 0);
+        assert_eq!(report.latency.send_lag.mean, 0);
+    }
+
+    #[test]
+    fn same_seed_reproduces_counts() {
+        let config = tiny_config();
+        let first = run(&config).expect("first run");
+        let second = run(&config).expect("second run");
+
+        assert_eq!(first.run.commands, second.run.commands);
+        assert_eq!(first.run.engine_events, second.run.engine_events);
+        assert_eq!(first.run.trades, second.run.trades);
+        assert_eq!(first.run.final_open_orders, second.run.final_open_orders);
+        assert_eq!(first.run.peak_open_orders, second.run.peak_open_orders);
+    }
+
+    #[test]
+    fn default_workload_produces_no_rejections() {
+        let report = run(&tiny_config()).expect("benchmark run");
+        assert_eq!(report.run.rejections, 0);
+    }
+
+    #[test]
+    fn peak_open_orders_respects_the_cap() {
+        let mut config = tiny_config();
+        config.events = 2_000;
+        config.warmup = 200;
+        config.max_open_orders = 10;
+        let report = run(&config).expect("benchmark run");
+        assert!(report.run.peak_open_orders <= 10);
+        assert!(report.run.final_open_orders <= 10);
+    }
+
+    #[test]
+    fn observed_mix_matches_configured_ratios() {
+        let mut config = tiny_config();
+        config.events = 10_000;
+        config.warmup = 1_000;
+        config.rate = 0;
+
+        let report = run(&config).expect("benchmark run");
+        let total = report.latency.total.all.count as f64;
+        let limit = report.latency.total.limit.count as f64 / total;
+        let market = report.latency.total.market.count as f64 / total;
+        let cancel = report.latency.total.cancel.count as f64 / total;
+
+        assert!((limit - 0.60).abs() < 0.02, "limit share was {limit}");
+        assert!((market - 0.15).abs() < 0.02, "market share was {market}");
+        assert!((cancel - 0.25).abs() < 0.02, "cancel share was {cancel}");
+    }
+
+    #[test]
+    fn medium_runs_mark_p999_indicative() {
+        let mut config = tiny_config();
+        config.events = 20_000;
+        config.warmup = 0;
+        config.rate = 0;
+
+        let report = run(&config).expect("benchmark run");
+        let text = report.render_text();
+        assert!(text.contains("p99.9 indicative"));
+        assert!(!text.contains("p99.9 unreliable"));
+    }
+
+    #[test]
+    fn empty_categories_are_serialized_with_zero_counts() {
+        let mut config = tiny_config();
+        config.events = 200;
+        config.warmup = 0;
+        config.rate = 0;
+        config.limit_ratio = 1.0;
+        config.market_ratio = 0.0;
+        config.cancel_ratio = 0.0;
+        config.cross_ratio = 0.0;
+
+        let report = run(&config).expect("benchmark run");
+        let json = report.to_json();
+        assert!(json.contains("\"market\": {\n        \"count\": 0"));
+        assert!(json.contains("\"cancel\": {\n        \"count\": 0"));
+    }
+
+    #[test]
+    fn final_depth_is_reported() {
+        let report = run(&tiny_config()).expect("benchmark run");
+        let levels = report.run.final_depth_levels.bids + report.run.final_depth_levels.asks;
+        assert!(levels > 0, "expected resting orders after the run");
+    }
+
+    #[test]
+    fn invalid_ratios_are_usage_errors() {
+        let mut config = tiny_config();
+        config.limit_ratio = 0.9;
+        config.market_ratio = 0.9;
+        let error = run(&config).expect_err("invalid ratios must fail");
+        assert!(matches!(error, BenchError::Usage(_)));
+    }
+
+    #[test]
+    fn report_renders_text_and_json_sections() {
+        let report = run(&tiny_config()).expect("benchmark run");
+
+        let text = report.render_text();
+        assert!(text.contains("latency (ns)"));
+        assert!(text.contains("per command type"));
+        assert!(text.contains("p99.9 unreliable"));
+
+        let json = report.to_json();
+        assert!(json.contains("\"config\""));
+        assert!(json.contains("\"latency_ns\""));
+        assert!(json.contains("\"peak_open_orders\""));
+        assert!(json.contains("\"env\""));
+    }
+}
