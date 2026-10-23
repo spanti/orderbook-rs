@@ -189,7 +189,7 @@ impl BenchReport {
         .expect("writing to a String cannot fail");
         writeln!(
             out,
-            "note: timings use the OS monotonic clock; Windows QPC typically ticks at ~100 ns"
+            "note: timings use the OS monotonic clock; Windows QPC typically ticks at ~100 ns, so do not interpret sub-tick differences"
         )
         .expect("writing to a String cannot fail");
 

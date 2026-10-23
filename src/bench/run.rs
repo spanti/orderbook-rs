@@ -27,7 +27,7 @@ pub fn run(config: &BenchConfig) -> Result<BenchReport, BenchError> {
     for index in 0..config.warmup {
         let action =
             workload.next_action(|symbol_index| book_prices(&engine, &symbols, symbol_index));
-        let prepared = Prepared::from_action(&action);
+        let prepared = PreparedCommand::from_action(&action);
         if config.rate > 0 {
             pace(intended_time(warmup_start, index, config.rate));
         }
@@ -46,6 +46,8 @@ pub fn run(config: &BenchConfig) -> Result<BenchReport, BenchError> {
     let mut service_cancel = Samples::default();
     let mut send_lag_samples = Samples::default();
 
+    workload.start_measurement();
+
     let measured_start = Instant::now();
     let events_before = engine.events().len();
     let trades_before = engine.trades().len();
@@ -53,7 +55,7 @@ pub fn run(config: &BenchConfig) -> Result<BenchReport, BenchError> {
     for index in 0..config.events {
         let action =
             workload.next_action(|symbol_index| book_prices(&engine, &symbols, symbol_index));
-        let prepared = Prepared::from_action(&action);
+        let prepared = PreparedCommand::from_action(&action);
         let intended = if config.rate > 0 {
             Some(intended_time(measured_start, index, config.rate))
         } else {
@@ -140,7 +142,7 @@ pub fn run(config: &BenchConfig) -> Result<BenchReport, BenchError> {
     })
 }
 
-enum Prepared {
+enum PreparedCommand {
     Limit {
         symbol_index: usize,
         request: OrderRequest,
@@ -155,7 +157,7 @@ enum Prepared {
     },
 }
 
-impl Prepared {
+impl PreparedCommand {
     fn from_action(action: &Action) -> Self {
         let request = OrderRequest {
             side: action.side,
@@ -193,17 +195,21 @@ enum Executed {
     Cancel(Option<ExecutionReport>),
 }
 
-fn execute(engine: &mut MatchingEngine, symbols: &[String], prepared: &Prepared) -> Executed {
+fn execute(
+    engine: &mut MatchingEngine,
+    symbols: &[String],
+    prepared: &PreparedCommand,
+) -> Executed {
     match prepared {
-        Prepared::Limit {
+        PreparedCommand::Limit {
             symbol_index,
             request,
         } => Executed::Submit(engine.submit_limit_order(&symbols[*symbol_index], *request)),
-        Prepared::Market {
+        PreparedCommand::Market {
             symbol_index,
             request,
         } => Executed::Submit(engine.submit_market_order(&symbols[*symbol_index], *request)),
-        Prepared::Cancel {
+        PreparedCommand::Cancel {
             symbol_index,
             order_id,
         } => Executed::Cancel(engine.cancel_order(&symbols[*symbol_index], *order_id)),
@@ -398,7 +404,11 @@ mod tests {
     fn final_depth_is_reported() {
         let report = run(&tiny_config()).expect("benchmark run");
         let levels = report.run.final_depth_levels.bids + report.run.final_depth_levels.asks;
-        assert!(levels > 0, "expected resting orders after the run");
+
+        assert!(report.run.final_open_orders <= report.run.peak_open_orders);
+        if report.run.final_open_orders > 0 {
+            assert!(levels > 0, "expected resting orders after the run");
+        }
     }
 
     #[test]
@@ -415,13 +425,20 @@ mod tests {
         let report = run(&tiny_config()).expect("benchmark run");
 
         let text = report.render_text();
+        assert!(text.contains("config   events="));
+        assert!(text.contains("workload limit="));
+        assert!(text.contains("run\n"));
         assert!(text.contains("latency (ns)"));
         assert!(text.contains("per command type"));
         assert!(text.contains("p99.9 unreliable"));
 
         let json = report.to_json();
         assert!(json.contains("\"config\""));
+        assert!(json.contains("\"run\""));
         assert!(json.contains("\"latency_ns\""));
+        assert!(json.contains("\"total\""));
+        assert!(json.contains("\"service\""));
+        assert!(json.contains("\"send_lag\""));
         assert!(json.contains("\"peak_open_orders\""));
         assert!(json.contains("\"env\""));
     }

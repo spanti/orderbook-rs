@@ -151,7 +151,13 @@ fn json_out_writes_a_pretty_report() {
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     let json = std::fs::read_to_string(&path).expect("json report exists");
     assert!(json.contains("\n  \"config\": {"));
+    assert!(json.contains("\"events\": 100"));
+    assert!(json.contains("\"rate\": 0"));
     assert!(json.contains("\"latency_ns\""));
+    assert!(json.contains("\"total\": {"));
+    assert!(json.contains("\"service\": {"));
+    assert!(json.contains("\"send_lag\": {"));
+    assert!(json.contains("\"final_depth_levels\""));
     assert!(json.contains("\"peak_open_orders\""));
     assert!(json.contains("\"env\""));
 

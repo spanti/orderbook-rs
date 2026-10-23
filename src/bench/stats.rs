@@ -25,14 +25,6 @@ impl Samples {
         self.values.push(value);
     }
 
-    pub fn len(&self) -> usize {
-        self.values.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
-    }
-
     /// Sorts the samples in place and computes the summary.
     pub fn summary(&mut self) -> Summary {
         if self.values.is_empty() {
@@ -89,6 +81,14 @@ mod tests {
     fn nearest_rank_handles_empty_and_single() {
         assert_eq!(percentile_nearest_rank(&[], 0.50), 0);
         assert_eq!(percentile_nearest_rank(&[7], 0.999), 7);
+    }
+
+    #[test]
+    fn nearest_rank_handles_duplicate_values() {
+        let sorted = [5, 5, 5, 9, 9];
+        assert_eq!(percentile_nearest_rank(&sorted, 0.50), 5);
+        assert_eq!(percentile_nearest_rank(&sorted, 0.99), 9);
+        assert_eq!(percentile_nearest_rank(&sorted, 0.999), 9);
     }
 
     #[test]

@@ -323,3 +323,80 @@ fn parse_f64(flag: &str, value: &str) -> Result<f64, BenchError> {
         .parse::<f64>()
         .map_err(|_| BenchError::usage(format!("invalid value for {flag}: {value}")))
 }
+
+#[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn warmup_default_is_ten_percent_capped() {
+        assert_eq!(default_warmup(1), 0);
+        assert_eq!(default_warmup(1_000), 100);
+        assert_eq!(default_warmup(500_000), 50_000);
+        assert_eq!(default_warmup(2_000_000), 100_000);
+    }
+
+    #[test]
+    fn ratio_sum_uses_a_one_e_minus_six_tolerance() {
+        let mut config = BenchConfig::default();
+        config.limit_ratio = 0.6;
+        config.market_ratio = 0.15;
+        config.cancel_ratio = 0.249_999_5;
+        assert!(config.validate().is_ok());
+
+        config.cancel_ratio = 0.249_998;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn out_of_range_ratios_are_rejected() {
+        let mut config = BenchConfig::default();
+        config.limit_ratio = 1.5;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn parse_supports_both_value_forms() {
+        let action = parse_args([
+            "--events=1000".to_string(),
+            "--rate".to_string(),
+            "0".to_string(),
+        ])
+        .expect("valid arguments");
+
+        let CliAction::Run(config) = action else {
+            panic!("expected a run action");
+        };
+        assert_eq!(config.events, 1000);
+        assert_eq!(config.warmup, 100);
+        assert_eq!(config.rate, 0);
+    }
+
+    #[test]
+    fn parse_rejects_unknown_duplicate_and_missing_values() {
+        assert!(parse_args(["--not-a-flag".to_string()]).is_err());
+        assert!(
+            parse_args([
+                "--events".to_string(),
+                "1".to_string(),
+                "--events".to_string(),
+                "2".to_string()
+            ])
+            .is_err()
+        );
+        assert!(parse_args(["--events".to_string()]).is_err());
+    }
+
+    #[test]
+    fn help_short_circuits_parsing() {
+        assert_eq!(
+            parse_args(["--help".to_string()]).expect("help"),
+            CliAction::Help
+        );
+        assert_eq!(
+            parse_args(["-h".to_string()]).expect("help"),
+            CliAction::Help
+        );
+    }
+}

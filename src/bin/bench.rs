@@ -11,10 +11,9 @@ fn main() {
         }
         Ok(CliAction::Run(config)) => {
             if cfg!(debug_assertions) && !config.allow_debug {
-                eprintln!(
-                    "error: benchmark must be built with --release; pass --allow-debug to run anyway"
-                );
-                std::process::exit(2);
+                let error = BenchError::DebugBuild;
+                eprintln!("error: {error}");
+                std::process::exit(error.exit_code());
             }
 
             match run(&config) {

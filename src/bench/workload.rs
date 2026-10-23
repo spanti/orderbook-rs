@@ -75,7 +75,7 @@ pub struct Workload {
     cancel_ratio: f64,
     cross_ratio: f64,
     timestamp: u64,
-    open: OpenOrders,
+    open_orders: OpenOrders,
     rejections: u64,
     peak_open_orders: u64,
 }
@@ -96,7 +96,7 @@ impl Workload {
             cancel_ratio: config.cancel_ratio,
             cross_ratio: config.cross_ratio,
             timestamp: 0,
-            open: OpenOrders::default(),
+            open_orders: OpenOrders::default(),
             rejections: 0,
             peak_open_orders: 0,
         }
@@ -114,23 +114,23 @@ impl Workload {
         self.timestamp = self.timestamp.saturating_add(1);
         let timestamp = self.timestamp;
 
-        if self.open.len() as u64 >= self.max_open_orders
-            && let Some((order_id, target_symbol)) = self.open.random_entry(&mut self.rng)
+        if self.open_orders.len() as u64 >= self.max_open_orders
+            && let Some((order_id, target_symbol)) = self.open_orders.random_entry(&mut self.rng)
         {
             return Action::cancel(target_symbol, order_id, timestamp);
         }
 
         let roll = self.rng.next_f64();
         if roll < self.cancel_ratio {
-            if let Some((order_id, target_symbol)) = self.open.random_entry(&mut self.rng) {
+            if let Some((order_id, target_symbol)) = self.open_orders.random_entry(&mut self.rng) {
                 return Action::cancel(target_symbol, order_id, timestamp);
             }
-            return self.limit_action(symbol_index, &book, timestamp);
+            return self.limit_action(symbol_index, &book, timestamp, false);
         }
         if roll < self.cancel_ratio + self.market_ratio {
             return self.market_action(symbol_index, timestamp);
         }
-        self.limit_action(symbol_index, &book, timestamp)
+        self.limit_action(symbol_index, &book, timestamp, true)
     }
 
     pub fn on_submit_result(
@@ -143,13 +143,13 @@ impl Workload {
         match result {
             Ok(report) => {
                 for fill in &report.fills {
-                    self.open.on_fill(fill.maker_order_id, fill.quantity);
+                    self.open_orders.on_fill(fill.maker_order_id, fill.quantity);
                 }
                 if matches!(
                     report.status,
                     OrderStatus::New | OrderStatus::PartiallyFilled
                 ) {
-                    self.open.insert(
+                    self.open_orders.insert(
                         report.order_id,
                         action.symbol_index,
                         report.remaining_quantity,
@@ -164,16 +164,21 @@ impl Workload {
         self.update_peak();
     }
 
-    pub fn on_cancel_result(&mut self, action: &Action, _result: Option<&ExecutionReport>) {
+    pub fn on_cancel_result(&mut self, action: &Action, result: Option<&ExecutionReport>) {
         debug_assert_eq!(action.kind, CommandKind::Cancel);
+        if result.is_none() {
+            // A cancel that the engine did not apply means the harness selected
+            // a stale order. Treat it like a rejection so it is visible.
+            self.rejections = self.rejections.saturating_add(1);
+        }
         if let Some(order_id) = action.target_order_id {
-            self.open.remove(order_id);
+            self.open_orders.remove(order_id);
         }
         self.update_peak();
     }
 
     pub fn open_len(&self) -> u64 {
-        self.open.len() as u64
+        self.open_orders.len() as u64
     }
 
     pub fn peak_open_orders(&self) -> u64 {
@@ -182,6 +187,13 @@ impl Workload {
 
     pub fn rejections(&self) -> u64 {
         self.rejections
+    }
+
+    /// Resets the counters that describe the measured phase. Call once after
+    /// warmup so reported stats do not include warmup commands.
+    pub fn start_measurement(&mut self) {
+        self.peak_open_orders = self.open_orders.len() as u64;
+        self.rejections = 0;
     }
 
     fn walk_mid(&mut self, symbol_index: usize) {
@@ -202,12 +214,18 @@ impl Workload {
         self.mids[symbol_index] = next.clamp(lower, upper);
     }
 
-    fn limit_action<F>(&mut self, symbol_index: usize, book: &F, timestamp: u64) -> Action
+    fn limit_action<F>(
+        &mut self,
+        symbol_index: usize,
+        book: &F,
+        timestamp: u64,
+        allow_crossing: bool,
+    ) -> Action
     where
         F: Fn(usize) -> (Option<u64>, Option<u64>),
     {
         let side = self.random_side();
-        let crossing = self.rng.chance(self.cross_ratio);
+        let crossing = allow_crossing && self.rng.chance(self.cross_ratio);
         let mid = self.mids[symbol_index];
         let (best_bid, best_ask) = book(symbol_index);
 
@@ -269,7 +287,7 @@ impl Workload {
     }
 
     fn update_peak(&mut self) {
-        let open = self.open.len() as u64;
+        let open = self.open_orders.len() as u64;
         if open > self.peak_open_orders {
             self.peak_open_orders = open;
         }
@@ -431,6 +449,34 @@ mod tests {
     }
 
     #[test]
+    fn cancel_fallback_stays_non_crossing_even_when_cross_ratio_is_one() {
+        let mut config = BenchConfig::default();
+        config.limit_ratio = 0.0;
+        config.market_ratio = 0.0;
+        config.cancel_ratio = 1.0;
+        config.cross_ratio = 1.0;
+        config.symbols = 1;
+
+        let mut workload = Workload::new(&config);
+        for _ in 0..50 {
+            let action = workload.next_action(|_| (Some(1), Some(1_000_000)));
+            assert_eq!(action.kind, CommandKind::Limit);
+            match action.side {
+                Side::Bid => assert!(
+                    action.price < 1_000_000,
+                    "fallback bid crossed ask: {}",
+                    action.price
+                ),
+                Side::Ask => assert!(
+                    action.price > 1,
+                    "fallback ask crossed bid: {}",
+                    action.price
+                ),
+            }
+        }
+    }
+
+    #[test]
     fn crossing_prices_cross_the_opposite_best() {
         let mut config = BenchConfig::default();
         config.limit_ratio = 1.0;
@@ -507,6 +553,43 @@ mod tests {
         workload.on_submit_result(&action, &Err(EngineError::QuantityOutOfRange));
         assert_eq!(workload.rejections(), 1);
         assert_eq!(workload.open_len(), 0);
+    }
+
+    #[test]
+    fn failed_cancels_are_counted_as_harness_errors() {
+        let mut config = BenchConfig::default();
+        config.symbols = 1;
+        let mut workload = Workload::new(&config);
+
+        let cancel = Action::cancel(0, 999, 1);
+        workload.on_cancel_result(&cancel, None);
+
+        assert_eq!(workload.rejections(), 1);
+        assert_eq!(workload.open_len(), 0);
+    }
+
+    #[test]
+    fn start_measurement_resets_counters_to_the_current_pool() {
+        let mut config = BenchConfig::default();
+        config.symbols = 1;
+        let mut workload = Workload::new(&config);
+
+        for order_id in 1..=3 {
+            let action = Action::submit(0, CommandKind::Limit, Side::Bid, 100, 10, order_id);
+            let report = report(order_id, OrderStatus::New, 10, 0, 10, Vec::new());
+            workload.on_submit_result(&action, &Ok(report));
+        }
+        assert_eq!(workload.peak_open_orders(), 3);
+
+        let cancel = Action::cancel(0, 1, 4);
+        let cancel_report = report(1, OrderStatus::Canceled, 10, 0, 10, Vec::new());
+        workload.on_cancel_result(&cancel, Some(&cancel_report));
+        assert_eq!(workload.peak_open_orders(), 3);
+
+        workload.start_measurement();
+        assert_eq!(workload.open_len(), 2);
+        assert_eq!(workload.peak_open_orders(), 2);
+        assert_eq!(workload.rejections(), 0);
     }
 
     #[test]
