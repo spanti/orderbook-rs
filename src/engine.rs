@@ -1,10 +1,10 @@
 use colored::Colorize;
 
-use std::cmp::Reverse;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use crate::ledger::OrderLedger;
 use crate::orderbook::OrderBook;
+use crate::stop_book::StopBook;
 use crate::types::{
     BookSnapshot, CommandOutcome, EngineCommand, EngineConfig, EngineError, EngineEvent,
     ExecutionReport, Fill, ModifyRequest, Order, OrderBookId, OrderRecord, OrderRequest,
@@ -15,13 +15,6 @@ use crate::types::{
 struct LastTrade {
     price: u64,
     timestamp: u64,
-}
-
-#[derive(Debug, Default)]
-struct StopBook {
-    buy: BTreeSet<(u64, OrderBookId)>, // (stop_price, order_id)
-    sell: BTreeSet<(Reverse<u64>, OrderBookId)>, // (Reverse(stop_price), order_id)
-    orders: HashMap<OrderBookId, StopOrder>,
 }
 
 enum TakerRecord {
@@ -151,27 +144,7 @@ impl MatchingEngine {
     }
 
     fn next_triggered_stop(&self, symbol: &str, last_price: u64) -> Option<OrderBookId> {
-        let book = self.stop_books.get(symbol)?;
-
-        // 买止损：stop_price <= last，价格升序 + id 升序
-        let buy = book
-            .buy
-            .range(..=(last_price, OrderBookId::MAX))
-            .next()
-            .map(|&(_, id)| id);
-
-        // 卖止损：stop_price >= last，即 Reverse(stop_price) <= Reverse(last)
-        // 升序遍历 = 价格降序 + id 升序
-        let sell = book
-            .sell
-            .range(..=(Reverse(last_price), OrderBookId::MAX))
-            .next()
-            .map(|&(_, id)| id);
-
-        match (buy, sell) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        self.stop_books.get(symbol)?.next_triggered(last_price)
     }
 
     fn trigger_stop(
@@ -182,7 +155,9 @@ impl MatchingEngine {
         last_timestamp: u64,
     ) {
         let stop = self
-            .remove_pending_stop(symbol, order_id)
+            .stop_books
+            .get_mut(symbol)
+            .and_then(|book| book.remove(order_id))
             .expect("stop index and order map diverged");
 
         // StopTriggered event
@@ -216,17 +191,6 @@ impl MatchingEngine {
 
         let _report =
             self.execute_taker(symbol, &request, order_id, TakerRecord::ResumePendingStop);
-    }
-
-    fn remove_pending_stop(&mut self, symbol: &str, order_id: OrderBookId) -> Option<StopOrder> {
-        let book = self.stop_books.get_mut(symbol)?;
-        let stop = book.orders.remove(&order_id)?;
-        let removed = match stop.side {
-            Side::Bid => book.buy.remove(&(stop.stop_price, order_id)),
-            Side::Ask => book.sell.remove(&(Reverse(stop.stop_price), order_id)),
-        };
-        debug_assert!(removed, "stop index missing entry for {order_id}");
-        Some(stop)
     }
 
     fn can_fill_completely(&self, symbol: &str, request: &OrderRequest) -> bool {
@@ -333,7 +297,9 @@ impl MatchingEngine {
 
         if pending_stop {
             let stop = self
-                .remove_pending_stop(symbol, order_id)
+                .stop_books
+                .get_mut(symbol)
+                .and_then(|book| book.remove(order_id))
                 .expect("pending stop missing from stop store");
             let report = self
                 .ledger
@@ -353,7 +319,7 @@ impl MatchingEngine {
     /// 仅返回“待触发”的止损单；触发/撤销后返回 None。
     pub fn stop_order(&self, order_id: OrderBookId) -> Option<&StopOrder> {
         let record = self.ledger.get(order_id)?;
-        self.stop_books.get(&record.symbol)?.orders.get(&order_id)
+        self.stop_books.get(&record.symbol)?.get(order_id)
     }
 
     /// 按侧返回：买侧触发价升序，卖侧触发价降序；同价按 order_id 升序。
@@ -361,18 +327,7 @@ impl MatchingEngine {
         let Some(book) = self.stop_books.get(symbol) else {
             return Vec::new();
         };
-        match side {
-            Side::Bid => book
-                .buy
-                .iter()
-                .filter_map(|&(_, id)| book.orders.get(&id))
-                .collect(),
-            Side::Ask => book
-                .sell
-                .iter()
-                .filter_map(|&(_, id)| book.orders.get(&id))
-                .collect(),
-        }
+        book.iter(side).collect()
     }
 
     fn validate_quantity(&self, quantity: u64) -> Result<(), EngineError> {
@@ -432,16 +387,10 @@ impl MatchingEngine {
             timestamp: request.timestamp,
         };
 
-        let book = self.stop_books.entry(symbol.to_string()).or_default();
-        match stop.side {
-            Side::Bid => {
-                book.buy.insert((stop.stop_price, order_id));
-            }
-            Side::Ask => {
-                book.sell.insert((Reverse(stop.stop_price), order_id));
-            }
-        }
-        book.orders.insert(order_id, stop);
+        self.stop_books
+            .entry(symbol.to_string())
+            .or_default()
+            .insert(stop);
 
         let report = self
             .ledger
