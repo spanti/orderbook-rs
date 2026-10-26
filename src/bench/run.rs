@@ -65,9 +65,7 @@ fn run_decide(config: &BenchConfig) -> Result<BenchReport, BenchError> {
     };
 
     for _ in 0..config.warmup {
-        let events = engine
-            .decide(&command)
-            .expect("the decide baseline command is supported");
+        let events = engine.decide(&command);
         std::hint::black_box(&events);
     }
 
@@ -75,9 +73,7 @@ fn run_decide(config: &BenchConfig) -> Result<BenchReport, BenchError> {
     let measured_start = Instant::now();
     for _ in 0..config.events {
         let start = Instant::now();
-        let events = engine
-            .decide(&command)
-            .expect("the decide baseline command is supported");
+        let events = engine.decide(&command);
         let elapsed = ns_between(start, Instant::now());
         std::hint::black_box(&events);
         samples.push(elapsed);

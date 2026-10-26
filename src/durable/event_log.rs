@@ -320,18 +320,16 @@ impl EventSourcedEngine {
 
     /// Decide, append every event, then apply it.
     ///
-    /// A decision the event-sourced path does not support is returned as
-    /// [`DurableError::DecisionRejected`] and appends nothing. A failed append
-    /// applies nothing and leaves the instance failed closed.
+    /// Every command produces at least one event. A business rejection is a
+    /// successful, event-producing execute: it journals one
+    /// [`DomainEvent::OrderRejected`] and changes no engine state. A failed
+    /// append applies nothing and leaves the instance failed closed.
     pub fn execute(&mut self, command: EngineCommand) -> Result<Vec<DomainEvent>, DurableError> {
         if self.failed {
             return Err(DurableError::EngineFailed);
         }
 
-        let events = self
-            .engine
-            .decide(&command)
-            .map_err(DurableError::DecisionRejected)?;
+        let events = self.engine.decide(&command);
         if events.is_empty() {
             return Ok(events);
         }

@@ -36,6 +36,20 @@ fn submit(symbol: &str, request: OrderRequest) -> EngineCommand {
     }
 }
 
+fn rejected(command: &EngineCommand, reason: EngineError) -> DomainEvent {
+    let symbol = match command {
+        EngineCommand::SubmitOrder { symbol, .. }
+        | EngineCommand::SubmitStopOrder { symbol, .. }
+        | EngineCommand::CancelOrder { symbol, .. }
+        | EngineCommand::ModifyOrder { symbol, .. } => symbol,
+    };
+    DomainEvent::OrderRejected {
+        symbol: symbol.clone(),
+        reason,
+        command: command.clone(),
+    }
+}
+
 fn order_id(events: &[DomainEvent]) -> OrderBookId {
     match events.first().expect("decision emits at least one event") {
         DomainEvent::OrderAccepted { order, .. } => order.id,
@@ -47,6 +61,9 @@ fn order_id(events: &[DomainEvent]) -> OrderBookId {
         DomainEvent::TradeExecuted { .. } => {
             panic!("a decision starts with OrderAccepted or StopPlaced, not TradeExecuted")
         }
+        DomainEvent::OrderRejected { .. } => {
+            panic!("a rejected decision has no order id")
+        }
     }
 }
 
@@ -55,9 +72,7 @@ fn decide_returns_accepted_then_rested_for_a_non_crossing_limit_submit() {
     let engine = MatchingEngine::new(EngineConfig::default());
     let command = submit(BTC, limit(Side::Bid, 99, 5, 1));
 
-    let events = engine
-        .decide(&command)
-        .expect("a resting limit submit is supported");
+    let events = engine.decide(&command);
 
     assert_eq!(events.len(), 2);
     match &events[0] {
@@ -99,7 +114,7 @@ fn order_accepted_carries_the_post_only_flag_of_a_non_crossing_submit() {
     let mut request = limit(Side::Bid, 99, 2, 1);
     request.post_only = true;
 
-    let events = engine.decide(&submit(BTC, request)).unwrap();
+    let events = engine.decide(&submit(BTC, request));
 
     match &events[0] {
         DomainEvent::OrderAccepted { post_only, .. } => assert!(*post_only),
@@ -111,7 +126,7 @@ fn order_accepted_carries_the_post_only_flag_of_a_non_crossing_submit() {
 fn applying_either_prefix_of_the_decision_leaves_a_valid_engine_state() {
     let mut engine = MatchingEngine::new(EngineConfig::default());
     let command = submit(BTC, limit(Side::Bid, 99, 5, 1));
-    let events = engine.decide(&command).unwrap();
+    let events = engine.decide(&command);
 
     // Prefix 1: OrderAccepted creates the ledger record but does not touch the book.
     engine.apply(&events[0], 1);
@@ -146,8 +161,8 @@ fn decide_allocates_the_order_id_without_mutating_counters() {
     let mut engine = MatchingEngine::new(EngineConfig::default());
     let first = submit(BTC, limit(Side::Bid, 99, 1, 1));
 
-    let first_decision = engine.decide(&first).unwrap();
-    let repeated_decision = engine.decide(&first).unwrap();
+    let first_decision = engine.decide(&first);
+    let repeated_decision = engine.decide(&first);
     assert_eq!(order_id(&first_decision), 1);
     assert_eq!(
         order_id(&repeated_decision),
@@ -160,7 +175,7 @@ fn decide_allocates_the_order_id_without_mutating_counters() {
     }
 
     let second = submit(BTC, limit(Side::Bid, 98, 1, 2));
-    let second_decision = engine.decide(&second).unwrap();
+    let second_decision = engine.decide(&second);
     assert_eq!(
         order_id(&second_decision),
         2,
@@ -269,7 +284,7 @@ fn reopening_from_the_in_memory_event_log_reproduces_decision_state() {
 
     // Counters continue: the next decision allocates id 4.
     let command = submit(BTC, limit(Side::Bid, 98, 1, 4));
-    let next = reopened.engine().decide(&command).unwrap();
+    let next = reopened.engine().decide(&command);
     assert_eq!(order_id(&next), 4);
 
     // Sequence and command id continue across the restart too, not just ids.
@@ -364,7 +379,7 @@ fn a_failed_append_applies_nothing_and_fails_the_instance_closed() {
 }
 
 #[test]
-fn unsupported_commands_fail_clearly_and_append_nothing() {
+fn rejected_commands_are_journaled_as_events_and_change_no_state() {
     let log = InMemoryEventLog::new();
     let mut engine = EventSourcedEngine::create(
         EngineConfig::default(),
@@ -373,7 +388,7 @@ fn unsupported_commands_fail_clearly_and_append_nothing() {
     )
         .expect("fresh event log");
 
-    let unsupported = [EngineCommand::ModifyOrder {
+    let modify = EngineCommand::ModifyOrder {
         symbol: BTC.to_string(),
         order_id: 1,
         request: ModifyRequest {
@@ -381,36 +396,30 @@ fn unsupported_commands_fail_clearly_and_append_nothing() {
             quantity: 1,
             timestamp: 1,
         },
-    }];
-
-    for command in unsupported {
-        let error = engine
-            .execute(command)
-            .expect_err("unsupported commands are not silently dropped");
-        assert_eq!(
-            error,
-            DurableError::DecisionRejected(EngineError::UnsupportedCommand)
-        );
-        assert!(
-            !engine.is_failed(),
-            "a client error does not fail the instance"
-        );
-        assert!(engine.history_from(1).unwrap().is_empty());
-        assert_eq!(engine.applied_seq(), 0);
-    }
-
-    // An unknown cancel is a clear client rejection and appends nothing.
-    let error = engine
-        .execute(EngineCommand::CancelOrder {
-            symbol: BTC.to_string(),
-            order_id: 1,
-        })
-        .expect_err("the order does not exist");
-    assert_eq!(
-        error,
-        DurableError::DecisionRejected(EngineError::UnknownOrder)
+    };
+    let events = engine
+        .execute(modify.clone())
+        .expect("a business rejection is an event-producing execute");
+    assert_eq!(events, vec![rejected(&modify, EngineError::UnknownOrder)]);
+    assert!(
+        !engine.is_failed(),
+        "a client error does not fail the instance"
     );
-    assert_eq!(engine.applied_seq(), 0);
+    assert_eq!(engine.applied_seq(), 1);
+    assert_eq!(engine.history_from(1).unwrap().len(), 1);
+
+    // An unknown cancel is rejected the same way: one journaled event.
+    let cancel = EngineCommand::CancelOrder {
+        symbol: BTC.to_string(),
+        order_id: 1,
+    };
+    let events = engine
+        .execute(cancel.clone())
+        .expect("a business rejection is an event-producing execute");
+    assert_eq!(events, vec![rejected(&cancel, EngineError::UnknownOrder)]);
+    assert_eq!(engine.applied_seq(), 2);
+    assert_eq!(engine.history_from(1).unwrap().len(), 2);
+    assert_eq!(engine.engine().order_count(), 0);
 
     // Ticket 02 makes crossing submits supported: accepted + one trade.
     engine
@@ -421,10 +430,10 @@ fn unsupported_commands_fail_clearly_and_append_nothing() {
         .unwrap();
     assert_eq!(
         engine.history_from(1).unwrap().len(),
-        4,
-        "rest accepted+rested, then crossing accepted+trade"
+        6,
+        "two rejections, then accepted+rested and accepted+trade"
     );
-    assert_eq!(engine.applied_seq(), 4);
+    assert_eq!(engine.applied_seq(), 6);
 
     // Ticket 03 makes stop submissions supported: exactly one StopPlaced.
     engine
@@ -439,6 +448,6 @@ fn unsupported_commands_fail_clearly_and_append_nothing() {
             },
         })
         .expect("stop submission is supported from ticket 03");
-    assert_eq!(engine.history_from(5).unwrap().len(), 1);
-    assert_eq!(engine.applied_seq(), 5);
+    assert_eq!(engine.history_from(7).unwrap().len(), 1);
+    assert_eq!(engine.applied_seq(), 7);
 }

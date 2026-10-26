@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use orderbook_rs::durable::{
-    DurableError, EventSourcedEngine, InMemoryEventLog, InMemoryEventSnapshotStore,
+    EventSourcedEngine, InMemoryEventLog, InMemoryEventSnapshotStore,
 };
 use orderbook_rs::engine::MatchingEngine;
 use orderbook_rs::event::{DomainEvent, OrderCancelReason};
@@ -155,6 +155,20 @@ fn stop_triggered(order: Order, last_price: u64) -> DomainEvent {
     }
 }
 
+fn rejected(command: &EngineCommand, reason: EngineError) -> DomainEvent {
+    let symbol = match command {
+        EngineCommand::SubmitOrder { symbol, .. }
+        | EngineCommand::SubmitStopOrder { symbol, .. }
+        | EngineCommand::CancelOrder { symbol, .. }
+        | EngineCommand::ModifyOrder { symbol, .. } => symbol,
+    };
+    DomainEvent::OrderRejected {
+        symbol: symbol.clone(),
+        reason,
+        command: command.clone(),
+    }
+}
+
 fn apply_all(engine: &mut MatchingEngine, events: &[DomainEvent]) {
     for event in events {
         let sequence = engine.last_applied_sequence() + 1;
@@ -163,9 +177,7 @@ fn apply_all(engine: &mut MatchingEngine, events: &[DomainEvent]) {
 }
 
 fn run(engine: &mut MatchingEngine, command: &EngineCommand) -> Vec<DomainEvent> {
-    let events = engine
-        .decide(command)
-        .expect("command is supported by the event-sourced path");
+    let events = engine.decide(command);
     apply_all(engine, &events);
     events
 }
@@ -310,12 +322,12 @@ fn submitting_a_stop_emits_stop_placed_and_apply_registers_a_pending_record() {
     let request = stop_market(Side::Bid, 90, 3, 1);
     let command = submit_stop(BTC, request);
 
-    let events = engine.decide(&command).unwrap();
+    let events = engine.decide(&command);
 
     assert_eq!(events, vec![stop_placed(1, &request)], "one StopPlaced event");
 
     // Purity: deciding twice allocates the same local id and mutates nothing.
-    assert_eq!(engine.decide(&command).unwrap(), events);
+    assert_eq!(engine.decide(&command), events);
     assert_eq!(engine.order_count(), 0);
     assert!(engine.stop_order(1).is_none());
     assert_eq!(engine.last_sequence(), 0);
@@ -337,16 +349,20 @@ fn submitting_a_stop_emits_stop_placed_and_apply_registers_a_pending_record() {
 }
 
 #[test]
-fn a_rejected_stop_allocates_no_id_and_appends_nothing() {
+fn a_rejected_stop_emits_one_order_rejected_and_allocates_no_id() {
     let mut engine = MatchingEngine::new(EngineConfig::default());
     seed_last_price(&mut engine, 100);
 
     // A buy stop at or below the last price would trigger immediately.
     let command = submit_stop(BTC, stop_market(Side::Bid, 100, 1, 3));
     assert_eq!(
-        engine.decide(&command).unwrap_err(),
-        EngineError::StopPriceWouldTriggerImmediately
+        engine.decide(&command),
+        vec![rejected(
+            &command,
+            EngineError::StopPriceWouldTriggerImmediately
+        )]
     );
+    assert_eq!(engine.order_count(), 2, "only the two seed trades");
 
     let log = InMemoryEventLog::new();
     let mut durable = EventSourcedEngine::create(
@@ -356,17 +372,19 @@ fn a_rejected_stop_allocates_no_id_and_appends_nothing() {
     )
     .expect("fresh event log");
     // The durable engine starts empty, so use an invalid stop there.
-    let error = durable
-        .execute(submit_stop(BTC, stop_market(Side::Bid, 90, 0, 1)))
-        .expect_err("rejected stop");
+    let command = submit_stop(BTC, stop_market(Side::Bid, 90, 0, 1));
+    let events = durable
+        .execute(command.clone())
+        .expect("a business rejection is an event-producing execute");
     assert_eq!(
-        error,
-        DurableError::DecisionRejected(EngineError::QuantityOutOfRange)
+        events,
+        vec![rejected(&command, EngineError::QuantityOutOfRange)]
     );
     assert!(!durable.is_failed());
-    assert_eq!(durable.applied_seq(), 0);
-    assert!(durable.history_from(1).unwrap().is_empty());
+    assert_eq!(durable.applied_seq(), 1);
+    assert_eq!(durable.history_from(1).unwrap().len(), 1);
     assert_eq!(durable.engine().order_count(), 0);
+    assert_eq!(durable.engine().stop_order(1), None, "no id was allocated");
 }
 
 // --------------------------------------------------------------------------
@@ -382,7 +400,7 @@ fn market_stop_triggers_after_the_command_and_reuses_its_order_id() {
     rest(&mut engine, limit(Side::Bid, 95, 5, 4));
 
     let request = limit(Side::Ask, 95, 1, 5);
-    let events = engine.decide(&submit(BTC, request)).unwrap();
+    let events = engine.decide(&submit(BTC, request));
 
     assert_eq!(events.len(), 4, "accepted + trade + trigger + trade");
     assert_eq!(events[0], accepted(5, &request));
@@ -436,7 +454,7 @@ fn limit_stop_that_does_not_cross_rests_as_a_gtc_limit() {
     rest(&mut engine, limit(Side::Bid, 93, 5, 5));
 
     let request = limit(Side::Ask, 95, 1, 6);
-    let events = engine.decide(&submit(BTC, request)).unwrap();
+    let events = engine.decide(&submit(BTC, request));
 
     assert_eq!(events.len(), 4, "accepted + trade + trigger + rest");
     assert_eq!(
@@ -637,12 +655,12 @@ fn decide_is_pure_for_stop_submit_and_triggering_submits() {
     let stop_command = submit_stop(BTC, stop_limit(Side::Bid, 110, 109, 2, 5));
     let triggering = submit(BTC, limit(Side::Ask, 95, 1, 6));
 
-    let first_stop = engine.decide(&stop_command).unwrap();
-    let second_stop = engine.decide(&stop_command).unwrap();
+    let first_stop = engine.decide(&stop_command);
+    let second_stop = engine.decide(&stop_command);
     assert_eq!(first_stop, second_stop);
 
-    let first_trigger = engine.decide(&triggering).unwrap();
-    let second_trigger = engine.decide(&triggering).unwrap();
+    let first_trigger = engine.decide(&triggering);
+    let second_trigger = engine.decide(&triggering);
     assert_eq!(first_trigger, second_trigger);
 
     assert_eq!(
@@ -664,7 +682,7 @@ fn canceling_a_pending_stop_emits_stop_canceled_and_clears_stop_and_ledger() {
     seed_last_price(&mut engine, 100);
     let stop = place_stop(&mut engine, stop_market(Side::Bid, 105, 4, 3));
 
-    let events = engine.decide(&cancel(BTC, stop)).unwrap();
+    let events = engine.decide(&cancel(BTC, stop));
     assert_eq!(
         events,
         vec![DomainEvent::StopCanceled {
@@ -687,10 +705,11 @@ fn canceling_a_pending_stop_emits_stop_canceled_and_clears_stop_and_ledger() {
     assert_eq!(book.best_bid(), None);
     assert_eq!(book.best_ask(), None);
 
-    // Canceling again is a clear unknown-order rejection.
+    // Canceling again is a clear unknown-order rejection event.
+    let command = cancel(BTC, stop);
     assert_eq!(
-        engine.decide(&cancel(BTC, stop)).unwrap_err(),
-        EngineError::UnknownOrder
+        engine.decide(&command),
+        vec![rejected(&command, EngineError::UnknownOrder)]
     );
 }
 
@@ -699,11 +718,15 @@ fn pending_stop_cancel_is_scoped_to_the_symbol() {
     let mut engine = MatchingEngine::new(EngineConfig::default());
     let stop = place_stop(&mut engine, stop_market(Side::Bid, 90, 1, 1));
 
+    let wrong_symbol = cancel("ETH-USDT", stop);
     assert_eq!(
-        engine.decide(&cancel("ETH-USDT", stop)).unwrap_err(),
-        EngineError::UnknownOrder
+        engine.decide(&wrong_symbol),
+        vec![rejected(&wrong_symbol, EngineError::UnknownOrder)]
     );
-    assert!(engine.decide(&cancel(BTC, stop)).is_ok());
+    assert!(matches!(
+        engine.decide(&cancel(BTC, stop)).as_slice(),
+        [DomainEvent::StopCanceled { .. }]
+    ));
 }
 
 // --------------------------------------------------------------------------
@@ -749,7 +772,7 @@ fn every_prefix_is_valid_and_replay_equals_live_execution() {
     let mut live = MatchingEngine::new(EngineConfig::default());
     let mut live_events = Vec::new();
     for command in &commands {
-        let events = live.decide(command).expect("scenario is supported");
+        let events = live.decide(command);
         for event in &events {
             let sequence = live.last_applied_sequence() + 1;
             live.apply(event, sequence);
@@ -835,7 +858,7 @@ fn every_prefix_is_valid_and_replay_equals_live_execution() {
     // Counters continue after replay: the next stop gets the next order id.
     let mut reopened = reopened;
     let next_command = submit_stop(BTC, stop_market(Side::Bid, 120, 1, 20));
-    let next_events = reopened.engine().decide(&next_command).unwrap();
+    let next_events = reopened.engine().decide(&next_command);
     match next_events.first() {
         Some(DomainEvent::StopPlaced { stop, .. }) => {
             assert_eq!(stop.id, live_snapshot.next_order_id)
