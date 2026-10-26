@@ -9,7 +9,8 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::durable::{
-    CommandLog, CommandRecord, DurableError, LogHeader, SnapshotStore, StoredSnapshot,
+    CommandLog, CommandRecord, DurableError, EventLog, EventRecord, LogHeader, SnapshotStore,
+    StoredSnapshot,
 };
 
 /// Lock a mutex, recovering the guard if a previous holder panicked.
@@ -103,6 +104,128 @@ impl CommandLog for InMemoryCommandLog {
             .records
             .last()
             .map(|record| record.sequence)
+    }
+}
+
+#[derive(Debug, Default)]
+struct EventLogState {
+    header: Option<LogHeader>,
+    records: Vec<EventRecord>,
+}
+
+/// In-memory [`EventLog`] shared by every clone of a handle.
+///
+/// This is the ticket-01 event-log adapter: fast recovery tests can drop an
+/// [`EventSourcedEngine`](crate::durable::EventSourcedEngine) and reopen from a
+/// second handle to the same log.
+#[derive(Debug, Clone, Default)]
+pub struct InMemoryEventLog {
+    state: Arc<Mutex<EventLogState>>,
+}
+
+impl InMemoryEventLog {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Another handle to the same log, used to reopen after a simulated crash.
+    pub fn handle(&self) -> Self {
+        self.clone()
+    }
+}
+
+impl EventLog for InMemoryEventLog {
+    fn read_header(&self) -> Result<Option<LogHeader>, DurableError> {
+        Ok(lock(&self.state).header.clone())
+    }
+
+    fn write_header(&mut self, header: LogHeader) -> Result<(), DurableError> {
+        let mut state = lock(&self.state);
+        if state.header.is_some() {
+            return Err(DurableError::HeaderAlreadyPresent);
+        }
+        state.header = Some(header);
+        Ok(())
+    }
+
+    fn append(&mut self, record: EventRecord) -> Result<(), DurableError> {
+        let mut state = lock(&self.state);
+        if state.header.is_none() {
+            return Err(DurableError::MissingHeader);
+        }
+
+        let expected = state
+            .records
+            .last()
+            .map(|last| last.sequence.saturating_add(1))
+            .unwrap_or(1);
+        if record.sequence != expected {
+            return Err(DurableError::NonContiguousSequence {
+                expected,
+                found: record.sequence,
+            });
+        }
+
+        state.records.push(record);
+        Ok(())
+    }
+
+    fn append_batch(&mut self, records: Vec<EventRecord>) -> Result<(), DurableError> {
+        let mut state = lock(&self.state);
+        if state.header.is_none() {
+            return Err(DurableError::MissingHeader);
+        }
+
+        // Validate the whole batch before mutating, so a gap cannot leave a
+        // partial batch visible.
+        let mut expected = state
+            .records
+            .last()
+            .map(|last| last.sequence.saturating_add(1))
+            .unwrap_or(1);
+        for record in &records {
+            if record.sequence != expected {
+                return Err(DurableError::NonContiguousSequence {
+                    expected,
+                    found: record.sequence,
+                });
+            }
+            expected = expected.saturating_add(1);
+        }
+
+        state.records.extend(records);
+        Ok(())
+    }
+
+    fn read_from(&self, from: u64) -> Result<Vec<EventRecord>, DurableError> {
+        let state = lock(&self.state);
+        Ok(state
+            .records
+            .iter()
+            .filter(|record| record.sequence >= from)
+            .cloned()
+            .collect())
+    }
+
+    fn first_sequence(&self) -> Option<u64> {
+        lock(&self.state)
+            .records
+            .first()
+            .map(|record| record.sequence)
+    }
+
+    fn last_sequence(&self) -> Option<u64> {
+        lock(&self.state)
+            .records
+            .last()
+            .map(|record| record.sequence)
+    }
+
+    fn last_command_id(&self) -> Option<u64> {
+        lock(&self.state)
+            .records
+            .last()
+            .map(|record| record.command_id)
     }
 }
 

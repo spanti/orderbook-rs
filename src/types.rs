@@ -282,6 +282,11 @@ pub enum EngineError {
     InsufficientLiquidity,
     StopPriceWouldTriggerImmediately,
     StopOrderNotModifiable,
+    /// The event-sourced decision path does not support this command yet.
+    ///
+    /// Supported commands fail explicitly instead of being silently dropped;
+    /// later tickets extend the event catalog and remove this variant.
+    UnsupportedCommand,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]

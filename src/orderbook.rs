@@ -372,6 +372,19 @@ impl OrderBook {
         }
     }
 
+    /// Insert an order directly at its price level, without matching.
+    ///
+    /// This is the `OrderRested` apply primitive: replay must fold an already
+    /// decided rest, never re-run matching. FIFO priority follows insertion
+    /// order within the level, exactly as [`OrderBook::submit`] would place it.
+    pub fn rest_order(&mut self, order: Order) {
+        let own_side = match order.side {
+            Side::Bid => &mut self.bids,
+            Side::Ask => &mut self.asks,
+        };
+        own_side.insert_order(order);
+    }
+
     // Submit an order: match it against the opposite side, then rest any
     // remainder that the order's type and time-in-force allow.
     pub fn submit(&mut self, mut order: Order) -> SubmitResult {

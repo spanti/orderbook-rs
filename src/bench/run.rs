@@ -11,7 +11,7 @@ use crate::types::{
 
 use super::config::{BenchConfig, BenchError, BenchPath};
 use super::report::{BenchReport, CategoryStats, DepthLevels, EnvInfo, LatencyReport, RunStats};
-use super::stats::Samples;
+use super::stats::{Samples, Summary};
 use super::workload::{Action, CommandKind, SYMBOL_PREFIX, Workload};
 
 const DEPTH_SCAN_CAP: u64 = 10_000;
@@ -22,7 +22,112 @@ pub fn run(config: &BenchConfig) -> Result<BenchReport, BenchError> {
     match config.path {
         BenchPath::Direct => run_direct(config),
         BenchPath::Runtime => super::runtime_path::run_runtime(config),
+        BenchPath::Decide => run_decide(config),
     }
+}
+
+/// Measure the pure event-sourced decision step.
+///
+/// The engine is never mutated inside the timed window, so this is a baseline
+/// for `decide` + its borrow-based `DecisionScratch`: command in, events out.
+/// A whole-engine clone on this path would show up immediately here.
+fn run_decide(config: &BenchConfig) -> Result<BenchReport, BenchError> {
+    let symbol = format!("{SYMBOL_PREFIX}0");
+    let mut engine = MatchingEngine::new(EngineConfig::default());
+
+    // Seed one resting ask with the legacy path so the scratch performs a real
+    // opposite-book lookup. The bid below never crosses it.
+    let ask = EngineCommand::SubmitOrder {
+        symbol: symbol.clone(),
+        request: OrderRequest {
+            side: Side::Ask,
+            price: config.mid.saturating_add(config.price_band),
+            quantity: config.order_quantity,
+            timestamp: 0,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            post_only: false,
+        },
+    };
+    let _ = engine.execute(ask);
+
+    let command = EngineCommand::SubmitOrder {
+        symbol,
+        request: OrderRequest {
+            side: Side::Bid,
+            price: config.mid.saturating_sub(config.price_band),
+            quantity: config.order_quantity,
+            timestamp: 1,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            post_only: false,
+        },
+    };
+
+    for _ in 0..config.warmup {
+        let events = engine
+            .decide(&command)
+            .expect("the decide baseline command is supported");
+        std::hint::black_box(&events);
+    }
+
+    let mut samples = Samples::default();
+    let measured_start = Instant::now();
+    for _ in 0..config.events {
+        let start = Instant::now();
+        let events = engine
+            .decide(&command)
+            .expect("the decide baseline command is supported");
+        let elapsed = ns_between(start, Instant::now());
+        std::hint::black_box(&events);
+        samples.push(elapsed);
+    }
+
+    let wall_time_ns = duration_ns(measured_start.elapsed());
+    let summary = samples.summary();
+    let achieved_rate = if wall_time_ns == 0 {
+        0.0
+    } else {
+        config.events as f64 / (wall_time_ns as f64 / 1e9)
+    };
+
+    Ok(BenchReport {
+        config: config.clone(),
+        run: RunStats {
+            wall_time_ns,
+            achieved_rate,
+            commands: config.events,
+            // A non-crossing resting submit decides two events.
+            engine_events: config.events.saturating_mul(2),
+            trades: 0,
+            rejections: 0,
+            final_open_orders: 1,
+            peak_open_orders: 1,
+            final_depth_levels: DepthLevels {
+                bids: 0,
+                asks: 1,
+                bids_capped: false,
+                asks_capped: false,
+            },
+        },
+        latency: LatencyReport {
+            total: CategoryStats {
+                all: summary,
+                limit: summary,
+                market: Summary::default(),
+                cancel: Summary::default(),
+            },
+            service: CategoryStats {
+                all: summary,
+                limit: summary,
+                market: Summary::default(),
+                cancel: Summary::default(),
+            },
+            send_lag: Summary::default(),
+        },
+        runtime: None,
+        env: EnvInfo::current(),
+    })
 }
 
 fn run_direct(config: &BenchConfig) -> Result<BenchReport, BenchError> {
@@ -310,6 +415,25 @@ mod tests {
         config.symbols = 1;
         config.seed = 7;
         config
+    }
+
+    #[test]
+    fn decide_path_reports_the_pure_decision_baseline() {
+        let mut config = tiny_config();
+        config.path = BenchPath::Decide;
+        config.events = 200;
+        config.warmup = 10;
+
+        let report = run(&config).expect("decide baseline run");
+        assert_eq!(report.latency.total.all.count, 200);
+        assert_eq!(report.latency.service.all.count, 200);
+        assert_eq!(
+            report.run.engine_events, 400,
+            "two events per resting submit"
+        );
+        assert_eq!(report.run.final_open_orders, 1, "only the seeded ask rests");
+        assert!(report.runtime.is_none());
+        assert!(report.render_text().contains("engine events"));
     }
 
     #[test]
