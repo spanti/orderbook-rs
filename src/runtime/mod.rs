@@ -7,6 +7,7 @@
 pub mod envelope;
 pub mod error;
 pub mod idle;
+pub(crate) mod matching;
 pub mod metrics;
 pub mod ticket;
 

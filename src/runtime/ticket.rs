@@ -466,6 +466,48 @@ mod tests {
     }
 
     #[test]
+    fn durable_wait_parks_until_applied_and_durable_are_written() {
+        use std::sync::mpsc;
+        use std::thread;
+
+        let slot = Arc::new(ResponseSlot::new());
+        let ticket = Ticket::new(Arc::clone(&slot));
+        let handle = SlotHandle::new(Arc::clone(&slot));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+
+        // The waiter parks on durability before either result exists.
+        let waiter = thread::spawn(move || {
+            started_tx.send(()).expect("report waiter start");
+            let result = ticket.wait_durable();
+            result_tx.send(result).expect("report durable result");
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("waiter started");
+        assert!(
+            result_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "durable wait must park while the slot is empty"
+        );
+
+        // An applied receipt alone must not release a durable waiter.
+        handle.set_applied(Ok(receipt(4)));
+        assert!(
+            result_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "applied must not satisfy a durable wait"
+        );
+
+        handle.set_durable(Ok(()));
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("waiter wakes for durability");
+
+        assert_eq!(result.unwrap(), receipt(4));
+        waiter.join().expect("waiter thread");
+    }
+
+    #[test]
     fn wait_timeout_returns_timeout_without_a_result() {
         let slot = Arc::new(ResponseSlot::new());
         let ticket = Ticket::new(Arc::clone(&slot));
