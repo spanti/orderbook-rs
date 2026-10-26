@@ -2,15 +2,84 @@
 
 use std::fmt::Write;
 
-use super::config::BenchConfig;
+use crate::runtime::IdleStrategy;
+
+use super::config::{BenchConfig, LogKind};
 use super::stats::Summary;
+
+/// Acceptance target for `submit -> applied` p99, in nanoseconds.
+pub const APPLIED_SLO_NS: u64 = 10_000;
+/// Acceptance target for `submit -> durable` p99, in nanoseconds.
+pub const DURABLE_SLO_NS: u64 = 500_000;
 
 #[derive(Debug, Clone)]
 pub struct BenchReport {
     pub config: BenchConfig,
     pub run: RunStats,
     pub latency: LatencyReport,
+    /// Present only for the runtime path. Direct output is unchanged.
+    pub runtime: Option<RuntimeReport>,
     pub env: EnvInfo,
+}
+
+/// In-process runtime measurements beyond the direct-path latency tables.
+#[derive(Debug, Clone)]
+pub struct RuntimeReport {
+    /// Submit -> applied (`wait_applied`) per command.
+    pub applied_latency: Summary,
+    /// Submit -> durable (`wait_durable`) per command.
+    pub durable_latency: Summary,
+    pub queue_wait: LatencyMetric,
+    pub apply_service: LatencyMetric,
+    pub durable_wait: LatencyMetric,
+    pub journal_append: LatencyMetric,
+    /// Mean records per journal handoff batch.
+    pub batch_size_mean: f64,
+    pub batch_count: u64,
+    pub queue_depth_max: u64,
+    pub queue_full: u64,
+    /// Journal append time / durable wait time, as a share of durable latency.
+    pub fsync_share: f64,
+    pub applied_count: u64,
+    pub durable_count: u64,
+    pub slo: SloReport,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LatencyMetric {
+    pub mean_ns: u64,
+    pub max_ns: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SloReport {
+    pub applied: SloCheck,
+    pub durable: SloCheck,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SloCheck {
+    pub target_ns: u64,
+    pub p50: u64,
+    pub p99: u64,
+    pub p99_9: u64,
+    pub passed: bool,
+}
+
+impl SloCheck {
+    pub fn new(summary: Summary, target_ns: u64) -> Self {
+        Self {
+            target_ns,
+            p50: summary.p50,
+            p99: summary.p99,
+            p99_9: summary.p99_9,
+            passed: summary.p99 <= target_ns,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        if self.passed { "PASS" } else { "FAIL" }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +166,23 @@ impl BenchReport {
             self.config.order_quantity
         )
         .expect("writing to a String cannot fail");
+        if self.runtime.is_some() {
+            writeln!(
+                out,
+                "runtime  queue={} journal_batches={} apply_batch={} coalesce={} flush_us={} idle={} affinity={} snapshots={} log={} in_flight={}",
+                self.config.queue_capacity,
+                self.config.journal_batch_capacity,
+                self.config.apply_batch_max,
+                self.config.journal_coalesce_max,
+                self.config.journal_flush_us,
+                idle_label(self.config.idle),
+                affinity_label(self.config.affinity),
+                self.config.snapshot_cadence,
+                log_label(self.config.log),
+                self.config.in_flight
+            )
+            .expect("writing to a String cannot fail");
+        }
         writeln!(out).expect("writing to a String cannot fail");
 
         writeln!(out, "run").expect("writing to a String cannot fail");
@@ -155,6 +241,23 @@ impl BenchReport {
         write_summary_row(&mut out, "total", self.latency.total.all);
         write_summary_row(&mut out, "service", self.latency.service.all);
         write_summary_row(&mut out, "send lag", self.latency.send_lag);
+
+        if let Some(runtime) = &self.runtime {
+            writeln!(out).expect("writing to a String cannot fail");
+            writeln!(
+                out,
+                "runtime latency (ns)      p50      p99     p99.9      mean       max"
+            )
+            .expect("writing to a String cannot fail");
+            write_summary_row(&mut out, "applied", runtime.applied_latency);
+            write_summary_row(&mut out, "durable", runtime.durable_latency);
+            writeln!(
+                out,
+                "note: applied and durable latency are measured from submit; the service row above mirrors applied"
+            )
+            .expect("writing to a String cannot fail");
+        }
+
         writeln!(out).expect("writing to a String cannot fail");
 
         writeln!(out, "per command type").expect("writing to a String cannot fail");
@@ -176,6 +279,46 @@ impl BenchReport {
             self.latency.total.cancel,
             self.run.wall_time_ns,
         );
+
+        if let Some(runtime) = &self.runtime {
+            writeln!(out).expect("writing to a String cannot fail");
+            writeln!(out, "runtime metrics").expect("writing to a String cannot fail");
+            write_metric_row(&mut out, "queue wait", runtime.queue_wait);
+            write_metric_row(&mut out, "apply service", runtime.apply_service);
+            write_metric_row(&mut out, "durable wait", runtime.durable_wait);
+            write_metric_row(&mut out, "journal append", runtime.journal_append);
+            writeln!(
+                out,
+                "  batch size       mean={:.2} records  batches={}",
+                runtime.batch_size_mean,
+                commas(runtime.batch_count)
+            )
+            .expect("writing to a String cannot fail");
+            writeln!(
+                out,
+                "  queue depth max  {}",
+                commas(runtime.queue_depth_max)
+            )
+            .expect("writing to a String cannot fail");
+            writeln!(out, "  queue full       {}", commas(runtime.queue_full))
+                .expect("writing to a String cannot fail");
+            writeln!(
+                out,
+                "  fsync share      {:.1}% of durable wait",
+                runtime.fsync_share * 100.0
+            )
+            .expect("writing to a String cannot fail");
+
+            writeln!(out).expect("writing to a String cannot fail");
+            writeln!(out, "slo").expect("writing to a String cannot fail");
+            write_slo_row(&mut out, "submit -> applied", runtime.slo.applied);
+            write_slo_row(&mut out, "submit -> durable", runtime.slo.durable);
+            writeln!(
+                out,
+                "note: SLOs are defined for Linux release runs with --idle spin, a pinned matching core, in-memory applied latency, and FileCommandLog on NVMe for durable latency; the pass/fail line is informational elsewhere"
+            )
+            .expect("writing to a String cannot fail");
+        }
 
         writeln!(
             out,
@@ -327,6 +470,96 @@ impl BenchReport {
         writeln!(out, "    }}").expect("writing to a String cannot fail");
         writeln!(out, "  }},").expect("writing to a String cannot fail");
 
+        if let Some(runtime) = &self.runtime {
+            writeln!(out, "  \"runtime\": {{").expect("writing to a String cannot fail");
+            writeln!(out, "    \"config\": {{").expect("writing to a String cannot fail");
+            writeln!(
+                out,
+                "      \"queue_capacity\": {}, \"journal_batch_capacity\": {}, \"apply_batch_max\": {},",
+                self.config.queue_capacity,
+                self.config.journal_batch_capacity,
+                self.config.apply_batch_max
+            )
+            .expect("writing to a String cannot fail");
+            writeln!(
+                out,
+                "      \"journal_coalesce_max\": {}, \"journal_flush_us\": {}, \"idle\": \"{}\",",
+                self.config.journal_coalesce_max,
+                self.config.journal_flush_us,
+                idle_label(self.config.idle)
+            )
+            .expect("writing to a String cannot fail");
+            match self.config.affinity {
+                Some(core) => writeln!(out, "      \"affinity\": {core},")
+                    .expect("writing to a String cannot fail"),
+                None => writeln!(out, "      \"affinity\": null,")
+                    .expect("writing to a String cannot fail"),
+            }
+            writeln!(
+                out,
+                "      \"snapshot_cadence\": {}, \"log\": \"{}\",",
+                self.config.snapshot_cadence,
+                log_label(self.config.log)
+            )
+            .expect("writing to a String cannot fail");
+            match &self.config.data_dir {
+                Some(dir) => writeln!(
+                    out,
+                    "      \"data_dir\": \"{}\", \"in_flight\": {}",
+                    json_escape(&dir.to_string_lossy()),
+                    self.config.in_flight
+                )
+                .expect("writing to a String cannot fail"),
+                None => writeln!(
+                    out,
+                    "      \"data_dir\": null, \"in_flight\": {}",
+                    self.config.in_flight
+                )
+                .expect("writing to a String cannot fail"),
+            }
+            writeln!(out, "    }},").expect("writing to a String cannot fail");
+
+            writeln!(out, "    \"applied_latency\": {{").expect("writing to a String cannot fail");
+            write_json_summary_fields(&mut out, runtime.applied_latency, "      ", false);
+            writeln!(out, "    }},").expect("writing to a String cannot fail");
+            writeln!(out, "    \"durable_latency\": {{").expect("writing to a String cannot fail");
+            write_json_summary_fields(&mut out, runtime.durable_latency, "      ", false);
+            writeln!(out, "    }},").expect("writing to a String cannot fail");
+
+            write_json_metric(&mut out, "queue_wait", runtime.queue_wait, true);
+            write_json_metric(&mut out, "apply_service", runtime.apply_service, true);
+            write_json_metric(&mut out, "durable_wait", runtime.durable_wait, true);
+            write_json_metric(&mut out, "journal_append", runtime.journal_append, true);
+            writeln!(
+                out,
+                "    \"batch_size_mean\": {:.3},",
+                runtime.batch_size_mean
+            )
+            .expect("writing to a String cannot fail");
+            writeln!(out, "    \"batch_count\": {},", runtime.batch_count)
+                .expect("writing to a String cannot fail");
+            writeln!(out, "    \"queue_depth_max\": {},", runtime.queue_depth_max)
+                .expect("writing to a String cannot fail");
+            writeln!(out, "    \"queue_full\": {},", runtime.queue_full)
+                .expect("writing to a String cannot fail");
+            writeln!(out, "    \"fsync_share\": {:.6},", runtime.fsync_share)
+                .expect("writing to a String cannot fail");
+            writeln!(out, "    \"applied_count\": {},", runtime.applied_count)
+                .expect("writing to a String cannot fail");
+            writeln!(out, "    \"durable_count\": {},", runtime.durable_count)
+                .expect("writing to a String cannot fail");
+
+            writeln!(out, "    \"slo\": {{").expect("writing to a String cannot fail");
+            writeln!(out, "      \"applied\": {{").expect("writing to a String cannot fail");
+            write_json_slo_fields(&mut out, runtime.slo.applied, "        ");
+            writeln!(out, "      }},").expect("writing to a String cannot fail");
+            writeln!(out, "      \"durable\": {{").expect("writing to a String cannot fail");
+            write_json_slo_fields(&mut out, runtime.slo.durable, "        ");
+            writeln!(out, "      }}").expect("writing to a String cannot fail");
+            writeln!(out, "    }}").expect("writing to a String cannot fail");
+            writeln!(out, "  }},").expect("writing to a String cannot fail");
+        }
+
         writeln!(
             out,
             "  \"env\": {{ \"os\": \"{}\", \"arch\": \"{}\", \"profile\": \"{}\" }}",
@@ -353,6 +586,49 @@ fn write_summary_row(out: &mut String, label: &str, summary: Summary) {
         commas(summary.max)
     )
     .expect("writing to a String cannot fail");
+}
+
+fn write_metric_row(out: &mut String, label: &str, metric: LatencyMetric) {
+    writeln!(
+        out,
+        "  {:<16} mean={} ns  max={} ns",
+        label,
+        commas(metric.mean_ns),
+        commas(metric.max_ns)
+    )
+    .expect("writing to a String cannot fail");
+}
+
+fn write_slo_row(out: &mut String, label: &str, check: SloCheck) {
+    writeln!(
+        out,
+        "  {:<16} p50={} p99={} p99.9={} target={} ns  {}",
+        label,
+        commas(check.p50),
+        commas(check.p99),
+        commas(check.p99_9),
+        commas(check.target_ns),
+        check.label()
+    )
+    .expect("writing to a String cannot fail");
+}
+
+fn idle_label(idle: IdleStrategy) -> &'static str {
+    match idle {
+        IdleStrategy::Spin => "spin",
+        IdleStrategy::Backoff => "backoff",
+    }
+}
+
+fn log_label(log: LogKind) -> &'static str {
+    match log {
+        LogKind::Memory => "memory",
+        LogKind::File => "file",
+    }
+}
+
+fn affinity_label(affinity: Option<usize>) -> String {
+    affinity.map_or_else(|| "none".to_string(), |core| core.to_string())
 }
 
 fn write_type_row(out: &mut String, label: &str, summary: Summary, wall_time_ns: u64) {
@@ -398,6 +674,33 @@ fn write_json_summary_fields(
     } else {
         writeln!(out, "{indent}\"max\": {}", summary.max).expect("writing to a String cannot fail");
     }
+}
+
+fn write_json_metric(out: &mut String, name: &str, metric: LatencyMetric, trailing_comma: bool) {
+    writeln!(out, "    \"{name}\": {{").expect("writing to a String cannot fail");
+    writeln!(out, "      \"mean_ns\": {},", metric.mean_ns)
+        .expect("writing to a String cannot fail");
+    if trailing_comma {
+        writeln!(out, "      \"max_ns\": {}\n    }},", metric.max_ns)
+            .expect("writing to a String cannot fail");
+    } else {
+        writeln!(out, "      \"max_ns\": {}\n    }}", metric.max_ns)
+            .expect("writing to a String cannot fail");
+    }
+}
+
+fn write_json_slo_fields(out: &mut String, check: SloCheck, indent: &str) {
+    writeln!(out, "{indent}\"target_ns\": {},", check.target_ns)
+        .expect("writing to a String cannot fail");
+    writeln!(out, "{indent}\"p50\": {},", check.p50).expect("writing to a String cannot fail");
+    writeln!(out, "{indent}\"p99\": {},", check.p99).expect("writing to a String cannot fail");
+    writeln!(out, "{indent}\"p99_9\": {},", check.p99_9).expect("writing to a String cannot fail");
+    writeln!(
+        out,
+        "{indent}\"passed\": {}",
+        if check.passed { "true" } else { "false" }
+    )
+    .expect("writing to a String cannot fail");
 }
 
 fn commas(value: u64) -> String {

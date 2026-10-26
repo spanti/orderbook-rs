@@ -9,7 +9,7 @@ use crate::types::{
     TimeInForce,
 };
 
-use super::config::{BenchConfig, BenchError};
+use super::config::{BenchConfig, BenchError, BenchPath};
 use super::report::{BenchReport, CategoryStats, DepthLevels, EnvInfo, LatencyReport, RunStats};
 use super::stats::Samples;
 use super::workload::{Action, CommandKind, SYMBOL_PREFIX, Workload};
@@ -19,7 +19,13 @@ const SPIN_THRESHOLD: Duration = Duration::from_millis(1);
 
 pub fn run(config: &BenchConfig) -> Result<BenchReport, BenchError> {
     config.validate()?;
+    match config.path {
+        BenchPath::Direct => run_direct(config),
+        BenchPath::Runtime => super::runtime_path::run_runtime(config),
+    }
+}
 
+fn run_direct(config: &BenchConfig) -> Result<BenchReport, BenchError> {
     let symbols: Vec<String> = (0..config.symbols)
         .map(|index| format!("{SYMBOL_PREFIX}{index}"))
         .collect();
@@ -141,6 +147,7 @@ pub fn run(config: &BenchConfig) -> Result<BenchReport, BenchError> {
             final_depth_levels,
         },
         latency,
+        runtime: None,
         env: EnvInfo::current(),
     })
 }
@@ -150,7 +157,7 @@ pub fn run(config: &BenchConfig) -> Result<BenchReport, BenchError> {
 /// Cancel actions carry placeholder side/price/quantity; those are ignored.
 /// Submit actions set the same order type and time-in-force the old mapping
 /// used: Limit+GTC, Market+IOC, never post-only.
-fn command_from_action(action: &Action, symbols: &[String]) -> EngineCommand {
+pub(crate) fn command_from_action(action: &Action, symbols: &[String]) -> EngineCommand {
     let symbol = symbols[action.symbol_index].clone();
     match action.kind {
         CommandKind::Limit => EngineCommand::SubmitOrder {
@@ -189,7 +196,7 @@ fn command_from_action(action: &Action, symbols: &[String]) -> EngineCommand {
 /// Feed one command outcome back into the workload after the timed command
 /// window has closed. The engine's lifecycle query is deliberately evaluated
 /// here, not inside `send..done`, so bookkeeping never enters a latency sample.
-fn record_workload(
+pub(crate) fn record_workload(
     workload: &mut Workload,
     action: &Action,
     outcome: CommandOutcome,
@@ -208,7 +215,7 @@ fn record_workload(
     }
 }
 
-fn book_prices(
+pub(crate) fn book_prices(
     engine: &MatchingEngine,
     symbols: &[String],
     symbol_index: usize,
@@ -218,14 +225,14 @@ fn book_prices(
         .map_or((None, None), |book| (book.best_bid(), book.best_ask()))
 }
 
-fn intended_time(start: Instant, index: u64, rate: u64) -> Instant {
+pub(crate) fn intended_time(start: Instant, index: u64, rate: u64) -> Instant {
     let offset_ns = (index as u128 * 1_000_000_000u128 / rate as u128).min(u64::MAX as u128) as u64;
     start
         .checked_add(Duration::from_nanos(offset_ns))
         .unwrap_or(start)
 }
 
-fn pace(intended: Instant) {
+pub(crate) fn pace(intended: Instant) {
     let now = Instant::now();
     if now >= intended {
         return;
@@ -241,15 +248,15 @@ fn pace(intended: Instant) {
     }
 }
 
-fn ns_between(start: Instant, end: Instant) -> u64 {
+pub(crate) fn ns_between(start: Instant, end: Instant) -> u64 {
     duration_ns(end.saturating_duration_since(start))
 }
 
-fn duration_ns(duration: Duration) -> u64 {
+pub(crate) fn duration_ns(duration: Duration) -> u64 {
     duration.as_nanos().min(u64::MAX as u128) as u64
 }
 
-fn count_depth(engine: &MatchingEngine, symbols: &[String]) -> DepthLevels {
+pub(crate) fn count_depth(engine: &MatchingEngine, symbols: &[String]) -> DepthLevels {
     let mut bids = 0;
     let mut asks = 0;
     let mut bids_capped = false;
@@ -287,6 +294,7 @@ fn scan_side(book: &OrderBook, side: Side) -> (u64, bool) {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+    use crate::bench::config::{BenchPath, LogKind};
 
     fn tiny_config() -> BenchConfig {
         let mut config = BenchConfig::default();
@@ -403,6 +411,93 @@ mod tests {
         config.market_ratio = 0.9;
         let error = run(&config).expect_err("invalid ratios must fail");
         assert!(matches!(error, BenchError::Usage(_)));
+    }
+
+    fn tiny_runtime_config() -> BenchConfig {
+        let mut config = tiny_config();
+        config.path = BenchPath::Runtime;
+        config.events = 100;
+        config.warmup = 10;
+        config.rate = 0;
+        config
+    }
+
+    #[test]
+    fn runtime_path_reports_applied_and_durable_latency_families() {
+        let report = run(&tiny_runtime_config()).expect("runtime benchmark run");
+        let runtime = report.runtime.as_ref().expect("runtime report section");
+
+        assert_eq!(runtime.applied_latency.count, 100);
+        assert_eq!(runtime.durable_latency.count, 100);
+        assert_eq!(runtime.applied_count, 100);
+        assert_eq!(runtime.durable_count, 100);
+        assert_eq!(runtime.queue_full, 0);
+
+        let text = report.render_text();
+        assert!(text.contains("runtime latency (ns)"));
+        assert!(text.contains("applied"));
+        assert!(text.contains("durable"));
+        assert!(text.contains("slo"));
+        assert!(text.contains("target=10,000 ns"));
+        assert!(text.contains("target=500,000 ns"));
+
+        let json = report.to_json();
+        assert!(json.contains("\"runtime\""));
+        assert!(json.contains("\"applied_latency\""));
+        assert!(json.contains("\"durable_latency\""));
+        assert!(json.contains("\"queue_wait\""));
+        assert!(json.contains("\"apply_service\""));
+        assert!(json.contains("\"durable_wait\""));
+        assert!(json.contains("\"journal_append\""));
+        assert!(json.contains("\"queue_full\""));
+        assert!(json.contains("\"fsync_share\""));
+        assert!(json.contains("\"slo\""));
+    }
+
+    #[test]
+    fn runtime_path_supports_in_flight_throughput_mode() {
+        let mut config = tiny_runtime_config();
+        config.in_flight = 4;
+
+        let report = run(&config).expect("in-flight runtime benchmark run");
+        let runtime = report.runtime.as_ref().expect("runtime report section");
+
+        assert_eq!(runtime.applied_latency.count, 100);
+        assert_eq!(runtime.durable_latency.count, 100);
+        assert_eq!(report.run.commands, 100);
+    }
+
+    #[test]
+    fn runtime_file_log_uses_the_file_adapters() {
+        let dir = tempfile::tempdir().expect("temporary data dir");
+        let mut config = tiny_runtime_config();
+        config.events = 20;
+        config.warmup = 0;
+        config.log = LogKind::File;
+        config.data_dir = Some(dir.path().to_path_buf());
+
+        let report = run(&config).expect("file-backed runtime run");
+        assert_eq!(
+            report
+                .runtime
+                .as_ref()
+                .expect("runtime report section")
+                .applied_latency
+                .count,
+            20
+        );
+        assert!(dir.path().join("commands.log").exists());
+        assert!(dir.path().join("snapshots").exists());
+    }
+
+    #[test]
+    fn direct_path_output_has_no_runtime_section() {
+        let report = run(&tiny_config()).expect("direct benchmark run");
+
+        assert!(report.runtime.is_none());
+        assert!(!report.render_text().contains("runtime latency"));
+        assert!(!report.render_text().contains("runtime path"));
+        assert!(!report.to_json().contains("\"runtime\""));
     }
 
     #[test]
