@@ -37,6 +37,27 @@ pub struct EventRecord {
     pub event: DomainEvent,
 }
 
+impl EventRecord {
+    /// Build the contiguous records for one command's events.
+    ///
+    /// `first_sequence` is the event sequence assigned to the first event;
+    /// each following event takes the next one, and every record shares
+    /// `command_id`. Sequence assignment stays with the single writer, which
+    /// supplies the cursor values.
+    pub fn batch(events: &[DomainEvent], first_sequence: u64, command_id: u64) -> Vec<Self> {
+        events
+            .iter()
+            .enumerate()
+            .map(|(offset, event)| Self {
+                format_version: FORMAT_VERSION,
+                sequence: first_sequence.saturating_add(offset as u64),
+                command_id,
+                event: event.clone(),
+            })
+            .collect()
+    }
+}
+
 /// The single globally ordered, append-only event stream.
 ///
 /// Implementations make an appended record durable before returning, never
@@ -75,10 +96,18 @@ pub trait EventLog: Send + 'static {
     fn last_command_id(&self) -> Option<u64>;
 }
 
-/// The sequence values an event-sourced writer must agree on.
+/// The recovery state an event-sourced writer must agree on.
 ///
-/// All but `next_command_id` are event sequences. `next_command_id` is the
-/// grouping metadata that must continue across restarts.
+/// It carries the last event sequence applied to the engine, the last event
+/// sequence known durable, the event sequence the next record will receive,
+/// and the `command_id` the next command will receive. All but
+/// `next_command_id` are event sequences; `next_command_id` is grouping
+/// metadata that must continue across restarts.
+///
+/// Recovery reconstructs this cursor from the latest snapshot plus the log
+/// tail, and both the synchronous façade and the runtime continue from it.
+/// The spec defines these ids as primitive `u64`s, so they are deliberately
+/// not newtypes in this release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventCursor {
     /// Last event sequence applied to the engine.
@@ -333,16 +362,7 @@ impl DurableMatchingEngine {
 
         let command_id = self.cursor.next_command_id;
         let first_sequence = self.cursor.next_sequence;
-        let records: Vec<EventRecord> = events
-            .iter()
-            .enumerate()
-            .map(|(offset, event)| EventRecord {
-                format_version: FORMAT_VERSION,
-                sequence: first_sequence.saturating_add(offset as u64),
-                command_id,
-                event: event.clone(),
-            })
-            .collect();
+        let records = EventRecord::batch(&events, first_sequence, command_id);
 
         // Append-before-apply: a failed append must leave engine state intact.
         if let Err(error) = self.log.append_batch(records.clone()) {
@@ -386,5 +406,44 @@ impl DurableMatchingEngine {
     /// Whether an append failure stopped this instance.
     pub fn is_failed(&self) -> bool {
         self.failed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{EngineCommand, EngineError};
+
+    fn rejected() -> DomainEvent {
+        DomainEvent::OrderRejected {
+            symbol: "BTC-USDT".to_string(),
+            reason: EngineError::UnknownOrder,
+            command: EngineCommand::CancelOrder {
+                symbol: "BTC-USDT".to_string(),
+                order_id: 7,
+            },
+        }
+    }
+
+    #[test]
+    fn batch_assigns_contiguous_sequences_and_one_command_id() {
+        let events = vec![rejected(), rejected()];
+
+        let records = EventRecord::batch(&events, 10, 4);
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (record.format_version, record.sequence, record.command_id))
+                .collect::<Vec<_>>(),
+            vec![(FORMAT_VERSION, 10, 4), (FORMAT_VERSION, 11, 4)]
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.event.clone())
+                .collect::<Vec<_>>(),
+            events
+        );
     }
 }

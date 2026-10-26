@@ -266,6 +266,18 @@ pub enum EngineCommand {
     },
 }
 
+impl EngineCommand {
+    /// The symbol every command variant carries.
+    pub fn symbol(&self) -> &str {
+        match self {
+            Self::SubmitOrder { symbol, .. }
+            | Self::SubmitStopOrder { symbol, .. }
+            | Self::CancelOrder { symbol, .. }
+            | Self::ModifyOrder { symbol, .. } => symbol,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BookSnapshot {
     pub symbol: String,

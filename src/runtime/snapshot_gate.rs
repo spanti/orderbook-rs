@@ -46,8 +46,9 @@ pub(crate) trait SnapshotGate: Send + 'static {
 enum SnapshotPending {
     /// No snapshot is waiting.
     None,
-    /// A due boundary was reached while durability lagged; intake is paused.
-    Watermark,
+    /// A due boundary was reached while durability lagged; intake is paused
+    /// until the durability watermark catches up.
+    AwaitingWatermark,
     /// A capture is pending because the worker channel was full; keep
     /// matching and retry at the next durability boundary.
     Due,
@@ -134,7 +135,7 @@ impl SnapshotGate for CadenceSnapshotGate {
         }
 
         match self.pending {
-            SnapshotPending::Watermark => {
+            SnapshotPending::AwaitingWatermark => {
                 if applied_seq > durable_seq {
                     return GateDecision::Pause;
                 }
@@ -156,7 +157,7 @@ impl SnapshotGate for CadenceSnapshotGate {
                 if applied_seq > durable_seq {
                     // Deliberate, infrequent pause so continuous load cannot
                     // starve snapshots forever.
-                    self.pending = SnapshotPending::Watermark;
+                    self.pending = SnapshotPending::AwaitingWatermark;
                     return GateDecision::Pause;
                 }
 

@@ -6,7 +6,7 @@
 
 **Status:** done
 
-- [x] `decide` for a non-crossing limit submit returns `OrderAccepted` followed by `OrderRested`; no other event kind is emitted.
+- [x] `decide` for a non-crossing limit submit returns `OrderAccepted` followed by `OrderRested`; no other event kind is emitted. `OrderAccepted` also carries `post_only` as consumer metadata; `apply` ignores it.
 - [x] `OrderAccepted` creates the ledger record but does not insert into the book; `OrderRested` inserts the order at its price level with FIFO priority.
 - [x] `apply` is the only state write entry and folds both events; applying either prefix leaves a valid engine state.
 - [x] Each `EventRecord` carries format version 2, a contiguous event sequence, and the same `command_id` for both events.

@@ -30,8 +30,8 @@ pub struct CommandReceipt {
 /// Results written into one response slot.
 ///
 /// `applied` is the preliminary acknowledgement; `durable` is set once the
-/// record is confirmed in the command log. `stopped` unblocks waiters when a
-/// worker disappears before both results are written.
+/// command's event records are confirmed in the event log. `stopped` unblocks
+/// waiters when a worker disappears before both results are written.
 #[derive(Debug, Default)]
 pub(crate) struct SlotState {
     pub applied: Option<Result<CommandReceipt, RuntimeError>>,

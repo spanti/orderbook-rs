@@ -18,7 +18,7 @@ ADR 0001 选择命令日志，是因为当时的 `EngineEvent` 只是结果通�
 
 ## Decision
 
-- **事件目录**：`OrderAccepted`、`OrderRested`、`TradeExecuted`、`OrderCanceled`、`StopPlaced`、`StopTriggered`、`StopCanceled`、`OrderRejected`。`Order` 携带 id/side/price/quantity/timestamp/type/TIF；symbol 由事件携带。`OrderRested` 与 `StopTriggered` 中的 `Order.quantity` 是该事件发生时的剩余量。
+- **事件目录**：`OrderAccepted`、`OrderRested`、`TradeExecuted`、`OrderCanceled`、`StopPlaced`、`StopTriggered`、`StopCanceled`、`OrderRejected`。`Order` 携带 id/side/price/quantity/timestamp/type/TIF；symbol 由事件携带。`OrderRested` 与 `StopTriggered` 中的 `Order.quantity` 是该事件发生时的剩余量。`OrderAccepted` 另携带 `post_only`、`StopTriggered` 另携带触发时的 `last_price`；两者都是给消费者的元数据，`apply` 不读取。
 - **每类命令的事件序列**：
   - 新提交：`OrderAccepted` → `TradeExecuted`* → `OrderRested`（有剩余且可挂）或 `OrderCanceled{UnfilledResidual}`（有剩余但不可挂）；全成交则没有后两者。
   - 撤单：`OrderCanceled{UserCancel}`；撤待触发止损：`StopCanceled`。

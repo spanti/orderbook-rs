@@ -7,7 +7,7 @@
 **Status:** done
 
 - [x] Submitting a stop emits `StopPlaced` carrying the full stop order; applying it inserts the stop and the PendingTrigger ledger record.
-- [x] Triggering a stop emits `StopTriggered` carrying the converted order (side, target price, market+IOC or limit+GTC, original quantity); applying it removes the stop and activates the ledger record, without a separate `OrderAccepted`.
+- [x] Triggering a stop emits `StopTriggered` carrying the converted order (side, target price, market+IOC or limit+GTC, original quantity) and the triggering `last_price` as consumer metadata; applying it removes the stop and activates the ledger record, without a separate `OrderAccepted`.
 - [x] The events after `StopTriggered` are the normal matching events (trades, rest, residual discard) and replay exactly.
 - [x] A cascade of triggers emits its events in trigger order and replays to the same state.
 - [x] Cancelling a pending stop emits `StopCanceled` and removes it from the stop book and ledger.

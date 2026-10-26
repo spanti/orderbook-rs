@@ -9,7 +9,7 @@ use std::any::Any;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use orderbook_rs::bus::{BusError, EVENTS_TOPIC, InProcessBus, MessageBus};
+use orderbook_rs::bus::{BusError, EVENTS_TOPIC, InProcessBus, MessageBus, SubscriberBus};
 use orderbook_rs::durable::{EventRecord, FORMAT_VERSION};
 use orderbook_rs::event::DomainEvent;
 use orderbook_rs::types::{EngineCommand, EngineError};
@@ -180,6 +180,36 @@ fn commands_have_no_ingress_on_the_bus() {
         received.load(Ordering::SeqCst),
         0,
         "a command was never delivered to subscribers"
+    );
+}
+
+#[test]
+fn the_subscriber_view_registers_on_the_same_bus_but_has_no_publisher() {
+    let bus = Arc::new(InProcessBus::new());
+    let view = SubscriberBus::new(Arc::clone(&bus) as Arc<dyn MessageBus>);
+    let received = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&received);
+
+    view.register_any(
+        EVENTS_TOPIC,
+        Box::new(move |message: &dyn Any| {
+            assert!(message.downcast_ref::<EventRecord>().is_some());
+            counter.fetch_add(1, Ordering::SeqCst);
+        }),
+    )
+    .expect("register through the subscriber view");
+
+    // Publishing stays with the concrete bus / Event Publisher. The view
+    // itself exposes no `try_publish_any` or `send_any` (see the compile_fail
+    // doctest on `SubscriberBus`), so an engine handle cannot inject events.
+    bus.try_publish_any(EVENTS_TOPIC, &event_record(1))
+        .expect("publish through the writable bus");
+
+    assert_eq!(received.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        view.register_response_handler(1, Box::new(|_: &dyn Any| {})),
+        Err(BusError::Unsupported),
+        "the subscriber view mirrors the bus's unsupported request path"
     );
 }
 

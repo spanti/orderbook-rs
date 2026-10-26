@@ -15,7 +15,7 @@ use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use crate::durable::{DurableError, EventCursor, EventRecord, FORMAT_VERSION};
+use crate::durable::{DurableError, EventCursor, EventRecord};
 use crate::engine::MatchingEngine;
 
 use super::RuntimeConfig;
@@ -341,16 +341,7 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
 
         let command_id = self.next_command_id;
         let first_event_sequence = self.next_sequence;
-        let records: Vec<EventRecord> = events
-            .iter()
-            .enumerate()
-            .map(|(offset, event)| EventRecord {
-                format_version: FORMAT_VERSION,
-                sequence: first_event_sequence.saturating_add(offset as u64),
-                command_id,
-                event: event.clone(),
-            })
-            .collect();
+        let records = EventRecord::batch(&events, first_event_sequence, command_id);
         let last_event_sequence = records
             .last()
             .map(|record| record.sequence)

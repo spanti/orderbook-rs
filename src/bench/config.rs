@@ -46,10 +46,10 @@ pub enum BenchPath {
 /// Storage adapters used by the runtime path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LogKind {
-    /// In-memory command log and snapshot store.
+    /// In-memory event log and snapshot store.
     #[default]
     Memory,
-    /// File-backed command log and snapshot store under `--data-dir`.
+    /// File-backed event log and snapshot store under `--data-dir`.
     File,
 }
 
@@ -88,7 +88,8 @@ Runtime path options:
   --journal-flush-us <N>   Upper bound on buffering before a flush, in us (default: 100)
   --idle spin|backoff      Matching-thread idle strategy; runtime default: spin
   --affinity <CORE>        Pin the matching thread to a core index
-  --snapshot-cadence <N>   Automatic snapshots every N commands; 0 disables (default: 0)
+  --snapshot-cadence <N>   Automatic snapshots every N event sequences, captured at the next
+                           command boundary; 0 disables (default: 0)
   --log memory|file        Runtime storage adapters (default: memory)
   --data-dir <PATH>        Directory for file adapters; required with --log file
   --in-flight <N>          Commands in flight; 1 measures submit-to-ack latency (default: 1)
