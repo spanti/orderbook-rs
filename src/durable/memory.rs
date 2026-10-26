@@ -9,8 +9,8 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::durable::{
-    CommandLog, CommandRecord, DurableError, EventLog, EventRecord, LogHeader, SnapshotStore,
-    StoredSnapshot,
+    CommandLog, CommandRecord, DurableError, EVENT_FORMAT_VERSION, EventLog, EventRecord,
+    EventSnapshot, EventSnapshotStore, LogHeader, SnapshotStore, StoredSnapshot,
 };
 
 /// Lock a mutex, recovering the guard if a previous holder panicked.
@@ -140,6 +140,12 @@ impl EventLog for InMemoryEventLog {
     }
 
     fn write_header(&mut self, header: LogHeader) -> Result<(), DurableError> {
+        if header.format_version != EVENT_FORMAT_VERSION {
+            return Err(DurableError::UnsupportedVersion {
+                found: header.format_version,
+                supported: EVENT_FORMAT_VERSION,
+            });
+        }
         let mut state = lock(&self.state);
         if state.header.is_some() {
             return Err(DurableError::HeaderAlreadyPresent);
@@ -152,6 +158,12 @@ impl EventLog for InMemoryEventLog {
         let mut state = lock(&self.state);
         if state.header.is_none() {
             return Err(DurableError::MissingHeader);
+        }
+        if record.format_version != EVENT_FORMAT_VERSION {
+            return Err(DurableError::UnsupportedVersion {
+                found: record.format_version,
+                supported: EVENT_FORMAT_VERSION,
+            });
         }
 
         let expected = state
@@ -174,6 +186,15 @@ impl EventLog for InMemoryEventLog {
         let mut state = lock(&self.state);
         if state.header.is_none() {
             return Err(DurableError::MissingHeader);
+        }
+        if let Some(record) = records
+            .iter()
+            .find(|record| record.format_version != EVENT_FORMAT_VERSION)
+        {
+            return Err(DurableError::UnsupportedVersion {
+                found: record.format_version,
+                supported: EVENT_FORMAT_VERSION,
+            });
         }
 
         // Validate the whole batch before mutating, so a gap cannot leave a
@@ -274,6 +295,60 @@ impl SnapshotStore for InMemorySnapshotStore {
     }
 
     fn load_previous(&self) -> Result<Option<StoredSnapshot>, DurableError> {
+        let snapshots = lock(&self.snapshots);
+        let len = snapshots.len();
+        if len < 2 {
+            return Ok(None);
+        }
+        Ok(Some(snapshots[len - 2].clone()))
+    }
+}
+
+/// In-memory [`EventSnapshotStore`] shared by every clone of a handle.
+#[derive(Debug, Clone, Default)]
+pub struct InMemoryEventSnapshotStore {
+    snapshots: Arc<Mutex<Vec<EventSnapshot>>>,
+}
+
+impl InMemoryEventSnapshotStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Another handle to the same store, used to reopen after a simulated crash.
+    pub fn handle(&self) -> Self {
+        self.clone()
+    }
+}
+
+impl EventSnapshotStore for InMemoryEventSnapshotStore {
+    fn save(&mut self, snapshot: EventSnapshot) -> Result<(), DurableError> {
+        let mut snapshots = lock(&self.snapshots);
+        let floor = snapshots
+            .iter()
+            .map(|stored| stored.applied_seq)
+            .max()
+            .unwrap_or(0);
+        if snapshot.applied_seq < floor {
+            return Err(DurableError::SnapshotBelowFloor {
+                applied_seq: snapshot.applied_seq,
+                floor,
+            });
+        }
+
+        snapshots.push(snapshot);
+        // Retain the two newest complete snapshots.
+        while snapshots.len() > 2 {
+            snapshots.remove(0);
+        }
+        Ok(())
+    }
+
+    fn load_latest(&self) -> Result<Option<EventSnapshot>, DurableError> {
+        Ok(lock(&self.snapshots).last().cloned())
+    }
+
+    fn load_previous(&self) -> Result<Option<EventSnapshot>, DurableError> {
         let snapshots = lock(&self.snapshots);
         let len = snapshots.len();
         if len < 2 {

@@ -6,7 +6,7 @@
 
 use orderbook_rs::durable::{
     DurableError, EVENT_FORMAT_VERSION, EventLog, EventRecord, EventSourcedEngine,
-    InMemoryEventLog, LogHeader,
+    InMemoryEventLog, InMemoryEventSnapshotStore, LogHeader,
 };
 use orderbook_rs::engine::MatchingEngine;
 use orderbook_rs::event::DomainEvent;
@@ -164,7 +164,11 @@ fn decide_allocates_the_order_id_without_mutating_counters() {
 #[test]
 fn event_records_carry_format_version_contiguous_sequence_and_one_command_id() {
     let log = InMemoryEventLog::new();
-    let mut engine = EventSourcedEngine::create(EngineConfig::default(), Box::new(log.handle()))
+    let mut engine = EventSourcedEngine::create(
+        EngineConfig::default(),
+        Box::new(log.handle()),
+        Box::new(InMemoryEventSnapshotStore::new()),
+    )
         .expect("fresh event log");
 
     engine
@@ -202,7 +206,11 @@ fn reopening_from_the_in_memory_event_log_reproduces_decision_state() {
     let log = InMemoryEventLog::new();
     let expected = {
         let mut engine =
-            EventSourcedEngine::create(EngineConfig::default(), Box::new(log.handle()))
+            EventSourcedEngine::create(
+        EngineConfig::default(),
+        Box::new(log.handle()),
+        Box::new(InMemoryEventSnapshotStore::new()),
+    )
                 .expect("fresh event log");
         // Same price level on BTC proves FIFO priority survives; ETH proves
         // per-symbol isolation survives.
@@ -218,7 +226,10 @@ fn reopening_from_the_in_memory_event_log_reproduces_decision_state() {
         engine.engine().capture_snapshot()
     };
 
-    let mut reopened = EventSourcedEngine::open(Box::new(log.handle()))
+    let mut reopened = EventSourcedEngine::open(
+        Box::new(log.handle()),
+        Box::new(InMemoryEventSnapshotStore::new()),
+    )
         .expect("recovery folds the event log alone");
 
     assert_eq!(reopened.engine().capture_snapshot(), expected);
@@ -320,6 +331,7 @@ fn a_failed_append_applies_nothing_and_fails_the_instance_closed() {
     let mut engine = EventSourcedEngine::create(
         EngineConfig::default(),
         Box::new(FailingEventLog::new(log.handle())),
+        Box::new(InMemoryEventSnapshotStore::new()),
     )
     .expect("header write succeeds");
 
@@ -347,7 +359,11 @@ fn a_failed_append_applies_nothing_and_fails_the_instance_closed() {
 #[test]
 fn unsupported_commands_fail_clearly_and_append_nothing() {
     let log = InMemoryEventLog::new();
-    let mut engine = EventSourcedEngine::create(EngineConfig::default(), Box::new(log.handle()))
+    let mut engine = EventSourcedEngine::create(
+        EngineConfig::default(),
+        Box::new(log.handle()),
+        Box::new(InMemoryEventSnapshotStore::new()),
+    )
         .expect("fresh event log");
 
     let unsupported = [

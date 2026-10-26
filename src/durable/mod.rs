@@ -16,14 +16,23 @@ use crate::types::{CommandOutcome, EngineCommand, EngineConfig, EngineError};
 mod framing;
 
 pub mod event_log;
+pub mod event_snapshot;
+pub mod file_event_log;
+pub mod file_event_snapshot;
 pub mod file_log;
 pub mod file_snapshot;
 pub mod memory;
+mod snapshot_files;
 
 pub use event_log::{EVENT_FORMAT_VERSION, EventCursor, EventLog, EventRecord, EventSourcedEngine};
+pub use event_snapshot::{EventSnapshot, EventSnapshotStore};
+pub use file_event_log::FileEventLog;
+pub use file_event_snapshot::FileEventSnapshotStore;
 pub use file_log::FileCommandLog;
 pub use file_snapshot::FileSnapshotStore;
-pub use memory::{InMemoryCommandLog, InMemoryEventLog, InMemorySnapshotStore};
+pub use memory::{
+    InMemoryCommandLog, InMemoryEventLog, InMemoryEventSnapshotStore, InMemorySnapshotStore,
+};
 
 /// Version written into every durable envelope. Incompatible versions are
 /// refused rather than migrated.
