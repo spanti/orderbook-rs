@@ -19,6 +19,11 @@
 //! - **Journal thread**: owns the [`EventLog`](crate::durable::EventLog).
 //!   It coalesces batches, calls `append_batch`, and advances the shared
 //!   durability watermark only after the append returns.
+//! - **Event Publisher**: runs on its own thread. It shares the log handle with
+//!   the journal only to read committed records, and synchronously publishes
+//!   durable [`EventRecord`](crate::durable::EventRecord)s on the
+//!   [`MessageBus`](crate::bus::MessageBus). It starts at the recovered
+//!   durability watermark and never replays history.
 //! - **Snapshot worker**: owns the
 //!   [`EventSnapshotStore`](crate::durable::EventSnapshotStore) and saves
 //!   snapshots off the matching thread.
@@ -33,6 +38,7 @@
 //!         matching thread --Vec<EventRecord>--> journal sync_channel(journal_batch_capacity)
 //!             --> journal thread --append_batch + fsync--> durability watermark
 //!                 --> matching thread --Durable Acknowledgement
+//!                 --> Event Publisher --read_from(watermark)--> MessageBus subscribers
 //!         matching thread --EventSnapshot--> snapshot sync_channel(1)
 //!             --> snapshot worker --save--> SnapshotStore
 //! ```
@@ -56,6 +62,10 @@
 //! - `applied_seq` never decreases, and the durability watermark never exceeds
 //!   it. A durable acknowledgement is sent only after the command's **last**
 //!   event sequence is in the log.
+//! - The Event Publisher dispatches durable records in event-sequence order.
+//!   The bus is synchronous, so a slow handler delays publication for every
+//!   subscriber but never the matching thread; a handler panic is isolated.
+//!   Consumers that miss events read `EventLog::read_from(last_seen + 1)`.
 //!
 //! # Failure modes
 //!
@@ -73,12 +83,16 @@
 //!   `"snapshot"`).
 //! - Shutdown is bounded by [`RuntimeConfig::shutdown_timeout`]. A journal
 //!   already blocked in an fsync cannot be interrupted, so the final join may
-//!   still wait for that fsync.
+//!   still wait for that fsync. Publication is drained to the final durability
+//!   watermark; a handler that cannot be interrupted is detached at the
+//!   timeout, and consumers catch up from the event log.
 //!
 //! # Non-goals and known deviations
 //!
-//! - No read or query API through [`EngineHandle`]. There is no market-data
-//!   output stream; the applied receipt carries the command's events.
+//! - No read or query API through [`EngineHandle`]. Durable events are emitted
+//!   on the [`MessageBus`](crate::bus::MessageBus); the applied receipt also
+//!   carries the command's events. The bus is in-process, synchronous, and has
+//!   no per-subscriber queue, lag detection, or command path.
 //! - No client idempotency or request deduplication; `request_id` is
 //!   observability only.
 //! - No per-symbol sharding, timers, GTT, or auction events.
@@ -105,6 +119,7 @@ pub(crate) mod journal;
 pub(crate) mod lifecycle;
 pub(crate) mod matching;
 pub mod metrics;
+pub(crate) mod publisher;
 pub(crate) mod shared;
 pub(crate) mod snapshot;
 pub(crate) mod snapshot_gate;

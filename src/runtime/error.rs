@@ -45,6 +45,7 @@ impl std::error::Error for SubmitError {
 pub enum Worker {
     Matching,
     Journal,
+    Publisher,
     Snapshot,
 }
 
@@ -53,6 +54,7 @@ impl fmt::Display for Worker {
         match self {
             Self::Matching => write!(f, "matching"),
             Self::Journal => write!(f, "journal"),
+            Self::Publisher => write!(f, "publisher"),
             Self::Snapshot => write!(f, "snapshot"),
         }
     }

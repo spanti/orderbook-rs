@@ -11,11 +11,12 @@
 //! idempotent, so dropping a runtime that was explicitly shut down is a no-op.
 
 use std::sync::atomic::AtomicU64;
-use std::sync::mpsc::{self, SyncSender};
-use std::sync::{Arc, Barrier};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::bus::{InProcessBus, MessageBus};
 use crate::durable::{
     DurableError, EVENT_FORMAT_VERSION, EventCursor, EventLog, EventSnapshotStore, LogHeader,
     recover_event,
@@ -26,9 +27,10 @@ use crate::types::{EngineCommand, EngineConfig};
 use super::RuntimeConfig;
 use super::envelope::CommandEnvelope;
 use super::error::{RuntimeError, SubmitError, Worker};
-use super::journal::{self, ThreadWaker, Waker};
+use super::journal::{self, SharedEventLog, ThreadWaker, Waker};
 use super::matching::MatchingThread;
 use super::metrics::RuntimeMetrics;
+use super::publisher;
 use super::shared::SharedState;
 use super::snapshot::{self, SnapshotSink};
 use super::snapshot_gate::{CadenceSnapshotGate, GateDecision, SnapshotGate};
@@ -46,9 +48,20 @@ pub struct EngineHandle {
     submitter: IngressSubmitter,
     shared: SharedState,
     metrics: Option<Arc<RuntimeMetrics>>,
+    bus: Arc<dyn MessageBus>,
 }
 
 impl EngineHandle {
+    /// The bus durable events are published on.
+    ///
+    /// Subscribers register on [`crate::bus::EVENTS_TOPIC`] and downcast each
+    /// message to [`crate::durable::EventRecord`]. Events that were already
+    /// published (for example while this handle was not subscribed) are read
+    /// from the event log with `read_from(last_seen + 1)`.
+    pub fn bus(&self) -> Arc<dyn MessageBus> {
+        Arc::clone(&self.bus)
+    }
+
     /// Try to submit without blocking.
     ///
     /// Returns [`SubmitError::QueueFull`] when the ingress Command Queue or the
@@ -94,8 +107,11 @@ pub struct EngineRuntime {
     shared: SharedState,
     waker: ThreadWaker,
     config: RuntimeConfig,
+    bus: Arc<dyn MessageBus>,
     matching: Option<JoinHandle<Option<MatchingEngine>>>,
     journal: Option<JoinHandle<()>>,
+    publisher: Option<JoinHandle<()>>,
+    publisher_done: Option<mpsc::Receiver<()>>,
     snapshot: Option<JoinHandle<()>>,
     snapshot_sink: Option<SnapshotSink>,
     /// The runtime keeps one ingress sender for its whole life so the Command
@@ -113,8 +129,28 @@ impl EngineRuntime {
     pub fn create(
         config: RuntimeConfig,
         engine_config: EngineConfig,
+        log: Box<dyn EventLog>,
+        snapshots: Box<dyn EventSnapshotStore>,
+    ) -> Result<(EngineHandle, Self), RuntimeError> {
+        Self::create_with_bus(
+            config,
+            engine_config,
+            log,
+            snapshots,
+            Arc::new(InProcessBus::new()),
+        )
+    }
+
+    /// Start a fresh runtime that publishes durable events on `bus`.
+    ///
+    /// The caller may keep a clone of `bus` and register subscribers before
+    /// submitting commands.
+    pub fn create_with_bus(
+        config: RuntimeConfig,
+        engine_config: EngineConfig,
         mut log: Box<dyn EventLog>,
         snapshots: Box<dyn EventSnapshotStore>,
+        bus: Arc<dyn MessageBus>,
     ) -> Result<(EngineHandle, Self), RuntimeError> {
         log.write_header(LogHeader {
             format_version: EVENT_FORMAT_VERSION,
@@ -128,6 +164,7 @@ impl EngineRuntime {
             log,
             snapshots,
             EventCursor::fresh(),
+            bus,
         )
     }
 
@@ -142,10 +179,23 @@ impl EngineRuntime {
         log: Box<dyn EventLog>,
         snapshots: Box<dyn EventSnapshotStore>,
     ) -> Result<(EngineHandle, Self), RuntimeError> {
+        Self::open_with_bus(config, log, snapshots, Arc::new(InProcessBus::new()))
+    }
+
+    /// Recover from `log` and publish only live durable events on `bus`.
+    ///
+    /// The publisher starts at the recovered durable watermark, so history is
+    /// never replayed; consumers read `EventLog::read_from` for that.
+    pub fn open_with_bus(
+        config: RuntimeConfig,
+        log: Box<dyn EventLog>,
+        snapshots: Box<dyn EventSnapshotStore>,
+        bus: Arc<dyn MessageBus>,
+    ) -> Result<(EngineHandle, Self), RuntimeError> {
         let (engine, cursor) = recover_event(log.as_ref(), snapshots.as_ref())
             .map_err(|error| RuntimeError::Startup(error.to_string()))?;
 
-        Self::start(config, engine, log, snapshots, cursor)
+        Self::start(config, engine, log, snapshots, cursor, bus)
     }
 
     fn start(
@@ -154,6 +204,7 @@ impl EngineRuntime {
         log: Box<dyn EventLog>,
         snapshots: Box<dyn EventSnapshotStore>,
         cursor: EventCursor,
+        bus: Arc<dyn MessageBus>,
     ) -> Result<(EngineHandle, Self), RuntimeError> {
         Self::start_with_gate(
             config,
@@ -161,6 +212,7 @@ impl EngineRuntime {
             log,
             snapshots,
             cursor,
+            bus,
             CadenceSnapshotGate::new,
         )
     }
@@ -170,12 +222,14 @@ impl EngineRuntime {
     /// The production entry points use [`CadenceSnapshotGate`]; tests inject a
     /// gate that fails on demand so panic propagation can be exercised without
     /// weakening the public API.
+    #[allow(clippy::too_many_arguments)]
     fn start_with_gate<G, F>(
         config: RuntimeConfig,
         engine: MatchingEngine,
         log: Box<dyn EventLog>,
         snapshots: Box<dyn EventSnapshotStore>,
         cursor: EventCursor,
+        bus: Arc<dyn MessageBus>,
         make_gate: F,
     ) -> Result<(EngineHandle, Self), RuntimeError>
     where
@@ -196,11 +250,25 @@ impl EngineRuntime {
             submitter,
             shared: shared.clone(),
             metrics: config.metrics.clone(),
+            bus: Arc::clone(&bus),
         };
 
         let waker = ThreadWaker::new();
-        let (journal_sink, journal_handle) =
-            journal::spawn(log, shared.clone(), &config, waker.clone());
+        // The journal writer and the publisher reader share one log handle, so
+        // the publisher needs no adapter hook and cannot read a different log.
+        let shared_log: SharedEventLog = Arc::new(Mutex::new(log));
+        let (journal_sink, journal_handle) = journal::spawn_shared(
+            Arc::clone(&shared_log),
+            shared.clone(),
+            &config,
+            waker.clone(),
+        );
+        let (publisher_handle, publisher_done) = publisher::spawn(
+            shared_log,
+            shared.clone(),
+            Arc::clone(&bus),
+            cursor.durable_seq,
+        );
         let (snapshot_sink, snapshot_handle) = snapshot::spawn(snapshots);
         let gate = make_gate(config.snapshot_cadence, snapshot_sink.clone());
 
@@ -242,6 +310,15 @@ impl EngineRuntime {
                     drop(handle);
                     drop(ingress_sender);
                     let _ = journal_handle.join();
+                    shared.finish_publisher();
+                    match publisher_done.recv_timeout(config.shutdown_timeout) {
+                        Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                            let _ = publisher_handle.join();
+                        }
+                        // A detached publisher cannot be joined without
+                        // blocking; every event remains readable from the log.
+                        Err(RecvTimeoutError::Timeout) => {}
+                    }
                     let _ = snapshot_handle.join();
                     return Err(RuntimeError::Startup(format!(
                         "could not start the matching thread: {error}"
@@ -263,6 +340,13 @@ impl EngineRuntime {
             drop(ingress_sender);
             let _ = matching_handle.join();
             let _ = journal_handle.join();
+            shared.finish_publisher();
+            match publisher_done.recv_timeout(config.shutdown_timeout) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                    let _ = publisher_handle.join();
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+            }
             let _ = snapshot_handle.join();
             return Err(RuntimeError::Startup(detail));
         }
@@ -271,8 +355,11 @@ impl EngineRuntime {
             shared,
             waker,
             config,
+            bus,
             matching: Some(matching_handle),
             journal: Some(journal_handle),
+            publisher: Some(publisher_handle),
+            publisher_done: Some(publisher_done),
             snapshot: Some(snapshot_handle),
             snapshot_sink: Some(snapshot_sink),
             _ingress_sender: Some(ingress_sender),
@@ -299,6 +386,14 @@ impl EngineRuntime {
     /// This runtime's metrics sink, if metrics are enabled.
     pub fn metrics(&self) -> Option<&Arc<RuntimeMetrics>> {
         self.config.metrics.as_ref()
+    }
+
+    /// The bus durable events are published on.
+    ///
+    /// Subscribers register before submitting commands; events published before
+    /// a subscriber exists are recovered from the event log.
+    pub fn bus(&self) -> Arc<dyn MessageBus> {
+        Arc::clone(&self.bus)
     }
 
     fn stop(&mut self, final_snapshot: bool) -> Result<(), RuntimeError> {
@@ -366,6 +461,32 @@ impl EngineRuntime {
             panic_error = Some(RuntimeError::WorkerPanicked(Worker::Journal));
         }
 
+        // The journal has exited, so the durability watermark is final. Let
+        // the publisher drain to it and stop. A synchronous handler cannot be
+        // interrupted, so the wait is bounded: on timeout the thread is
+        // detached and consumers catch up from the event log.
+        self.shared.finish_publisher();
+        if let Some(done) = self.publisher_done.take() {
+            match done.recv_timeout(self.shared.shutdown_remaining()) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => {
+                    if let Some(handle) = self.publisher.take()
+                        && handle.join().is_err()
+                        && panic_error.is_none()
+                    {
+                        panic_error = Some(RuntimeError::WorkerPanicked(Worker::Publisher));
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    // Abandoning the join handle leaves the thread detached;
+                    // every event is already durable and readable from the log.
+                    self.publisher = None;
+                    if failure.is_none() && panic_error.is_none() {
+                        failure = Some(RuntimeError::Timeout);
+                    }
+                }
+            }
+        }
+
         if let Some(handle) = self.snapshot.take()
             && handle.join().is_err()
             && panic_error.is_none()
@@ -427,6 +548,7 @@ pub fn start_with_matching_panic_for_test(
         log,
         snapshots,
         EventCursor::fresh(),
+        Arc::new(InProcessBus::new()),
         move |_cadence, _sink| PanicAfterBarrierGate {
             start,
             started: false,
@@ -554,6 +676,7 @@ mod tests {
             Box::new(crate::durable::InMemoryEventLog::new()),
             Box::new(InMemoryEventSnapshotStore::new()),
             EventCursor::fresh(),
+            Arc::new(InProcessBus::new()),
             |_cadence, _sink| PanickingGate { panic_after: 1 },
         )
         .expect("start with the test gate");

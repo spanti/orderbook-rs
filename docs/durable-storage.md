@@ -205,11 +205,27 @@ recovery bug.
 
 ## MessageBus publication
 
-After the journal fsyncs a batch, it publishes a watermark/wake-up signal. A
-separate Event Publisher reads `EventLog::read_from(last_published + 1)` up to
-`durable_seq` and calls `try_publish_any("events", record)` in sequence order.
-The publisher starts at the recovered durable watermark, so it publishes only
-live events; history is the consumer's job via `EventLog::read_from`.
+After the journal fsyncs a batch, it advances the durability watermark and
+publishes a watermark/wake-up signal. A separate Event Publisher reads
+`EventLog::read_from(last_published + 1)`, clamps the result to `durable_seq`,
+and calls `try_publish_any("events", record)` in sequence order. The publisher
+starts at the recovered durable watermark, so it publishes only live events;
+history is the consumer's job via `EventLog::read_from`.
+
+The journal writer and the publisher share one `EventLog` handle. The journal
+holds its lock only for `append_batch`; the publisher holds it only while
+cloning the records returned by `read_from`. Handler dispatch happens after the
+lock is released, so a slow subscriber delays publication for every subscriber
+but never the journal or the matching thread. The wake-up is advisory: the
+publisher re-reads the watermark and the log after every notification, so a
+lost wake-up cannot lose an event, and a record is never published above the
+watermark it observed.
+
+On explicit shutdown the journal is joined first, making the watermark final;
+the publisher then drains to that watermark and exits, bounded by
+`shutdown_timeout`. If a synchronous handler cannot be interrupted, the
+publisher thread is detached after the timeout and consumers catch up from the
+event log.
 
 The bus is synchronous: handlers run on the publisher thread with `&dyn Any`,
 and a slow handler delays publication for every subscriber but never the
