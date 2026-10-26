@@ -32,6 +32,13 @@ The CRC-32 covers exactly the JSON bytes (not the checksum, space, or newline).
 Appends write, flush, and fsync before returning, so an acknowledged append is
 durable. The header is written through the same durable append path.
 
+`append_batch` validates the whole batch for sequence contiguity and encodes
+every line before writing, then writes all lines, flushes once, and fsyncs once.
+`Ok` means every record in the batch is durable; `Err` may leave a prefix of the
+batch written, so the caller must fail-stop rather than retry the same batch.
+The default trait implementation falls back to one `append` per record, keeping
+per-record durability without group commit.
+
 On open:
 
 - A final fragment without a terminating newline is truncated. It is an append
@@ -57,6 +64,8 @@ the previous one.
 A `CommandLog` implementation must:
 
 - Return from `append` only after the record is durable.
+- Return from `append_batch` only when every record in the batch is durable, and
+  never report success for a partially durable batch.
 - Read records back in append order.
 - Never invent, reorder, or deduplicate sequences. Sequence gaps and duplicates
   are the durable layer's concern; the adapter reports exactly what is stored.
