@@ -167,6 +167,38 @@ impl BookSide {
         }
     }
 
+    /// Price levels in ascending price order, each with its orders in FIFO
+    /// order. Used when exporting a restorable engine snapshot.
+    fn export_levels(&self) -> Vec<(u64, Vec<Order>)> {
+        self.price_levels
+            .iter()
+            .map(|(&price, level)| (price, level.orders.iter().cloned().collect()))
+            .collect()
+    }
+
+    /// Rebuild a side from exported levels without running matching. Price
+    /// level totals and the order lookup index are derived from the orders.
+    fn from_levels(side: Side, levels: Vec<(u64, Vec<Order>)>) -> Self {
+        let mut book_side = Self::new(side);
+        for (price, orders) in levels {
+            if orders.is_empty() {
+                continue;
+            }
+            let mut level = PriceLevel::new(price);
+            for order in orders {
+                debug_assert_eq!(
+                    order.side, side,
+                    "order {} was exported under the wrong book side",
+                    order.id
+                );
+                book_side.order_map.insert(order.id, (side, price));
+                level.add_order(order);
+            }
+            book_side.price_levels.insert(price, level);
+        }
+        book_side
+    }
+
     fn available_quantity(&self, order: &Order) -> u64 {
         let mut walk = MatchWalk::new(self.side, order);
         let mut available = 0u64;
@@ -321,6 +353,23 @@ impl OrderBook {
             Side::Ask => &self.asks,
         };
         book_side.depth(level)
+    }
+
+    /// Export both sides as `(price, FIFO orders)` pairs in ascending price
+    /// order. Used to capture a restorable snapshot of this book.
+    pub(crate) fn export_levels(&self) -> (Vec<(u64, Vec<Order>)>, Vec<(u64, Vec<Order>)>) {
+        (self.bids.export_levels(), self.asks.export_levels())
+    }
+
+    /// Rebuild a book from exported levels without running any matching.
+    ///
+    /// Price-level totals and the order lookup index are recomputed from the
+    /// stored orders, so the restored book matches identically.
+    pub(crate) fn from_levels(bids: Vec<(u64, Vec<Order>)>, asks: Vec<(u64, Vec<Order>)>) -> Self {
+        Self {
+            bids: BookSide::from_levels(Side::Bid, bids),
+            asks: BookSide::from_levels(Side::Ask, asks),
+        }
     }
 
     // Submit an order: match it against the opposite side, then rest any
