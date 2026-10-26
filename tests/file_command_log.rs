@@ -404,23 +404,35 @@ fn a_partial_trailing_line_is_truncated_on_open() {
 }
 
 #[test]
-fn a_corrupt_last_complete_line_is_truncated_as_a_torn_append() {
+fn a_corrupt_last_complete_line_aborts_open() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("commands.log");
     write_valid_log(&path, &[record(1), record(2)]);
+    let len_before = fs::metadata(&path).unwrap().len();
 
+    // A completed, fsynced append cannot legitimately lose its checksum, so a
+    // newline-terminated bad line is corruption, not an unacknowledged append.
     corrupt_line_crc(&path, 2);
 
-    let mut reopened = FileCommandLog::open(&path).unwrap();
+    let error = FileCommandLog::open(&path).unwrap_err();
+    match error {
+        DurableError::CorruptRecord { detail } => {
+            assert!(
+                detail.contains("line 3"),
+                "the detail should name the terminal corrupt line: {detail}"
+            );
+            assert!(
+                detail.contains("crc32 mismatch"),
+                "the detail should name the checksum failure: {detail}"
+            );
+        }
+        other => panic!("expected corruption, got {other:?}"),
+    }
     assert_eq!(
-        reopened.last_sequence(),
-        Some(1),
-        "an unacknowledged last record is discarded, not reported as corruption"
+        fs::metadata(&path).unwrap().len(),
+        len_before,
+        "a refused open must not truncate acknowledged history"
     );
-    assert_eq!(reopened.read_from(1).unwrap(), vec![record(1)]);
-
-    reopened.append(record(2)).unwrap();
-    assert_eq!(reopened.last_sequence(), Some(2));
 }
 
 // ---------------------------------------------------------------------------

@@ -18,6 +18,10 @@ pub struct EngineSnapshot {
     pub config: EngineConfig,
     pub next_order_id: u64,
     pub next_trade_id: u64,
+    /// Next **event** sequence counter, restored so event ids continue.
+    ///
+    /// This is the engine's derived-output counter, not the durable command
+    /// boundary (see [`crate::durable::StoredSnapshot::applied_seq`]).
     pub next_event_sequence: u64,
     /// Every book, including empty ones, sorted by symbol.
     pub books: Vec<BookState>,

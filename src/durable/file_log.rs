@@ -5,11 +5,12 @@
 //! bytes. An append writes, flushes and fsyncs before returning, so an
 //! acknowledged record is on disk.
 //!
-//! On open a partial trailing line is truncated: a final line without a
-//! terminating newline, or one that fails its checksum or decoding, represents
-//! an append that was never acknowledged. Any corrupt line before the last one
-//! aborts open with [`DurableError::CorruptRecord`], because silently skipping
-//! history would create a gap.
+//! On open only a final line without a terminating newline is truncated: that
+//! append was never acknowledged. Any newline-terminated line that fails its
+//! checksum or decoding aborts open with [`DurableError::CorruptRecord`],
+//! including the last one. A completed, fsynced append cannot legitimately lose
+//! its checksum, and treating it as a torn write would silently drop applied
+//! history.
 //!
 //! Parsed records are cached, so [`CommandLog::read_from`],
 //! [`CommandLog::first_sequence`] and [`CommandLog::last_sequence`] need no IO.
@@ -19,6 +20,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use crate::durable::framing::{decode_line, encode_line};
 use crate::durable::{CommandLog, CommandRecord, DurableError, LogHeader};
 
 /// A [`CommandLog`] persisted as checksummed JSON Lines.
@@ -43,8 +45,9 @@ impl FileCommandLog {
     /// Open the log at `path`, creating an empty file when it does not exist.
     ///
     /// A newly created or empty file has no header until
-    /// [`CommandLog::write_header`] is called. A torn final line is removed
-    /// from the file; a corrupt line before it makes this call fail.
+    /// [`CommandLog::write_header`] is called. An unterminated final fragment
+    /// is removed from the file; any newline-terminated line that fails its
+    /// checksum or decoding, including the last one, makes this call fail.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DurableError> {
         let path = path.as_ref().to_path_buf();
         let mut file = OpenOptions::new()
@@ -60,7 +63,6 @@ impl FileCommandLog {
             .map_err(|error| storage_error(&path, "read", &error))?;
 
         let lines = split_lines(&bytes);
-        let line_count = lines.len();
         let mut header = None;
         let mut records = Vec::new();
         // Offset just past the last line we accept; anything after it is a torn
@@ -68,8 +70,9 @@ impl FileCommandLog {
         let mut kept_end = 0usize;
 
         for (index, line) in lines.iter().enumerate() {
-            let is_last = index + 1 == line_count;
-            if is_last && !line.terminated {
+            if !line.terminated {
+                // A final line without its newline is an append that was never
+                // acknowledged, so it is truncated rather than parsed.
                 break;
             }
 
@@ -82,16 +85,14 @@ impl FileCommandLog {
                     records.push(parsed);
                     kept_end = line.end;
                 }
-                Err(detail) if is_last => {
-                    // The last complete line can still be a half-finished
-                    // append; it was never acknowledged, so discard it.
-                    let _ = detail;
-                    break;
-                }
-                Err(detail) => {
-                    return Err(DurableError::CorruptRecord {
-                        detail: format!("{} line {}: {detail}", path.display(), index + 1),
-                    });
+                Err(error) => {
+                    // A newline-terminated line was written completely; a
+                    // checksum or decode failure means real corruption, even on
+                    // the last line, and must not be silently dropped.
+                    return Err(corrupt_context(
+                        error,
+                        &format!("{} line {}", path.display(), index + 1),
+                    ));
                 }
             }
         }
@@ -138,10 +139,9 @@ impl CommandLog for FileCommandLog {
             return Err(DurableError::HeaderAlreadyPresent);
         }
 
-        let json = serde_json::to_vec(&header)
-            .map_err(|error| DurableError::Storage(format!("cannot encode log header: {error}")))?;
-        let line = encode_line(&json);
-        let result = self.append_bytes(&line);
+        let line = encode_line(&header)
+            .map_err(|error| encode_context(error, "cannot encode log header"))?;
+        let result = self.append_bytes(line.as_bytes());
         result.map_err(|error| storage_error(&self.path, "write header to", &error))?;
 
         self.header = Some(header);
@@ -165,11 +165,13 @@ impl CommandLog for FileCommandLog {
             });
         }
 
-        let json = serde_json::to_vec(&record).map_err(|error| {
-            DurableError::AppendFailed(format!("cannot encode command: {error}"))
+        let line = encode_line(&record).map_err(|error| match error {
+            DurableError::Storage(detail) => {
+                DurableError::AppendFailed(format!("cannot encode command: {detail}"))
+            }
+            other => other,
         })?;
-        let line = encode_line(&json);
-        let result = self.append_bytes(&line);
+        let result = self.append_bytes(line.as_bytes());
         result.map_err(|error| {
             DurableError::AppendFailed(format!("cannot append to {}: {error}", self.path.display()))
         })?;
@@ -232,54 +234,37 @@ enum ParsedLine {
     Record(CommandRecord),
 }
 
-fn parse_line(line: &[u8], is_header: bool) -> Result<ParsedLine, String> {
-    let json = checked_json(line)?;
-    let text = std::str::from_utf8(json).map_err(|_| "record is not valid UTF-8".to_string())?;
+fn parse_line(line: &[u8], is_header: bool) -> Result<ParsedLine, DurableError> {
+    let text = std::str::from_utf8(line).map_err(|_| DurableError::CorruptRecord {
+        detail: "record is not valid UTF-8".to_string(),
+    })?;
     if is_header {
-        serde_json::from_str(text)
+        decode_line(text)
             .map(ParsedLine::Header)
-            .map_err(|error| format!("invalid header JSON: {error}"))
+            .map_err(|error| corrupt_context(error, "invalid header"))
     } else {
-        serde_json::from_str(text)
+        decode_line(text)
             .map(ParsedLine::Record)
-            .map_err(|error| format!("invalid command JSON: {error}"))
+            .map_err(|error| corrupt_context(error, "invalid command record"))
     }
 }
 
-/// Verify the `{crc32:08x} ` prefix and return the JSON bytes it covers.
-fn checked_json(line: &[u8]) -> Result<&[u8], String> {
-    if line.len() < 9 {
-        return Err("line is shorter than a checksummed record".to_string());
+/// Add context to a corruption detail, leaving other variants untouched.
+fn corrupt_context(error: DurableError, context: &str) -> DurableError {
+    match error {
+        DurableError::CorruptRecord { detail } => DurableError::CorruptRecord {
+            detail: format!("{context}: {detail}"),
+        },
+        other => other,
     }
-
-    let (crc_bytes, rest) = line.split_at(8);
-    if rest.first() != Some(&b' ') {
-        return Err("checksum is not followed by a space".to_string());
-    }
-    let json = &rest[1..];
-
-    let crc_text =
-        std::str::from_utf8(crc_bytes).map_err(|_| "checksum is not ASCII".to_string())?;
-    let expected =
-        u32::from_str_radix(crc_text, 16).map_err(|_| "checksum is not hexadecimal".to_string())?;
-    let actual = crc32fast::hash(json);
-    if expected != actual {
-        return Err(format!(
-            "crc32 mismatch: expected {expected:08x}, computed {actual:08x}"
-        ));
-    }
-
-    Ok(json)
 }
 
-fn encode_line(json: &[u8]) -> Vec<u8> {
-    let crc = crc32fast::hash(json);
-    let mut line = Vec::with_capacity(9 + json.len() + 1);
-    line.extend_from_slice(format!("{crc:08x}").as_bytes());
-    line.push(b' ');
-    line.extend_from_slice(json);
-    line.push(b'\n');
-    line
+/// Add context to an encoding detail, leaving other variants untouched.
+fn encode_context(error: DurableError, context: &str) -> DurableError {
+    match error {
+        DurableError::Storage(detail) => DurableError::Storage(format!("{context}: {detail}")),
+        other => other,
+    }
 }
 
 fn storage_error(path: &Path, action: &str, error: &std::io::Error) -> DurableError {

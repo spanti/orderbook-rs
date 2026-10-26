@@ -84,8 +84,13 @@ impl MatchingEngine {
         }
     }
 
-    /// The last event sequence handed out, derived from the sequence counter
-    /// rather than the event history so it survives a restore that drops events.
+    /// The last **event** sequence handed out, derived from the sequence
+    /// counter rather than the event history so it survives a restore that
+    /// drops events.
+    ///
+    /// This is not the durable command sequence: recovery is bounded by
+    /// [`crate::durable::DurableMatchingEngine::applied_seq`]. One command can
+    /// emit several events, so an event sequence is not a recovery boundary.
     pub fn last_sequence(&self) -> u64 {
         self.next_sequence_id.saturating_sub(1)
     }
