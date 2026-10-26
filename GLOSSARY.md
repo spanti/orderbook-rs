@@ -42,23 +42,71 @@ _Avoid_: 用 "event" 指代命令
 _Avoid_: event log、order event log
 
 **Sequencer** / 定序器:
-为每条命令分配全局递增命令序号，并在应用前写入命令日志的组件；本项目中由 DurableMatchingEngine 承担。
+为每条命令分配全局递增命令序号，并保证命令日志按该顺序追加的组件；本项目中由同步 DurableMatchingEngine 或 Matching Runtime 的 Matching Thread 承担。
 _Avoid_: dispatcher、gateway
 
 **Recovery Gap** / 恢复空洞:
 命令日志中缺失的序号区间，使快照与剩余日志无法衔接。出现时必须拒绝启动，而不是带病运行。
 
+## Ingestion
+
+**Command Queue** / 入站命令队列:
+Command 从提交方到达撮合线程所经过的瞬态通道。命令离开队列后不留下任何可恢复的痕迹。
+_Avoid_: 队列、buffer、command buffer
+
+**Command Envelope** / 命令信封:
+Command 在 Command Queue 中的载体，同时携带回执凭据。
+_Avoid_: request、message
+
+**Ticket** / 回执凭据:
+命令入队后交给提交方的凭据，用于取得该命令的处理结果。
+_Avoid_: future、promise
+
+**Matching Thread** / 撮合线程:
+独占引擎状态、从 Command Queue 取出命令并执行的唯一线程。
+_Avoid_: worker、dispatcher
+
+**Engine Handle** / 引擎句柄:
+提交方持有的投递入口，自身不拥有撮合状态。
+_Avoid_: client、proxy、gateway
+
+## Runtime
+
+**Matching Runtime** / 撮合运行时:
+由一个 Engine Handle、一个 Command Queue、一个 Matching Thread、一个 Journal Thread 和一个 Snapshot Worker 组成的运行时；提交方只通过 Engine Handle 与它交互。
+_Avoid_: server、engine service
+
+**Journal Thread** / 日志线程:
+独占 Command Log、按批次追加记录并 fsync 的线程。它不拥有撮合状态。
+_Avoid_: writer、logger
+
+**Snapshot Worker** / 快照工作线程:
+独占 Snapshot Store、把 Engine Snapshot 写入存储的线程。它不拥有撮合状态。
+_Avoid_: checkpoint thread
+
+**Applied Acknowledgement** / 应用回执:
+命令已改变引擎状态、但尚未确认落盘的回执。它是 preliminary 的：崩溃后该命令可能不在 Command Log 中。
+_Avoid_: immediate ack、soft ack
+
+**Durable Acknowledgement** / 持久化回执:
+命令记录已落盘、可从 Command Log 恢复的回执。它同时蕴含 Applied Acknowledgement。
+_Avoid_: commit ack、hard ack
+
+**Durability Watermark** / 持久化水位:
+已确认落盘的最大 Command Sequence（`durable_seq`）。Engine Snapshot 不得越过它。
+_Avoid_: commit index、checkpoint
+
 ## Recovery
 
 **Durable Matching Engine** / 持久化撮合引擎:
-组合在纯内存撮合引擎之外的持久化层，负责先写命令日志再执行，并按阈值生成引擎快照。撮合引擎本身不感知 IO。
+组合在纯内存撮合引擎之外的持久化层；同步路径先写命令日志再执行，并按阈值生成引擎快照。撮合引擎本身不感知 IO。
 _Avoid_: persistent engine、matching service
 
 **Replay** / 重放:
 从全新引擎开始，按顺序应用命令日志中的命令，重建状态。
 
 **Exact Recovery** / 精确恢复:
-恢复后的引擎决策状态与中断前逐位一致：簿内订单及优先级、订单台账、止损单、各计数器、成交记录、last trade price、配置。输出/审计缓冲（事件历史、命令缓冲）不属于恢复状态。
+恢复后的引擎决策状态与已落盘的 Command Log 逐位一致：簿内订单及优先级、订单台账、止损单、各计数器、成交记录、last trade price、配置。输出/审计缓冲（事件历史、命令缓冲）不属于恢复状态；未被 Durable Acknowledgement 确认的命令不在恢复范围内。
 
 **Engine Snapshot** / 引擎快照:
 某个命令边界上的完整引擎状态，内含 applied command sequence，用于缩短恢复时的重放长度。
