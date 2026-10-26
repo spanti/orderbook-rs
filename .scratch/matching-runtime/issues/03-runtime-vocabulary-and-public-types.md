@@ -12,4 +12,4 @@
 - [x] Define `RuntimeMetrics` as atomics with cache-line grouping; all updates are no-ops when the metrics handle is absent.
 - [x] Define `IdleStrategy::{Spin, Backoff}` with a resettable backoff counter.
 - [x] Add `MatchingEngine::execute_ref(&mut self, command: &EngineCommand) -> CommandOutcome` that applies without cloning, and `MatchingEngine::clear_events(&mut self)`.
-- [ ] Unit tests: default config, error display, `CommandReceipt` equality/clone, backoff reset, `execute_ref` produces the same outcome and state as `execute`, `clear_events` does not change state or the event sequence counter.
+- [x] Unit tests: default config, error display, `CommandReceipt` equality/clone, backoff reset, `execute_ref` produces the same outcome and state as `execute`, `clear_events` does not change state or the event sequence counter.

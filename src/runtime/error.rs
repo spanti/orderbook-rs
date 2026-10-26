@@ -79,3 +79,43 @@ impl std::error::Error for RuntimeError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn submit_error_display_and_source() {
+        assert_eq!(SubmitError::QueueFull.to_string(), "command queue is full");
+        assert_eq!(SubmitError::Shutdown.to_string(), "runtime is shut down");
+
+        let failed = SubmitError::EngineFailed(DurableError::AppendFailed("disk".into()));
+        assert!(failed.to_string().contains("disk"));
+        assert!(std::error::Error::source(&failed).is_some());
+        assert!(std::error::Error::source(&SubmitError::QueueFull).is_none());
+    }
+
+    #[test]
+    fn runtime_error_display_and_source() {
+        assert_eq!(RuntimeError::Timeout.to_string(), "operation timed out");
+        assert_eq!(
+            RuntimeError::WorkerPanicked("matching").to_string(),
+            "runtime worker panicked: matching"
+        );
+
+        let failed = RuntimeError::EngineFailed(DurableError::AppendFailed("disk".into()));
+        assert!(failed.to_string().contains("disk"));
+        assert!(std::error::Error::source(&failed).is_some());
+        assert!(std::error::Error::source(&RuntimeError::EngineStopped).is_none());
+
+        let snapshot = RuntimeError::SnapshotFailed(DurableError::Storage("io".into()));
+        assert!(snapshot.to_string().contains("io"));
+        assert!(std::error::Error::source(&snapshot).is_some());
+
+        assert!(
+            RuntimeError::Startup("no matching core".into())
+                .to_string()
+                .contains("no matching core")
+        );
+    }
+}
