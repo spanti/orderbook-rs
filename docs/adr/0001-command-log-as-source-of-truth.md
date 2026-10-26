@@ -2,7 +2,9 @@
 
 ## Status
 
-accepted
+accepted（已被 [ADR 0004](0004-event-sourced-order-log.md) 取代）
+
+> 本 ADR 记录当时的决策。事件模型已在 ADR 0004 中重设计，命令日志不再作为事实源。
 
 ## Context
 
