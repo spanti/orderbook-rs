@@ -14,7 +14,7 @@ pub use envelope::CommandEnvelope;
 pub use error::{RuntimeError, SubmitError};
 pub use idle::{Idle, IdleStrategy};
 pub use metrics::RuntimeMetrics;
-pub use ticket::{CommandReceipt, ResponseSlot, SlotHandle, SlotState, Ticket};
+pub use ticket::{CommandReceipt, ResponseSlot, SlotHandle, SlotPool, SlotState, Ticket};
 
 use std::sync::Arc;
 use std::time::Duration;
