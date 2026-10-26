@@ -13,6 +13,8 @@ use crate::engine::MatchingEngine;
 use crate::snapshot::EngineSnapshot;
 use crate::types::{CommandOutcome, EngineCommand, EngineConfig};
 
+mod framing;
+
 pub mod file_log;
 pub mod file_snapshot;
 pub mod memory;
@@ -33,10 +35,15 @@ pub struct LogHeader {
     pub config: EngineConfig,
 }
 
-/// One appended command, with its globally ordered sequence number.
+/// One appended command, with its globally ordered command sequence number.
+///
+/// The sequence is the durability and recovery boundary. It is unrelated to the
+/// engine's event sequence (`EngineEvent::sequence_id`): one command can emit
+/// several events.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CommandRecord {
     pub format_version: u32,
+    /// Global **command** sequence, starting at 1. Not an event sequence.
     pub sequence: u64,
     pub command: EngineCommand,
 }
@@ -45,6 +52,8 @@ pub struct CommandRecord {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StoredSnapshot {
     pub format_version: u32,
+    /// **Command** sequence of the last command reflected in `snapshot`, not
+    /// the engine's event sequence.
     pub applied_seq: u64,
     pub snapshot: EngineSnapshot,
 }
@@ -142,13 +151,13 @@ pub trait CommandLog {
     /// Append a record. Rejects a record whose sequence is not the next one.
     fn append(&mut self, record: CommandRecord) -> Result<(), DurableError>;
 
-    /// Every record with `sequence >= from`, in append order.
+    /// Every record whose **command** sequence is `>= from`, in append order.
     fn read_from(&self, from: u64) -> Result<Vec<CommandRecord>, DurableError>;
 
-    /// First stored command sequence, cached with no IO.
+    /// First stored **command** sequence, cached with no IO.
     fn first_sequence(&self) -> Option<u64>;
 
-    /// Last stored command sequence, cached with no IO.
+    /// Last stored **command** sequence, cached with no IO.
     fn last_sequence(&self) -> Option<u64>;
 }
 
@@ -168,6 +177,11 @@ pub trait SnapshotStore {
 
 /// A [`MatchingEngine`] that makes every command durable before applying it and
 /// recovers by restoring the latest snapshot then replaying the log tail.
+///
+/// The sequence numbers on this surface (`applied_seq`, `CommandRecord` and
+/// `StoredSnapshot`) are **command** sequences. They are distinct from the
+/// engine's event sequence ([`MatchingEngine::last_sequence`]): one command can
+/// emit several events, so only the command sequence is a recovery boundary.
 pub struct DurableMatchingEngine {
     engine: MatchingEngine,
     log: Box<dyn CommandLog>,
@@ -262,33 +276,25 @@ impl DurableMatchingEngine {
                     _ => {}
                 }
 
-                let expected = stored.applied_seq.saturating_add(1);
-                if let Some(first) = log.first_sequence()
-                    && first > expected
-                {
-                    return Err(DurableError::RecoveryGap {
-                        expected,
-                        found: Some(first),
-                    });
-                }
-
                 (
                     MatchingEngine::restore_snapshot(stored.snapshot),
                     stored.applied_seq,
                 )
             }
-            None => {
-                if let Some(first) = log.first_sequence()
-                    && first > 1
-                {
-                    return Err(DurableError::RecoveryGap {
-                        expected: 1,
-                        found: Some(first),
-                    });
-                }
-                (MatchingEngine::new(header.config), 0)
-            }
+            None => (MatchingEngine::new(header.config), 0),
         };
+
+        // The log must cover every command after the snapshot boundary. With no
+        // snapshot that boundary is zero, so the log must start at sequence 1.
+        let expected_first = applied_seq.saturating_add(1);
+        if let Some(first) = log.first_sequence()
+            && first > expected_first
+        {
+            return Err(DurableError::RecoveryGap {
+                expected: expected_first,
+                found: Some(first),
+            });
+        }
 
         let mut durable = Self {
             engine,
@@ -421,12 +427,16 @@ impl DurableMatchingEngine {
         &self.engine
     }
 
-    /// Sequence of the last applied command; `0` before any command.
+    /// **Command** sequence of the last applied command; `0` before any command.
+    ///
+    /// This is the recovery and snapshot boundary. It is not
+    /// [`MatchingEngine::last_sequence`], which counts derived events.
     pub fn applied_seq(&self) -> u64 {
         self.applied_seq
     }
 
-    /// Durable command records from `from` onward, in sequence order.
+    /// Durable command records whose **command** sequence is `from` onward, in
+    /// sequence order.
     pub fn history_from(&self, from: u64) -> Result<Vec<CommandRecord>, DurableError> {
         self.log.read_from(from)
     }

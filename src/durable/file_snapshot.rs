@@ -18,6 +18,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::durable::framing::{decode_line, encode_line};
 use crate::durable::{DurableError, SnapshotStore, StoredSnapshot};
 
 /// How many snapshot files are retained after a successful save.
@@ -160,9 +161,12 @@ impl SnapshotStore for FileSnapshotStore {
             });
         }
 
-        let json = serde_json::to_vec(&snapshot)
-            .map_err(|error| DurableError::Storage(format!("cannot encode snapshot: {error}")))?;
-        let line = encode_line(&json);
+        let line = encode_line(&snapshot).map_err(|error| match error {
+            DurableError::Storage(detail) => {
+                DurableError::Storage(format!("cannot encode snapshot: {detail}"))
+            }
+            other => other,
+        })?;
 
         let target = self.snapshot_path(snapshot.applied_seq);
         let temp = self.temp_path(snapshot.applied_seq);
@@ -173,7 +177,7 @@ impl SnapshotStore for FileSnapshotStore {
                 .create(true)
                 .truncate(true)
                 .open(&temp)?;
-            file.write_all(&line)?;
+            file.write_all(line.as_bytes())?;
             file.flush()?;
             file.sync_all()?;
             Ok(())
@@ -235,40 +239,11 @@ fn read_snapshot(path: &Path) -> Result<Option<StoredSnapshot>, DurableError> {
     Ok(decode_snapshot(&bytes).ok())
 }
 
-fn decode_snapshot(bytes: &[u8]) -> Result<StoredSnapshot, String> {
-    let line = bytes.strip_suffix(b"\n").unwrap_or(bytes);
-    if line.len() < 9 {
-        return Err("snapshot is shorter than a checksummed record".to_string());
-    }
-
-    let (crc_bytes, rest) = line.split_at(8);
-    if rest.first() != Some(&b' ') {
-        return Err("checksum is not followed by a space".to_string());
-    }
-    let json = &rest[1..];
-
-    let crc_text =
-        std::str::from_utf8(crc_bytes).map_err(|_| "checksum is not ASCII".to_string())?;
-    let expected =
-        u32::from_str_radix(crc_text, 16).map_err(|_| "checksum is not hexadecimal".to_string())?;
-    let actual = crc32fast::hash(json);
-    if expected != actual {
-        return Err(format!(
-            "crc32 mismatch: expected {expected:08x}, computed {actual:08x}"
-        ));
-    }
-
-    serde_json::from_slice(json).map_err(|error| format!("invalid snapshot JSON: {error}"))
-}
-
-fn encode_line(json: &[u8]) -> Vec<u8> {
-    let crc = crc32fast::hash(json);
-    let mut line = Vec::with_capacity(9 + json.len() + 1);
-    line.extend_from_slice(format!("{crc:08x}").as_bytes());
-    line.push(b' ');
-    line.extend_from_slice(json);
-    line.push(b'\n');
-    line
+fn decode_snapshot(bytes: &[u8]) -> Result<StoredSnapshot, DurableError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| DurableError::CorruptRecord {
+        detail: "snapshot is not valid UTF-8".to_string(),
+    })?;
+    decode_line(text)
 }
 
 fn sync_directory(dir: &Path) -> std::io::Result<()> {
