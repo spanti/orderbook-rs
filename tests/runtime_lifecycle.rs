@@ -9,6 +9,7 @@ use orderbook_rs::durable::{
     CommandLog, CommandRecord, DurableError, DurableMatchingEngine, InMemoryCommandLog,
     InMemorySnapshotStore, LogHeader, SnapshotStore, StoredSnapshot,
 };
+use orderbook_rs::engine::MatchingEngine;
 use orderbook_rs::runtime::{
     CommandReceipt, EngineHandle, EngineRuntime, RuntimeConfig, RuntimeError, RuntimeMetrics,
     SubmitError,
@@ -295,6 +296,16 @@ fn shutdown_drains_writes_a_final_snapshot_and_reopens() {
         .expect("snapshot store readable")
         .expect("explicit shutdown writes a final snapshot");
     assert_eq!(final_snapshot.applied_seq, 4);
+
+    let mut direct = MatchingEngine::new(EngineConfig::default());
+    for timestamp in 1..=4 {
+        let _ = direct.execute(submit_order(timestamp));
+    }
+    assert_eq!(
+        final_snapshot.snapshot,
+        direct.capture_snapshot(),
+        "the runtime's final decision state matches direct execution"
+    );
 
     // Reopening uses the snapshot plus the log tail and continues the global
     // command sequence.
