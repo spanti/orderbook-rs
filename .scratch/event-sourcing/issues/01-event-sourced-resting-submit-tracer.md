@@ -4,15 +4,15 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done
 
-- [ ] `decide` for a non-crossing limit submit returns `OrderAccepted` followed by `OrderRested`; no other event kind is emitted.
-- [ ] `OrderAccepted` creates the ledger record but does not insert into the book; `OrderRested` inserts the order at its price level with FIFO priority.
-- [ ] `apply` is the only state write entry and folds both events; applying either prefix leaves a valid engine state.
-- [ ] Each `EventRecord` carries format version 2, a contiguous event sequence, and the same `command_id` for both events.
-- [ ] The event-sourced durable façade appends both records before applying; a failed append applies nothing and fails the instance closed.
-- [ ] Reopening from the in-memory event log alone reproduces the book, FIFO priority, ledger, trades, last price, counters, and last applied event sequence.
-- [ ] `BookSnapshot.sequence` reports the last applied event sequence.
-- [ ] Unsupported commands are not accepted by the event-sourced path with a clear failure; no command is silently dropped.
-- [ ] The decision scratch/overlay is exercised by a benchmark baseline; a whole-engine clone is not on the path.
-- [ ] All existing command-sourced tests still pass.
+- [x] `decide` for a non-crossing limit submit returns `OrderAccepted` followed by `OrderRested`; no other event kind is emitted.
+- [x] `OrderAccepted` creates the ledger record but does not insert into the book; `OrderRested` inserts the order at its price level with FIFO priority.
+- [x] `apply` is the only state write entry and folds both events; applying either prefix leaves a valid engine state.
+- [x] Each `EventRecord` carries format version 2, a contiguous event sequence, and the same `command_id` for both events.
+- [x] The event-sourced durable façade appends both records before applying; a failed append applies nothing and fails the instance closed.
+- [x] Reopening from the in-memory event log alone reproduces the book, FIFO priority, ledger, trades, last price, counters, and last applied event sequence.
+- [x] `BookSnapshot.sequence` reports the last applied event sequence.
+- [x] Unsupported commands are not accepted by the event-sourced path with a clear failure; no command is silently dropped.
+- [x] The decision scratch/overlay is exercised by a benchmark baseline; a whole-engine clone is not on the path.
+- [x] All existing command-sourced tests still pass.
