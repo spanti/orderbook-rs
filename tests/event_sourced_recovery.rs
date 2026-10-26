@@ -11,9 +11,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use orderbook_rs::durable::{
-    DurableError, EVENT_FORMAT_VERSION, EventLog, EventRecord, EventSnapshot, EventSnapshotStore,
-    EventSourcedEngine, FileEventLog, FileEventSnapshotStore, InMemoryEventLog,
-    InMemoryEventSnapshotStore, LogHeader, StoredSnapshot,
+    DurableError, DurableMatchingEngine, EventLog, EventRecord, FORMAT_VERSION, FileEventLog,
+    FileSnapshotStore, InMemoryEventLog, InMemorySnapshotStore, LogHeader, SnapshotStore,
+    StoredSnapshot,
 };
 use orderbook_rs::engine::MatchingEngine;
 use orderbook_rs::event::DomainEvent;
@@ -30,7 +30,7 @@ const BTC: &str = "BTC-USDT";
 
 fn header(config: EngineConfig) -> LogHeader {
     LogHeader {
-        format_version: EVENT_FORMAT_VERSION,
+        format_version: FORMAT_VERSION,
         config,
     }
 }
@@ -87,13 +87,13 @@ fn resting_records(commands: u64) -> Vec<EventRecord> {
     for command in 1..=commands {
         let price = 100 - command;
         records.push(EventRecord {
-            format_version: EVENT_FORMAT_VERSION,
+            format_version: FORMAT_VERSION,
             sequence: command * 2 - 1,
             command_id: command,
             event: accepted(command, price),
         });
         records.push(EventRecord {
-            format_version: EVENT_FORMAT_VERSION,
+            format_version: FORMAT_VERSION,
             sequence: command * 2,
             command_id: command,
             event: rested(command, price),
@@ -104,9 +104,9 @@ fn resting_records(commands: u64) -> Vec<EventRecord> {
 
 fn fresh_engine(
     log: &InMemoryEventLog,
-    snapshots: &InMemoryEventSnapshotStore,
-) -> EventSourcedEngine {
-    EventSourcedEngine::create(
+    snapshots: &InMemorySnapshotStore,
+) -> DurableMatchingEngine {
+    DurableMatchingEngine::create(
         EngineConfig::default(),
         Box::new(log.handle()),
         Box::new(snapshots.handle()),
@@ -114,10 +114,10 @@ fn fresh_engine(
     .expect("a fresh event log accepts the v2 header")
 }
 
-fn fold_full_log(log: &InMemoryEventLog) -> EventSourcedEngine {
-    EventSourcedEngine::open(
+fn fold_full_log(log: &InMemoryEventLog) -> DurableMatchingEngine {
+    DurableMatchingEngine::open(
         Box::new(log.handle()),
-        Box::new(InMemoryEventSnapshotStore::new()),
+        Box::new(InMemorySnapshotStore::new()),
     )
     .expect("a contiguous log folds from empty")
 }
@@ -159,7 +159,7 @@ impl EventLog for FixedEventLog {
         self.records.first().map(|record| record.sequence)
     }
 
-    fn last_sequence(&self) -> Option<u64> {
+    fn last_stored_sequence(&self) -> Option<u64> {
         self.records.last().map(|record| record.sequence)
     }
 
@@ -215,8 +215,8 @@ impl EventLog for DuplicatingEventLog {
         self.inner.first_sequence()
     }
 
-    fn last_sequence(&self) -> Option<u64> {
-        self.inner.last_sequence()
+    fn last_stored_sequence(&self) -> Option<u64> {
+        self.inner.last_stored_sequence()
     }
 
     fn last_command_id(&self) -> Option<u64> {
@@ -266,8 +266,8 @@ impl EventLog for CountingEventLog {
         self.inner.first_sequence()
     }
 
-    fn last_sequence(&self) -> Option<u64> {
-        self.inner.last_sequence()
+    fn last_stored_sequence(&self) -> Option<u64> {
+        self.inner.last_stored_sequence()
     }
 
     fn last_command_id(&self) -> Option<u64> {
@@ -282,7 +282,7 @@ impl EventLog for CountingEventLog {
 #[test]
 fn snapshot_plus_event_tail_recovers_exactly_the_full_log_fold() {
     let log = InMemoryEventLog::new();
-    let snapshots = InMemoryEventSnapshotStore::new();
+    let snapshots = InMemorySnapshotStore::new();
 
     let expected = {
         let mut engine = fresh_engine(&log, &snapshots);
@@ -300,8 +300,9 @@ fn snapshot_plus_event_tail_recovers_exactly_the_full_log_fold() {
         "the snapshot stops at the command boundary before the crash"
     );
 
-    let reopened = EventSourcedEngine::open(Box::new(log.handle()), Box::new(snapshots.handle()))
-        .expect("snapshot plus contiguous tail recovers");
+    let reopened =
+        DurableMatchingEngine::open(Box::new(log.handle()), Box::new(snapshots.handle()))
+            .expect("snapshot plus contiguous tail recovers");
     assert_eq!(reopened.applied_seq(), 6);
     assert_eq!(reopened.engine().capture_snapshot(), expected);
 
@@ -321,10 +322,10 @@ fn recovery_reads_only_the_tail_after_the_snapshot_boundary() {
     let snapshot_dir = dir.path().join("snapshots");
 
     {
-        let mut engine = EventSourcedEngine::create(
+        let mut engine = DurableMatchingEngine::create(
             EngineConfig::default(),
             Box::new(FileEventLog::open(&log_path).unwrap()),
-            Box::new(FileEventSnapshotStore::open(&snapshot_dir).unwrap()),
+            Box::new(FileSnapshotStore::open(&snapshot_dir).unwrap()),
         )
         .unwrap();
         engine.execute(submit(99, 1)).unwrap();
@@ -336,9 +337,9 @@ fn recovery_reads_only_the_tail_after_the_snapshot_boundary() {
 
     let log = CountingEventLog::new(FileEventLog::open(&log_path).unwrap());
     let reads = log.reads.clone();
-    let reopened = EventSourcedEngine::open(
+    let reopened = DurableMatchingEngine::open(
         Box::new(log),
-        Box::new(FileEventSnapshotStore::open(&snapshot_dir).unwrap()),
+        Box::new(FileSnapshotStore::open(&snapshot_dir).unwrap()),
     )
     .expect("file event log plus file event snapshot recovers");
 
@@ -353,7 +354,7 @@ fn recovery_reads_only_the_tail_after_the_snapshot_boundary() {
 #[test]
 fn an_applied_but_not_snapshotted_tail_is_folded_after_recovery() {
     let log = InMemoryEventLog::new();
-    let snapshots = InMemoryEventSnapshotStore::new();
+    let snapshots = InMemorySnapshotStore::new();
 
     {
         let mut engine = fresh_engine(&log, &snapshots);
@@ -367,7 +368,7 @@ fn an_applied_but_not_snapshotted_tail_is_folded_after_recovery() {
     assert_eq!(latest.last_command_id, 1);
 
     let reopened =
-        EventSourcedEngine::open(Box::new(log.handle()), Box::new(snapshots.handle())).unwrap();
+        DurableMatchingEngine::open(Box::new(log.handle()), Box::new(snapshots.handle())).unwrap();
     assert_eq!(
         reopened.applied_seq(),
         4,
@@ -380,7 +381,7 @@ fn an_applied_but_not_snapshotted_tail_is_folded_after_recovery() {
 #[test]
 fn command_ids_continue_from_the_snapshot_when_the_log_tail_is_empty() {
     let log = InMemoryEventLog::new();
-    let snapshots = InMemoryEventSnapshotStore::new();
+    let snapshots = InMemorySnapshotStore::new();
 
     {
         let mut engine = fresh_engine(&log, &snapshots);
@@ -390,7 +391,7 @@ fn command_ids_continue_from_the_snapshot_when_the_log_tail_is_empty() {
     }
 
     let mut reopened =
-        EventSourcedEngine::open(Box::new(log.handle()), Box::new(snapshots.handle())).unwrap();
+        DurableMatchingEngine::open(Box::new(log.handle()), Box::new(snapshots.handle())).unwrap();
     assert_eq!(reopened.applied_seq(), 4);
     assert_eq!(reopened.cursor().next_command_id, 3);
 
@@ -416,7 +417,7 @@ fn command_ids_continue_from_the_maximum_of_snapshot_and_log_tail() {
     }
     writer
         .append(EventRecord {
-            format_version: EVENT_FORMAT_VERSION,
+            format_version: FORMAT_VERSION,
             sequence: 3,
             command_id: 7,
             event: accepted(2, 95),
@@ -424,7 +425,7 @@ fn command_ids_continue_from_the_maximum_of_snapshot_and_log_tail() {
         .unwrap();
     writer
         .append(EventRecord {
-            format_version: EVENT_FORMAT_VERSION,
+            format_version: FORMAT_VERSION,
             sequence: 4,
             command_id: 7,
             event: rested(2, 95),
@@ -437,14 +438,15 @@ fn command_ids_continue_from_the_maximum_of_snapshot_and_log_tail() {
     for record in resting_records(1) {
         reference.apply(&record.event, record.sequence);
     }
-    let store = store_with_snapshot(EventSnapshot {
-        format_version: EVENT_FORMAT_VERSION,
+    let store = store_with_snapshot(StoredSnapshot {
+        format_version: FORMAT_VERSION,
         applied_seq: 2,
         last_command_id: 1,
         snapshot: reference.capture_snapshot(),
     });
 
-    let mut reopened = EventSourcedEngine::open(Box::new(log.handle()), Box::new(store)).unwrap();
+    let mut reopened =
+        DurableMatchingEngine::open(Box::new(log.handle()), Box::new(store)).unwrap();
     assert_eq!(
         reopened.cursor().next_command_id,
         8,
@@ -463,7 +465,7 @@ fn command_ids_continue_from_the_maximum_of_snapshot_and_log_tail() {
 #[test]
 fn a_duplicate_record_at_or_below_the_applied_sequence_is_skipped() {
     let log = InMemoryEventLog::new();
-    let snapshots = InMemoryEventSnapshotStore::new();
+    let snapshots = InMemorySnapshotStore::new();
 
     {
         let mut engine = fresh_engine(&log, &snapshots);
@@ -474,7 +476,7 @@ fn a_duplicate_record_at_or_below_the_applied_sequence_is_skipped() {
     }
 
     let expected = fold_full_log(&log).engine().capture_snapshot();
-    let reopened = EventSourcedEngine::open(
+    let reopened = DurableMatchingEngine::open(
         Box::new(DuplicatingEventLog::new(log.handle())),
         Box::new(snapshots.handle()),
     )
@@ -490,8 +492,8 @@ fn a_gap_between_the_snapshot_and_the_log_aborts_recovery() {
     for record in &records[..2] {
         boundary.apply(&record.event, record.sequence);
     }
-    let store = store_with_snapshot(EventSnapshot {
-        format_version: EVENT_FORMAT_VERSION,
+    let store = store_with_snapshot(StoredSnapshot {
+        format_version: FORMAT_VERSION,
         applied_seq: 2,
         last_command_id: 1,
         snapshot: boundary.capture_snapshot(),
@@ -502,7 +504,7 @@ fn a_gap_between_the_snapshot_and_the_log_aborts_recovery() {
         records: records[3..].to_vec(),
     };
 
-    let error = match EventSourcedEngine::open(Box::new(log), Box::new(store)) {
+    let error = match DurableMatchingEngine::open(Box::new(log), Box::new(store)) {
         Ok(_) => panic!("recovery must refuse a gap after the snapshot"),
         Err(error) => error,
     };
@@ -523,13 +525,11 @@ fn a_log_that_starts_after_the_first_expected_sequence_refuses_recovery() {
         records: resting_records(2)[2..].to_vec(),
     };
 
-    let error = match EventSourcedEngine::open(
-        Box::new(log),
-        Box::new(InMemoryEventSnapshotStore::new()),
-    ) {
-        Ok(_) => panic!("recovery must refuse a log that starts too late"),
-        Err(error) => error,
-    };
+    let error =
+        match DurableMatchingEngine::open(Box::new(log), Box::new(InMemorySnapshotStore::new())) {
+            Ok(_) => panic!("recovery must refuse a log that starts too late"),
+            Err(error) => error,
+        };
     assert_eq!(
         error,
         DurableError::RecoveryGap {
@@ -549,13 +549,11 @@ fn a_non_contiguous_sequence_in_the_tail_aborts_recovery() {
         records: tail,
     };
 
-    let error = match EventSourcedEngine::open(
-        Box::new(log),
-        Box::new(InMemoryEventSnapshotStore::new()),
-    ) {
-        Ok(_) => panic!("recovery must refuse a gap inside the tail"),
-        Err(error) => error,
-    };
+    let error =
+        match DurableMatchingEngine::open(Box::new(log), Box::new(InMemorySnapshotStore::new())) {
+            Ok(_) => panic!("recovery must refuse a gap inside the tail"),
+            Err(error) => error,
+        };
     assert_eq!(
         error,
         DurableError::NonContiguousSequence {
@@ -569,15 +567,15 @@ fn a_non_contiguous_sequence_in_the_tail_aborts_recovery() {
 // Snapshot validation: ahead, version, config
 // ---------------------------------------------------------------------------
 
-fn store_with_snapshot(snapshot: EventSnapshot) -> InMemoryEventSnapshotStore {
-    let mut store = InMemoryEventSnapshotStore::new();
+fn store_with_snapshot(snapshot: StoredSnapshot) -> InMemorySnapshotStore {
+    let mut store = InMemorySnapshotStore::new();
     store.save(snapshot).unwrap();
     store
 }
 
-fn empty_snapshot_at(applied_seq: u64, last_command_id: u64) -> EventSnapshot {
-    EventSnapshot {
-        format_version: EVENT_FORMAT_VERSION,
+fn empty_snapshot_at(applied_seq: u64, last_command_id: u64) -> StoredSnapshot {
+    StoredSnapshot {
+        format_version: FORMAT_VERSION,
         applied_seq,
         last_command_id,
         snapshot: MatchingEngine::new(EngineConfig::default()).capture_snapshot(),
@@ -592,7 +590,7 @@ fn a_snapshot_ahead_of_the_log_is_refused() {
     };
     let store = store_with_snapshot(empty_snapshot_at(6, 2));
 
-    let error = match EventSourcedEngine::open(Box::new(log), Box::new(store)) {
+    let error = match DurableMatchingEngine::open(Box::new(log), Box::new(store)) {
         Ok(_) => panic!("recovery must refuse a snapshot ahead of the log"),
         Err(error) => error,
     };
@@ -616,13 +614,13 @@ fn an_unsupported_snapshot_version_is_refused() {
     let store = store_with_snapshot(snapshot);
 
     assert_eq!(
-        match EventSourcedEngine::open(Box::new(log), Box::new(store)) {
+        match DurableMatchingEngine::open(Box::new(log), Box::new(store)) {
             Ok(_) => panic!("recovery must refuse a v1 snapshot"),
             Err(error) => error,
         },
         DurableError::UnsupportedVersion {
             found: 1,
-            supported: EVENT_FORMAT_VERSION,
+            supported: FORMAT_VERSION,
         }
     );
 }
@@ -643,7 +641,7 @@ fn a_snapshot_with_a_different_config_is_refused() {
     let store = store_with_snapshot(snapshot);
 
     assert_eq!(
-        match EventSourcedEngine::open(Box::new(log), Box::new(store)) {
+        match DurableMatchingEngine::open(Box::new(log), Box::new(store)) {
             Ok(_) => panic!("recovery must refuse a config mismatch"),
             Err(error) => error,
         },
@@ -676,10 +674,10 @@ fn a_v1_file_snapshot_is_refused_by_recovery() {
     let log_path = dir.path().join("events.log");
     let snapshot_dir = dir.path().join("snapshots");
     {
-        let mut engine = EventSourcedEngine::create(
+        let mut engine = DurableMatchingEngine::create(
             EngineConfig::default(),
             Box::new(FileEventLog::open(&log_path).unwrap()),
-            Box::new(FileEventSnapshotStore::open(&snapshot_dir).unwrap()),
+            Box::new(FileSnapshotStore::open(&snapshot_dir).unwrap()),
         )
         .unwrap();
         engine.execute(submit(99, 1)).unwrap();
@@ -690,20 +688,21 @@ fn a_v1_file_snapshot_is_refused_by_recovery() {
     let v1 = StoredSnapshot {
         format_version: 1,
         applied_seq: 2,
+        last_command_id: 0,
         snapshot: MatchingEngine::new(EngineConfig::default()).capture_snapshot(),
     };
     write_snapshot_line(&snapshot_file(&snapshot_dir, 2), &v1);
 
-    let error = EventSourcedEngine::open(
+    let error = DurableMatchingEngine::open(
         Box::new(FileEventLog::open(&log_path).unwrap()),
-        Box::new(FileEventSnapshotStore::open(&snapshot_dir).unwrap()),
+        Box::new(FileSnapshotStore::open(&snapshot_dir).unwrap()),
     )
     .unwrap_err();
     assert_eq!(
         error,
         DurableError::UnsupportedVersion {
             found: 1,
-            supported: EVENT_FORMAT_VERSION,
+            supported: FORMAT_VERSION,
         }
     );
 }
@@ -715,10 +714,10 @@ fn recovery_falls_back_to_the_previous_snapshot_when_the_newest_is_corrupt() {
     let snapshot_dir = dir.path().join("snapshots");
 
     let expected = {
-        let mut engine = EventSourcedEngine::create(
+        let mut engine = DurableMatchingEngine::create(
             EngineConfig::default(),
             Box::new(FileEventLog::open(&log_path).unwrap()),
-            Box::new(FileEventSnapshotStore::open(&snapshot_dir).unwrap()),
+            Box::new(FileSnapshotStore::open(&snapshot_dir).unwrap()),
         )
         .unwrap();
         engine.execute(submit(99, 1)).unwrap();
@@ -737,9 +736,9 @@ fn recovery_falls_back_to_the_previous_snapshot_when_the_newest_is_corrupt() {
     bytes[index] ^= 0xff;
     fs::write(&newest, bytes).unwrap();
 
-    let reopened = EventSourcedEngine::open(
+    let reopened = DurableMatchingEngine::open(
         Box::new(FileEventLog::open(&log_path).unwrap()),
-        Box::new(FileEventSnapshotStore::open(&snapshot_dir).unwrap()),
+        Box::new(FileSnapshotStore::open(&snapshot_dir).unwrap()),
     )
     .expect("the previous complete snapshot is used");
     assert_eq!(reopened.applied_seq(), 6);

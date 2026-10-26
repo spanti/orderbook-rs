@@ -187,7 +187,7 @@ impl<W: Waker> JournalThread<W> {
     /// Append one coalesced group. Returns `false` when the log failed and the
     /// journal must exit.
     fn append(&mut self, records: Vec<EventRecord>) -> bool {
-        let Some(last_sequence) = records.last().map(|record| record.sequence) else {
+        let Some(last_durable_sequence) = records.last().map(|record| record.sequence) else {
             // An empty handoff advances nothing; keep waiting for real work.
             return true;
         };
@@ -203,7 +203,7 @@ impl<W: Waker> JournalThread<W> {
                 // The batch is durable now; only now may anyone observe it.
                 // The publisher is woken after the watermark advance; it
                 // re-reads the log up to that watermark.
-                self.shared.publish_durable(last_sequence);
+                self.shared.publish_durable(last_durable_sequence);
                 self.shared.notify_publisher();
                 self.waker.wake();
                 true
@@ -272,7 +272,7 @@ pub(crate) fn spawn<W: Waker>(
 mod tests {
     use super::*;
     use crate::durable::{
-        DurableError, EVENT_FORMAT_VERSION, EventCursor, EventLog, EventRecord, LogHeader,
+        DurableError, EventCursor, EventLog, EventRecord, FORMAT_VERSION, LogHeader,
     };
     use crate::engine::MatchingEngine;
     use crate::runtime::RuntimeError;
@@ -319,7 +319,7 @@ mod tests {
 
     fn record(sequence: u64) -> EventRecord {
         EventRecord {
-            format_version: EVENT_FORMAT_VERSION,
+            format_version: FORMAT_VERSION,
             sequence,
             command_id: sequence,
             event: crate::event::DomainEvent::OrderRejected {
@@ -474,7 +474,7 @@ mod tests {
                 .map(|record| record.sequence)
         }
 
-        fn last_sequence(&self) -> Option<u64> {
+        fn last_stored_sequence(&self) -> Option<u64> {
             lock(&self.inner)
                 .records
                 .last()

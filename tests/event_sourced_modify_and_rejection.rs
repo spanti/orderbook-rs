@@ -2,14 +2,12 @@
 //!
 //! These tests exercise the event-sourced path only through public seams: the
 //! pure `decide`, the sole state-write entry `apply`, and the append-before-
-//! apply `EventSourcedEngine`. Expected event streams are literals from the
+//! apply `DurableMatchingEngine`. Expected event streams are literals from the
 //! ticket and the event catalog, never recomputed by the code under test.
 
 use std::collections::HashMap;
 
-use orderbook_rs::durable::{
-    EventSourcedEngine, InMemoryEventLog, InMemoryEventSnapshotStore,
-};
+use orderbook_rs::durable::{DurableMatchingEngine, InMemoryEventLog, InMemorySnapshotStore};
 use orderbook_rs::engine::MatchingEngine;
 use orderbook_rs::event::{DomainEvent, OrderCancelReason};
 use orderbook_rs::snapshot::EngineSnapshot;
@@ -90,11 +88,7 @@ fn accepted(symbol: &str, order_id: OrderBookId, request: &OrderRequest) -> Doma
     }
 }
 
-fn canceled_modified(
-    symbol: &str,
-    order_id: OrderBookId,
-    canceled_quantity: u64,
-) -> DomainEvent {
+fn canceled_modified(symbol: &str, order_id: OrderBookId, canceled_quantity: u64) -> DomainEvent {
     DomainEvent::OrderCanceled {
         symbol: symbol.to_string(),
         order_id,
@@ -152,7 +146,7 @@ fn run(engine: &mut MatchingEngine, command: &EngineCommand) -> Vec<DomainEvent>
     events
 }
 
-/// Seed a resting order through the event-sourced path, not the old path.
+/// Seed a resting order through the pure decide/apply path.
 fn rest(engine: &mut MatchingEngine, symbol: &str, request: OrderRequest) -> OrderBookId {
     let events = run(engine, &submit(symbol, request));
     match events.first() {
@@ -251,7 +245,11 @@ fn a_rejected_submit_emits_one_order_rejected_with_the_full_command() {
         vec![rejected(&command, EngineError::QuantityOutOfRange)],
         "a business rejection is an event, not an Err"
     );
-    assert_eq!(engine.order_count(), 0, "rejection creates no ledger record");
+    assert_eq!(
+        engine.order_count(),
+        0,
+        "rejection creates no ledger record"
+    );
     assert!(engine.book(BTC).is_none(), "rejection creates no book");
 
     // A rejection consumes no order id: the next accepted order is id 1.
@@ -318,24 +316,12 @@ fn a_rejected_modify_emits_one_order_rejected_for_every_business_reason() {
 
     for (command, reason) in [
         // Validation runs before any order lookup.
-        (
-            modify(BTC, id, 101, 5, 2),
-            EngineError::PriceNotOnTick,
-        ),
-        (
-            modify(BTC, id, 100, 11, 2),
-            EngineError::QuantityOutOfRange,
-        ),
+        (modify(BTC, id, 101, 5, 2), EngineError::PriceNotOnTick),
+        (modify(BTC, id, 100, 11, 2), EngineError::QuantityOutOfRange),
         // Unknown order.
-        (
-            modify(BTC, 99, 100, 5, 2),
-            EngineError::UnknownOrder,
-        ),
+        (modify(BTC, 99, 100, 5, 2), EngineError::UnknownOrder),
         // Wrong symbol.
-        (
-            modify(ETH, id, 100, 5, 2),
-            EngineError::UnknownOrder,
-        ),
+        (modify(ETH, id, 100, 5, 2), EngineError::UnknownOrder),
     ] {
         assert_eq!(
             engine.decide(&command),
@@ -379,10 +365,10 @@ fn a_rejected_modify_emits_one_order_rejected_for_every_business_reason() {
 #[test]
 fn rejected_commands_consume_a_sequence_and_command_id_but_replay_as_a_no_op() {
     let log = InMemoryEventLog::new();
-    let mut engine = EventSourcedEngine::create(
+    let mut engine = DurableMatchingEngine::create(
         EngineConfig::default(),
         Box::new(log.handle()),
-        Box::new(InMemoryEventSnapshotStore::new()),
+        Box::new(InMemorySnapshotStore::new()),
     )
     .expect("fresh event log");
 
@@ -403,16 +389,18 @@ fn rejected_commands_consume_a_sequence_and_command_id_but_replay_as_a_no_op() {
         .execute(submit(BTC, limit(Side::Bid, 98, 1, 2)))
         .unwrap();
     match events.first() {
-        Some(DomainEvent::OrderAccepted { order, .. }) => assert_eq!(
-            order.id, 2,
-            "the rejection allocated no order id"
-        ),
+        Some(DomainEvent::OrderAccepted { order, .. }) => {
+            assert_eq!(order.id, 2, "the rejection allocated no order id")
+        }
         other => panic!("expected OrderAccepted, got {other:?}"),
     }
 
     let history = engine.history_from(1).unwrap();
     assert_eq!(
-        history.iter().map(|record| record.sequence).collect::<Vec<_>>(),
+        history
+            .iter()
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>(),
         vec![1, 2, 3, 4, 5]
     );
     assert_eq!(
@@ -429,9 +417,9 @@ fn rejected_commands_consume_a_sequence_and_command_id_but_replay_as_a_no_op() {
 
     let before_replay = engine.engine().capture_snapshot();
     let applied = engine.applied_seq();
-    let reopened = EventSourcedEngine::open(
+    let reopened = DurableMatchingEngine::open(
         Box::new(log.handle()),
-        Box::new(InMemoryEventSnapshotStore::new()),
+        Box::new(InMemorySnapshotStore::new()),
     )
     .expect("replay");
     assert_eq!(
@@ -508,8 +496,14 @@ fn a_modify_that_crosses_emits_cancel_accept_and_the_trade() {
     apply_all(&mut engine, &events);
 
     assert_eq!(engine.trades().len(), 1);
-    assert_eq!(engine.order_record(maker).unwrap().status, OrderStatus::Filled);
-    assert_eq!(engine.order_record(old).unwrap().status, OrderStatus::Canceled);
+    assert_eq!(
+        engine.order_record(maker).unwrap().status,
+        OrderStatus::Filled
+    );
+    assert_eq!(
+        engine.order_record(old).unwrap().status,
+        OrderStatus::Canceled
+    );
     assert_eq!(engine.order_record(3).unwrap().status, OrderStatus::Filled);
     assert!(engine.book(BTC).unwrap().best_bid().is_none());
     assert!(engine.book(BTC).unwrap().best_ask().is_none());
@@ -639,13 +633,16 @@ fn a_modify_runs_the_stop_cascade_after_the_replacement_submit() {
     apply_all(&mut engine, &events);
 
     assert!(engine.stop_order(stop).is_none(), "the stop triggered");
-    assert_eq!(engine.order_record(stop).unwrap().status, OrderStatus::Filled);
+    assert_eq!(
+        engine.order_record(stop).unwrap().status,
+        OrderStatus::Filled
+    );
     assert_eq!(engine.snapshot(BTC, 10).unwrap().bids, vec![(95, 3)]);
     assert_eq!(engine.last_trade_price(BTC), Some(95));
 }
 
 // --------------------------------------------------------------------------
-// Replay equality, prefix validity, and live-versus-command-sourced equality
+// Replay equality, prefix validity, and decide/apply versus execute equality
 // --------------------------------------------------------------------------
 
 fn modify_and_rejection_commands() -> Vec<EngineCommand> {
@@ -693,37 +690,36 @@ fn every_prefix_is_valid_and_replay_equals_live_execution() {
         live_events.extend(events);
     }
 
-    // The live event-sourced state matches the old command path's state.
-    let mut old = MatchingEngine::new(EngineConfig::default());
+    // The execute convenience must match the explicit decide/apply fold.
+    let mut convenience = MatchingEngine::new(EngineConfig::default());
     for command in &commands {
-        let _ = old.execute(command.clone());
+        let _ = convenience.execute(command.clone());
     }
     let live_snapshot = live.capture_snapshot();
-    let old_snapshot = old.capture_snapshot();
-    assert_eq!(live_snapshot.books, old_snapshot.books);
-    assert_eq!(live_snapshot.ledger, old_snapshot.ledger);
-    assert_eq!(live_snapshot.stops, old_snapshot.stops);
-    assert_eq!(live_snapshot.trades, old_snapshot.trades);
-    assert_eq!(live_snapshot.last_trades, old_snapshot.last_trades);
-    assert_eq!(live_snapshot.next_order_id, old_snapshot.next_order_id);
-    assert_eq!(live_snapshot.next_trade_id, old_snapshot.next_trade_id);
+    assert_eq!(
+        live_snapshot,
+        convenience.capture_snapshot(),
+        "decide/apply and the execute convenience must reach the same state"
+    );
 
     // Replay the same events from an empty engine through the durable seam.
     let log = InMemoryEventLog::new();
     {
-        let mut durable = EventSourcedEngine::create(
+        let mut durable = DurableMatchingEngine::create(
             EngineConfig::default(),
             Box::new(log.handle()),
-            Box::new(InMemoryEventSnapshotStore::new()),
+            Box::new(InMemorySnapshotStore::new()),
         )
         .expect("fresh event log");
         for command in &commands {
-            durable.execute(command.clone()).expect("event-producing execute");
+            durable
+                .execute(command.clone())
+                .expect("event-producing execute");
         }
     }
-    let reopened = EventSourcedEngine::open(
+    let reopened = DurableMatchingEngine::open(
         Box::new(log.handle()),
-        Box::new(InMemoryEventSnapshotStore::new()),
+        Box::new(InMemorySnapshotStore::new()),
     )
     .expect("replay");
 
@@ -747,20 +743,24 @@ fn every_prefix_is_valid_and_replay_equals_live_execution() {
             command_ids.push(record.command_id);
         }
     }
-    assert_eq!(
-        command_ids,
-        (1..=commands.len() as u64).collect::<Vec<_>>()
-    );
+    assert_eq!(command_ids, (1..=commands.len() as u64).collect::<Vec<_>>());
 
     // All four command variants have an event stream; rejections are journaled.
+    assert!(
+        history_events
+            .iter()
+            .any(|event| matches!(event, DomainEvent::OrderRejected { .. }))
+    );
     assert!(history_events.iter().any(|event| matches!(
         event,
-        DomainEvent::OrderRejected { .. }
+        DomainEvent::OrderCanceled {
+            reason: OrderCancelReason::Modified,
+            ..
+        }
     )));
-    assert!(history_events
-        .iter()
-        .any(|event| matches!(event, DomainEvent::OrderCanceled { reason: OrderCancelReason::Modified, .. })));
-    assert!(history_events
-        .iter()
-        .any(|event| matches!(event, DomainEvent::StopPlaced { .. })));
+    assert!(
+        history_events
+            .iter()
+            .any(|event| matches!(event, DomainEvent::StopPlaced { .. }))
+    );
 }

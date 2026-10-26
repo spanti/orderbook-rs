@@ -1,15 +1,18 @@
 //! Turn an engine's complete decision state into a deterministic snapshot and
-//! rebuild an equivalent engine from it, asserted only through the public
-//! `EngineSnapshot` and `MatchingEngine` surfaces.
+//! rebuild an equivalent engine from it, asserted through the public
+//! `EngineSnapshot`, `DomainEvent` and `MatchingEngine` surfaces.
+//!
+//! The snapshot is a derived cache: it stores state, not events, and the
+//! durable layer owns the event-sequence boundary in `StoredSnapshot`.
 
 use std::collections::BTreeMap;
 
 use orderbook_rs::engine::MatchingEngine;
+use orderbook_rs::event::DomainEvent;
 use orderbook_rs::snapshot::{BookState, EngineSnapshot, PriceLevelState};
 use orderbook_rs::types::{
-    CommandOutcome, EngineCommand, EngineConfig, EngineError, ExecutionReport, ModifyRequest,
-    OrderBookId, OrderRecord, OrderRequest, OrderStatus, OrderType, Side, StopKind, StopOrder,
-    StopOrderRequest, TimeInForce, Trade,
+    EngineCommand, EngineConfig, OrderBookId, OrderRecord, OrderRequest, OrderStatus, OrderType,
+    Side, StopKind, StopOrder, StopOrderRequest, TimeInForce,
 };
 
 const BTC: &str = "BTC-USDT";
@@ -37,7 +40,7 @@ fn stop(side: Side, stop_price: u64, quantity: u64, timestamp: u64) -> StopOrder
     }
 }
 
-fn submit(engine: &mut MatchingEngine, symbol: &str, request: OrderRequest) -> CommandOutcome {
+fn submit(engine: &mut MatchingEngine, symbol: &str, request: OrderRequest) -> Vec<DomainEvent> {
     engine.execute(EngineCommand::SubmitOrder {
         symbol: symbol.to_string(),
         request,
@@ -48,25 +51,35 @@ fn submit_stop(
     engine: &mut MatchingEngine,
     symbol: &str,
     request: StopOrderRequest,
-) -> CommandOutcome {
+) -> Vec<DomainEvent> {
     engine.execute(EngineCommand::SubmitStopOrder {
         symbol: symbol.to_string(),
         request,
     })
 }
 
-fn cancel(engine: &mut MatchingEngine, symbol: &str, order_id: OrderBookId) -> CommandOutcome {
+fn cancel(engine: &mut MatchingEngine, symbol: &str, order_id: OrderBookId) -> Vec<DomainEvent> {
     engine.execute(EngineCommand::CancelOrder {
         symbol: symbol.to_string(),
         order_id,
     })
 }
 
-fn accepted(outcome: CommandOutcome) -> ExecutionReport {
-    match outcome {
-        CommandOutcome::Accepted(report) => report,
-        other => panic!("expected an accepted outcome, got {other:?}"),
+fn accepted_order(events: &[DomainEvent]) -> &orderbook_rs::types::Order {
+    match events.first() {
+        Some(DomainEvent::OrderAccepted { order, .. }) => order,
+        other => panic!("expected OrderAccepted, got {other:?}"),
     }
+}
+
+fn trade_makers(events: &[DomainEvent]) -> Vec<OrderBookId> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            DomainEvent::TradeExecuted { trade } => Some(trade.maker_order_id),
+            _ => None,
+        })
+        .collect()
 }
 
 fn book_state<'a>(snapshot: &'a EngineSnapshot, symbol: &str) -> &'a BookState {
@@ -96,10 +109,6 @@ fn ledger_map(snapshot: &EngineSnapshot) -> BTreeMap<OrderBookId, &OrderRecord> 
         .collect()
 }
 
-fn trade_makers(trades: &[Trade]) -> Vec<OrderBookId> {
-    trades.iter().map(|trade| trade.maker_order_id).collect()
-}
-
 /// Two symbols, two orders sharing a price level (FIFO), one partial maker
 /// fill, one filled taker and a resting bid.
 fn two_symbol_scenario() -> MatchingEngine {
@@ -125,11 +134,6 @@ fn round_trip_preserves_multi_symbol_books_fifo_priority_and_partial_fills() {
 
     assert_eq!(snapshot.next_order_id, 7);
     assert_eq!(snapshot.next_trade_id, 3);
-    assert_eq!(
-        snapshot.next_event_sequence,
-        engine.last_sequence() + 1,
-        "the next event sequence continues the original stream"
-    );
 
     // Books are sorted by symbol; both symbols exist.
     assert_eq!(snapshot.books.len(), 2);
@@ -172,8 +176,16 @@ fn round_trip_preserves_multi_symbol_books_fifo_priority_and_partial_fills() {
     assert_eq!(restored.trades(), engine.trades());
     assert_eq!(restored.last_trade_price(BTC), Some(100));
     assert_eq!(restored.last_trade_price(ETH), Some(2000));
-    assert_eq!(restored.snapshot(BTC, 10), engine.snapshot(BTC, 10));
-    assert_eq!(restored.snapshot(ETH, 10), engine.snapshot(ETH, 10));
+    // The snapshot does not store the event boundary; only the aggregate book
+    // view is part of engine state.
+    let restored_btc = restored.snapshot(BTC, 10).unwrap();
+    let original_btc = engine.snapshot(BTC, 10).unwrap();
+    assert_eq!(restored_btc.bids, original_btc.bids);
+    assert_eq!(restored_btc.asks, original_btc.asks);
+    assert_eq!(
+        restored.snapshot(ETH, 10).map(|s| (s.bids, s.asks)),
+        engine.snapshot(ETH, 10).map(|s| (s.bids, s.asks))
+    );
 }
 
 #[test]
@@ -186,14 +198,13 @@ fn restored_fifo_priority_drives_the_next_match() {
         symbol: BTC.to_string(),
         request: limit(7, Side::Bid, 100, 2),
     };
-    let original_outcome = original.execute(command.clone());
-    let restored_outcome = restored.execute(command);
+    let original_events = original.execute(command.clone());
+    let restored_events = restored.execute(command);
 
-    assert_eq!(original_outcome, restored_outcome);
-    let report = accepted(restored_outcome);
+    assert_eq!(original_events, restored_events);
     // The partially filled id 1 is still first in line, then id 2.
     assert_eq!(
-        trade_makers(&report.fills),
+        trade_makers(&restored_events),
         vec![1, 2],
         "restored FIFO priority must match the original"
     );
@@ -213,7 +224,6 @@ fn restored_engine_makes_the_same_decisions_for_subsequent_commands() {
 
     let snapshot = original.capture_snapshot();
     let mut restored = MatchingEngine::restore_snapshot(snapshot);
-    let original_event_len = original.events().len();
 
     let commands = vec![
         EngineCommand::SubmitOrder {
@@ -235,7 +245,7 @@ fn restored_engine_makes_the_same_decisions_for_subsequent_commands() {
         EngineCommand::ModifyOrder {
             symbol: BTC.to_string(),
             order_id: 2,
-            request: ModifyRequest {
+            request: orderbook_rs::types::ModifyRequest {
                 price: 110,
                 quantity: 5,
                 timestamp: 11,
@@ -249,7 +259,7 @@ fn restored_engine_makes_the_same_decisions_for_subsequent_commands() {
             symbol: ETH.to_string(),
             request: limit(13, Side::Ask, 2000, 1),
         },
-        // A rejected command must consume the same event sequence in both.
+        // A rejected command must consume the same events in both.
         EngineCommand::SubmitOrder {
             symbol: BTC.to_string(),
             request: limit(14, Side::Bid, 100, 0),
@@ -261,17 +271,14 @@ fn restored_engine_makes_the_same_decisions_for_subsequent_commands() {
     ];
 
     for command in commands {
-        let original_outcome = original.execute(command.clone());
-        let restored_outcome = restored.execute(command);
-        assert_eq!(original_outcome, restored_outcome);
+        let original_events = original.execute(command.clone());
+        let restored_events = restored.execute(command);
+        assert_eq!(
+            restored_events, original_events,
+            "both engines must derive the same events"
+        );
     }
 
-    assert_eq!(
-        restored.events(),
-        &original.events()[original_event_len..],
-        "the restored engine re-derives exactly the same events"
-    );
-    assert_eq!(restored.last_sequence(), original.last_sequence());
     assert_eq!(restored.capture_snapshot(), original.capture_snapshot());
 }
 
@@ -284,7 +291,10 @@ fn ledger_round_trips_filled_canceled_and_open_records() {
     submit(&mut engine, BTC, limit(4, Side::Ask, 101, 4)); // still open
 
     let canceled = cancel(&mut engine, BTC, 3);
-    assert!(matches!(canceled, CommandOutcome::Canceled(_)));
+    assert!(matches!(
+        canceled.last(),
+        Some(DomainEvent::OrderCanceled { .. })
+    ));
 
     let snapshot = engine.capture_snapshot();
     let records = ledger_map(&snapshot);
@@ -401,7 +411,6 @@ fn empty_engine_round_trips() {
             config: EngineConfig::default(),
             next_order_id: 1,
             next_trade_id: 1,
-            next_event_sequence: 1,
             books: Vec::new(),
             ledger: Vec::new(),
             stops: Vec::new(),
@@ -409,12 +418,10 @@ fn empty_engine_round_trips() {
             trades: Vec::new(),
         }
     );
-    assert_eq!(engine.last_sequence(), 0);
+    assert_eq!(engine.last_applied_sequence(), 0);
 
     let restored = MatchingEngine::restore_snapshot(snapshot.clone());
     assert_eq!(restored.capture_snapshot(), snapshot);
-    assert!(restored.events().is_empty());
-    assert_eq!(restored.last_sequence(), 0);
 }
 
 #[test]
@@ -436,7 +443,10 @@ fn empty_books_are_preserved() {
     let restored = MatchingEngine::restore_snapshot(snapshot.clone());
     assert!(restored.book(BTC).is_some());
     assert_eq!(restored.book(BTC).unwrap().depth(Side::Bid, 0), None);
-    assert_eq!(restored.snapshot(BTC, 10), engine.snapshot(BTC, 10));
+    let restored_snapshot = restored.snapshot(BTC, 10).unwrap();
+    let original_snapshot = engine.snapshot(BTC, 10).unwrap();
+    assert_eq!(restored_snapshot.bids, original_snapshot.bids);
+    assert_eq!(restored_snapshot.asks, original_snapshot.asks);
     assert_eq!(restored.capture_snapshot(), snapshot);
 }
 
@@ -463,7 +473,7 @@ fn equal_state_serializes_to_identical_bytes() {
     assert_eq!(
         serde_json::to_string(&second.capture_snapshot()).unwrap(),
         serde_json::to_string(&snapshot).unwrap(),
-        "the same command stream must produce identical snapshot bytes"
+        "the same event stream must produce identical snapshot bytes"
     );
 
     // Restore the same logical state through a snapshot whose collections are
@@ -567,17 +577,20 @@ fn restore_rebuilds_price_level_totals_and_lookup_without_matching() {
 
     // Canceling a restored order proves the lookup index was rebuilt.
     let canceled = cancel(&mut restored, BTC, 2);
-    match canceled {
-        CommandOutcome::Canceled(report) => assert_eq!(report.remaining_quantity, 1),
-        other => panic!("expected a canceled outcome, got {other:?}"),
-    }
+    assert!(matches!(
+        canceled.as_slice(),
+        [DomainEvent::OrderCanceled {
+            canceled_quantity: 1,
+            ..
+        }]
+    ));
     assert_eq!(restored.book(BTC).unwrap().depth(Side::Ask, 0), None);
 
     // Matching still works against the rebuilt book.
-    let report = accepted(submit(&mut restored, BTC, limit(20, Side::Ask, 99, 3)));
-    assert_eq!(report.remaining_quantity, 0);
-    assert_eq!(trade_makers(&report.fills), vec![4]);
-    assert_eq!(report.fills[0].quantity, 3);
+    let events = submit(&mut restored, BTC, limit(20, Side::Ask, 99, 3));
+    let new_id = accepted_order(&events).id;
+    assert_eq!(restored.order_record(new_id).unwrap().remaining_quantity, 0);
+    assert_eq!(trade_makers(&events), vec![4]);
     assert_eq!(
         restored.book(BTC).unwrap().depth(Side::Bid, 0),
         Some((99, 2))
@@ -585,32 +598,30 @@ fn restore_rebuilds_price_level_totals_and_lookup_without_matching() {
 }
 
 #[test]
-fn events_are_absent_and_the_event_sequence_continues_after_restore() {
+fn restored_counters_continue_without_collisions() {
     let mut engine = MatchingEngine::new(EngineConfig::default());
-    submit(&mut engine, BTC, limit(1, Side::Ask, 100, 2)); // accepted: seq 1
-    submit(&mut engine, BTC, limit(2, Side::Bid, 100, 2)); // accepted + trade: seq 2, 3
-    let rejected = submit(&mut engine, BTC, limit(3, Side::Bid, 100, 0)); // rejected: seq 4
-    assert_eq!(
-        rejected,
-        CommandOutcome::Rejected(EngineError::QuantityOutOfRange)
-    );
-    assert_eq!(engine.events().len(), 4);
-    assert_eq!(engine.last_sequence(), 4);
+    submit(&mut engine, BTC, limit(1, Side::Ask, 100, 2));
+    submit(&mut engine, BTC, limit(2, Side::Bid, 100, 2));
+    let rejected = engine.execute(EngineCommand::SubmitOrder {
+        symbol: BTC.to_string(),
+        request: limit(3, Side::Bid, 100, 0),
+    });
+    assert!(matches!(
+        rejected.as_slice(),
+        [DomainEvent::OrderRejected { .. }]
+    ));
+    assert_eq!(engine.last_applied_sequence(), 5);
 
     let snapshot = engine.capture_snapshot();
-    assert_eq!(snapshot.next_event_sequence, 5);
-
     let mut restored = MatchingEngine::restore_snapshot(snapshot.clone());
-    assert!(
-        restored.events().is_empty(),
-        "events are derived outputs and are not part of a snapshot"
-    );
-    assert_eq!(restored.last_sequence(), 4);
 
-    let report = accepted(submit(&mut restored, BTC, limit(5, Side::Ask, 101, 1)));
-    assert_eq!(report.order_id, 3, "order ids continue without collision");
-    assert_eq!(restored.events().len(), 1);
-    assert_eq!(restored.events()[0].sequence_id(), 5);
-    assert_eq!(restored.last_sequence(), 5);
-    assert_eq!(restored.capture_snapshot().next_event_sequence, 6);
+    let events = submit(&mut restored, BTC, limit(5, Side::Ask, 101, 1));
+    assert_eq!(
+        accepted_order(&events).id,
+        3,
+        "order ids continue without collision"
+    );
+    assert_eq!(events.len(), 2);
+    assert_eq!(restored.last_applied_sequence(), 2);
+    assert_eq!(restored.capture_snapshot().next_order_id, 4);
 }

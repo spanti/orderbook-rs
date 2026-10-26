@@ -25,7 +25,7 @@
 //!   [`MessageBus`](crate::bus::MessageBus). It starts at the recovered
 //!   durability watermark and never replays history.
 //! - **Snapshot worker**: owns the
-//!   [`EventSnapshotStore`](crate::durable::EventSnapshotStore) and saves
+//!   [`SnapshotStore`](crate::durable::SnapshotStore) and saves
 //!   snapshots off the matching thread.
 //! - **Producers**: own only [`EngineHandle`] clones. They never touch engine
 //!   state.
@@ -39,7 +39,7 @@
 //!             --> journal thread --append_batch + fsync--> durability watermark
 //!                 --> matching thread --Durable Acknowledgement
 //!                 --> Event Publisher --read_from(watermark)--> MessageBus subscribers
-//!         matching thread --EventSnapshot--> snapshot sync_channel(1)
+//!         matching thread --StoredSnapshot--> snapshot sync_channel(1)
 //!             --> snapshot worker --save--> SnapshotStore
 //! ```
 //!

@@ -6,8 +6,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use orderbook_rs::durable::{
-    DurableError, EventLog, EventRecord, EventSnapshot, EventSnapshotStore, EventSourcedEngine,
-    InMemoryEventLog, InMemoryEventSnapshotStore, LogHeader,
+    DurableError, DurableMatchingEngine, EventLog, EventRecord, InMemoryEventLog,
+    InMemorySnapshotStore, LogHeader, SnapshotStore, StoredSnapshot,
 };
 use orderbook_rs::engine::MatchingEngine;
 use orderbook_rs::event::{DomainEvent, OrderCancelReason};
@@ -141,8 +141,8 @@ impl EventLog for BlockingLog {
         self.inner.first_sequence()
     }
 
-    fn last_sequence(&self) -> Option<u64> {
-        self.inner.last_sequence()
+    fn last_stored_sequence(&self) -> Option<u64> {
+        self.inner.last_stored_sequence()
     }
 
     fn last_command_id(&self) -> Option<u64> {
@@ -151,8 +151,8 @@ impl EventLog for BlockingLog {
 }
 
 /// An event snapshot store handle for tests that do not inspect snapshots.
-fn unused_snapshots() -> Box<dyn EventSnapshotStore> {
-    Box::new(InMemoryEventSnapshotStore::new())
+fn unused_snapshots() -> Box<dyn SnapshotStore> {
+    Box::new(InMemorySnapshotStore::new())
 }
 
 /// An event log that panics on the first append, simulating a journal worker
@@ -185,7 +185,7 @@ impl EventLog for PanickingLog {
         None
     }
 
-    fn last_sequence(&self) -> Option<u64> {
+    fn last_stored_sequence(&self) -> Option<u64> {
         None
     }
 
@@ -223,7 +223,7 @@ impl EventLog for FailingLog {
         None
     }
 
-    fn last_sequence(&self) -> Option<u64> {
+    fn last_stored_sequence(&self) -> Option<u64> {
         None
     }
 
@@ -236,16 +236,16 @@ impl EventLog for FailingLog {
 #[derive(Clone, Default)]
 struct FailingSnapshotStore;
 
-impl EventSnapshotStore for FailingSnapshotStore {
-    fn save(&mut self, _snapshot: EventSnapshot) -> Result<(), DurableError> {
+impl SnapshotStore for FailingSnapshotStore {
+    fn save(&mut self, _snapshot: StoredSnapshot) -> Result<(), DurableError> {
         Err(DurableError::Storage("snapshot disk full".to_string()))
     }
 
-    fn load_latest(&self) -> Result<Option<EventSnapshot>, DurableError> {
+    fn load_latest(&self) -> Result<Option<StoredSnapshot>, DurableError> {
         Ok(None)
     }
 
-    fn load_previous(&self) -> Result<Option<EventSnapshot>, DurableError> {
+    fn load_previous(&self) -> Result<Option<StoredSnapshot>, DurableError> {
         Ok(None)
     }
 }
@@ -254,16 +254,16 @@ impl EventSnapshotStore for FailingSnapshotStore {
 #[derive(Clone, Default)]
 struct PanickingSnapshotStore;
 
-impl EventSnapshotStore for PanickingSnapshotStore {
-    fn save(&mut self, _snapshot: EventSnapshot) -> Result<(), DurableError> {
+impl SnapshotStore for PanickingSnapshotStore {
+    fn save(&mut self, _snapshot: StoredSnapshot) -> Result<(), DurableError> {
         panic!("snapshot store panic");
     }
 
-    fn load_latest(&self) -> Result<Option<EventSnapshot>, DurableError> {
+    fn load_latest(&self) -> Result<Option<StoredSnapshot>, DurableError> {
         Ok(None)
     }
 
-    fn load_previous(&self) -> Result<Option<EventSnapshot>, DurableError> {
+    fn load_previous(&self) -> Result<Option<StoredSnapshot>, DurableError> {
         Ok(None)
     }
 }
@@ -271,7 +271,7 @@ impl EventSnapshotStore for PanickingSnapshotStore {
 #[test]
 fn create_submits_and_acknowledges_applied_and_durable() {
     let log = InMemoryEventLog::new();
-    let snapshots = InMemoryEventSnapshotStore::new();
+    let snapshots = InMemorySnapshotStore::new();
 
     let (handle, runtime) = EngineRuntime::create(
         runtime_config(),
@@ -300,7 +300,7 @@ fn create_submits_and_acknowledges_applied_and_durable() {
 #[test]
 fn shutdown_drains_writes_a_final_snapshot_and_reopens() {
     let log = InMemoryEventLog::new();
-    let snapshots = InMemoryEventSnapshotStore::new();
+    let snapshots = InMemorySnapshotStore::new();
 
     let (handle, runtime) = EngineRuntime::create(
         runtime_config(),
@@ -359,7 +359,7 @@ fn shutdown_drains_writes_a_final_snapshot_and_reopens() {
 #[test]
 fn drop_drains_without_a_final_snapshot_and_reopens() {
     let log = InMemoryEventLog::new();
-    let snapshots = InMemoryEventSnapshotStore::new();
+    let snapshots = InMemorySnapshotStore::new();
 
     let (handle, runtime) = EngineRuntime::create(
         runtime_config(),
@@ -412,12 +412,12 @@ fn drop_drains_without_a_final_snapshot_and_reopens() {
 #[test]
 fn open_recovers_a_log_seeded_by_the_synchronous_facade() {
     let log = InMemoryEventLog::new();
-    let snapshots = InMemoryEventSnapshotStore::new();
+    let snapshots = InMemorySnapshotStore::new();
     {
-        let mut durable = EventSourcedEngine::create(
+        let mut durable = DurableMatchingEngine::create(
             EngineConfig::default(),
             Box::new(log.handle()),
-            Box::new(InMemoryEventSnapshotStore::new()),
+            Box::new(InMemorySnapshotStore::new()),
         )
         .expect("seed event-sourced engine");
         for timestamp in 1..=3 {
@@ -501,7 +501,7 @@ fn a_full_ingress_rejects_with_queue_full_and_consumes_no_sequence() {
     runtime.shutdown().expect("shutdown");
 
     assert_eq!(
-        log.last_sequence(),
+        log.last_stored_sequence(),
         Some(2 * accepted),
         "the refused command emitted no events"
     );
@@ -689,7 +689,7 @@ fn concurrent_producers_get_unique_contiguous_event_ranges() {
     const PER_PRODUCER: u64 = 50;
 
     let log = InMemoryEventLog::new();
-    let snapshots = InMemoryEventSnapshotStore::new();
+    let snapshots = InMemorySnapshotStore::new();
     let config = RuntimeConfig {
         queue_capacity: 64,
         ..RuntimeConfig::default()

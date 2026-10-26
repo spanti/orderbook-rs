@@ -2,15 +2,13 @@
 //!
 //! These tests exercise the event-sourced path only through public seams: the
 //! pure `decide`, the sole state-write entry `apply`, and the append-before-
-//! apply `EventSourcedEngine`. Expected event streams and state are literals
+//! apply `DurableMatchingEngine`. Expected event streams and state are literals
 //! from the ticket and the event catalog, never recomputed by the code under
 //! test.
 
 use std::collections::HashMap;
 
-use orderbook_rs::durable::{
-    EventSourcedEngine, InMemoryEventLog, InMemoryEventSnapshotStore,
-};
+use orderbook_rs::durable::{DurableMatchingEngine, InMemoryEventLog, InMemorySnapshotStore};
 use orderbook_rs::engine::MatchingEngine;
 use orderbook_rs::event::{DomainEvent, OrderCancelReason};
 use orderbook_rs::snapshot::EngineSnapshot;
@@ -125,7 +123,7 @@ fn run(engine: &mut MatchingEngine, command: &EngineCommand) -> Vec<DomainEvent>
     events
 }
 
-/// Seed a resting order through the event-sourced path, not the old path.
+/// Seed a resting order through the pure decide/apply path.
 fn rest(engine: &mut MatchingEngine, symbol: &str, request: OrderRequest) -> OrderBookId {
     let events = run(engine, &submit(symbol, request));
     match events.first() {
@@ -151,22 +149,13 @@ fn ledger_map(snapshot: &EngineSnapshot) -> HashMap<OrderBookId, OrderRecord> {
         .collect()
 }
 
-/// Compare decision state, deliberately ignoring `next_event_sequence`.
-///
-/// The old command path emits one output event per state transition while the
-/// event-sourced path emits `OrderRested`/residual-cancel events too, so the
-/// derived event counter is not part of the shared decision state contract.
-fn assert_decision_state_eq(event_sourced: &MatchingEngine, command_sourced: &MatchingEngine) {
-    let event_sourced = event_sourced.capture_snapshot();
-    let command_sourced = command_sourced.capture_snapshot();
-    assert_eq!(event_sourced.books, command_sourced.books);
-    assert_eq!(event_sourced.ledger, command_sourced.ledger);
-    assert_eq!(event_sourced.stops, command_sourced.stops);
-    assert_eq!(event_sourced.last_trades, command_sourced.last_trades);
-    assert_eq!(event_sourced.trades, command_sourced.trades);
-    assert_eq!(event_sourced.next_order_id, command_sourced.next_order_id);
-    assert_eq!(event_sourced.next_trade_id, command_sourced.next_trade_id);
-    assert_eq!(event_sourced.config, command_sourced.config);
+/// Compare two engines' complete decision state and derived counters.
+fn assert_decision_state_eq(decided: &MatchingEngine, executed: &MatchingEngine) {
+    assert_eq!(
+        decided.capture_snapshot(),
+        executed.capture_snapshot(),
+        "decide/apply and the execute convenience must reach the same state"
+    );
 }
 
 /// Every prefix of the stream must leave a structurally valid engine state.
@@ -617,10 +606,10 @@ fn unknown_cancel_is_journaled_as_one_order_rejected() {
     );
 
     let log = InMemoryEventLog::new();
-    let mut durable = EventSourcedEngine::create(
+    let mut durable = DurableMatchingEngine::create(
         EngineConfig::default(),
         Box::new(log.handle()),
-        Box::new(InMemoryEventSnapshotStore::new()),
+        Box::new(InMemorySnapshotStore::new()),
     )
     .expect("fresh event log");
     let events = durable
@@ -661,7 +650,7 @@ fn decide_is_pure_for_a_crossing_submit() {
     let mut engine = MatchingEngine::new(EngineConfig::default());
     rest(&mut engine, BTC, limit(Side::Ask, 100, 5, 1));
     let before = engine.capture_snapshot();
-    let sequence_before = engine.last_sequence();
+    let sequence_before = engine.last_applied_sequence();
 
     let command = submit(BTC, limit(Side::Bid, 100, 3, 2));
     let first = engine.decide(&command);
@@ -669,7 +658,7 @@ fn decide_is_pure_for_a_crossing_submit() {
 
     assert_eq!(first, second, "decide allocates ids deterministically");
     assert_eq!(engine.capture_snapshot(), before, "decide mutates nothing");
-    assert_eq!(engine.last_sequence(), sequence_before);
+    assert_eq!(engine.last_applied_sequence(), sequence_before);
     assert!(engine.trades().is_empty());
     assert_eq!(engine.last_trade_price(BTC), None);
 }
@@ -704,29 +693,29 @@ fn every_prefix_is_a_valid_engine_state_and_replay_equals_live_execution() {
         commands_events.push(events);
     }
 
-    // The live path must match the old command path's decision state.
-    let mut old = MatchingEngine::new(EngineConfig::default());
+    // The execute convenience must match the explicit decide/apply fold.
+    let mut convenience = MatchingEngine::new(EngineConfig::default());
     for command in &commands {
-        let _ = old.execute(command.clone());
+        let _ = convenience.execute(command.clone());
     }
-    assert_decision_state_eq(&live, &old);
+    assert_decision_state_eq(&live, &convenience);
 
     // Replay the same events from an empty engine through the durable seam.
     let log = InMemoryEventLog::new();
     {
-        let mut durable = EventSourcedEngine::create(
+        let mut durable = DurableMatchingEngine::create(
             EngineConfig::default(),
             Box::new(log.handle()),
-            Box::new(InMemoryEventSnapshotStore::new()),
+            Box::new(InMemorySnapshotStore::new()),
         )
         .expect("fresh event log");
         for command in &commands {
             durable.execute(command.clone()).expect("supported command");
         }
     }
-    let reopened = EventSourcedEngine::open(
+    let reopened = DurableMatchingEngine::open(
         Box::new(log.handle()),
-        Box::new(InMemoryEventSnapshotStore::new()),
+        Box::new(InMemorySnapshotStore::new()),
     )
     .expect("replay");
 
@@ -766,10 +755,10 @@ fn replay_preserves_fifo_priority_across_fills_and_rests() {
     let log = InMemoryEventLog::new();
     let mut live = Mint::new();
     {
-        let mut durable = EventSourcedEngine::create(
+        let mut durable = DurableMatchingEngine::create(
             EngineConfig::default(),
             Box::new(log.handle()),
-            Box::new(InMemoryEventSnapshotStore::new()),
+            Box::new(InMemorySnapshotStore::new()),
         )
         .expect("fresh event log");
         for command in &commands {
@@ -777,9 +766,9 @@ fn replay_preserves_fifo_priority_across_fills_and_rests() {
         }
     }
 
-    let reopened = EventSourcedEngine::open(
+    let reopened = DurableMatchingEngine::open(
         Box::new(log.handle()),
-        Box::new(InMemoryEventSnapshotStore::new()),
+        Box::new(InMemorySnapshotStore::new()),
     )
     .expect("replay");
     let makers: Vec<(OrderBookId, u64)> = reopened
@@ -812,7 +801,7 @@ impl Mint {
         }
     }
 
-    fn observe(&mut self, durable: &mut EventSourcedEngine, command: &EngineCommand) {
+    fn observe(&mut self, durable: &mut DurableMatchingEngine, command: &EngineCommand) {
         let _events = durable.execute(command.clone()).expect("supported command");
         self.trades = durable.engine().trades().clone();
         self.records = records(durable.engine());
@@ -826,7 +815,7 @@ impl Mint {
 #[test]
 fn a_command_that_would_trigger_a_pending_stop_emits_the_trigger() {
     let mut engine = MatchingEngine::new(EngineConfig::default());
-    // Establish a last trade price of 100 on the old path.
+    // Establish a last trade price of 100 through the event path.
     let _ = engine.execute(submit(BTC, limit(Side::Ask, 100, 1, 1)));
     let _ = engine.execute(submit(BTC, limit(Side::Bid, 100, 1, 2)));
     // Pending buy stop at 105 (valid while the last price is 100).

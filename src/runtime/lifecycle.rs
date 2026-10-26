@@ -18,8 +18,7 @@ use std::time::{Duration, Instant};
 
 use crate::bus::{InProcessBus, MessageBus};
 use crate::durable::{
-    DurableError, EVENT_FORMAT_VERSION, EventCursor, EventLog, EventSnapshotStore, LogHeader,
-    recover_event,
+    DurableError, EventCursor, EventLog, FORMAT_VERSION, LogHeader, SnapshotStore, recover,
 };
 use crate::engine::MatchingEngine;
 use crate::types::{EngineCommand, EngineConfig};
@@ -130,7 +129,7 @@ impl EngineRuntime {
         config: RuntimeConfig,
         engine_config: EngineConfig,
         log: Box<dyn EventLog>,
-        snapshots: Box<dyn EventSnapshotStore>,
+        snapshots: Box<dyn SnapshotStore>,
     ) -> Result<(EngineHandle, Self), RuntimeError> {
         Self::create_with_bus(
             config,
@@ -149,11 +148,11 @@ impl EngineRuntime {
         config: RuntimeConfig,
         engine_config: EngineConfig,
         mut log: Box<dyn EventLog>,
-        snapshots: Box<dyn EventSnapshotStore>,
+        snapshots: Box<dyn SnapshotStore>,
         bus: Arc<dyn MessageBus>,
     ) -> Result<(EngineHandle, Self), RuntimeError> {
         log.write_header(LogHeader {
-            format_version: EVENT_FORMAT_VERSION,
+            format_version: FORMAT_VERSION,
             config: engine_config,
         })
         .map_err(|error| RuntimeError::Startup(error.to_string()))?;
@@ -171,13 +170,13 @@ impl EngineRuntime {
     /// Recover from an existing log and snapshot store.
     ///
     /// Uses the same borrowed recovery helper as the synchronous
-    /// [`crate::durable::EventSourcedEngine`], so both write paths apply the
+    /// [`crate::durable::DurableMatchingEngine`], so both write paths apply the
     /// header, version, config, gap, snapshot-ahead, and contiguity checks, and
     /// continue the event sequence and `command_id` from the recovered cursor.
     pub fn open(
         config: RuntimeConfig,
         log: Box<dyn EventLog>,
-        snapshots: Box<dyn EventSnapshotStore>,
+        snapshots: Box<dyn SnapshotStore>,
     ) -> Result<(EngineHandle, Self), RuntimeError> {
         Self::open_with_bus(config, log, snapshots, Arc::new(InProcessBus::new()))
     }
@@ -189,10 +188,10 @@ impl EngineRuntime {
     pub fn open_with_bus(
         config: RuntimeConfig,
         log: Box<dyn EventLog>,
-        snapshots: Box<dyn EventSnapshotStore>,
+        snapshots: Box<dyn SnapshotStore>,
         bus: Arc<dyn MessageBus>,
     ) -> Result<(EngineHandle, Self), RuntimeError> {
-        let (engine, cursor) = recover_event(log.as_ref(), snapshots.as_ref())
+        let (engine, cursor) = recover(log.as_ref(), snapshots.as_ref())
             .map_err(|error| RuntimeError::Startup(error.to_string()))?;
 
         Self::start(config, engine, log, snapshots, cursor, bus)
@@ -202,7 +201,7 @@ impl EngineRuntime {
         config: RuntimeConfig,
         engine: MatchingEngine,
         log: Box<dyn EventLog>,
-        snapshots: Box<dyn EventSnapshotStore>,
+        snapshots: Box<dyn SnapshotStore>,
         cursor: EventCursor,
         bus: Arc<dyn MessageBus>,
     ) -> Result<(EngineHandle, Self), RuntimeError> {
@@ -227,7 +226,7 @@ impl EngineRuntime {
         config: RuntimeConfig,
         engine: MatchingEngine,
         log: Box<dyn EventLog>,
-        snapshots: Box<dyn EventSnapshotStore>,
+        snapshots: Box<dyn SnapshotStore>,
         cursor: EventCursor,
         bus: Arc<dyn MessageBus>,
         make_gate: F,
@@ -532,12 +531,12 @@ pub fn start_with_matching_panic_for_test(
     config: RuntimeConfig,
     engine_config: EngineConfig,
     mut log: Box<dyn EventLog>,
-    snapshots: Box<dyn EventSnapshotStore>,
+    snapshots: Box<dyn SnapshotStore>,
     start: Arc<Barrier>,
     panic_after: u64,
 ) -> Result<(EngineHandle, EngineRuntime), RuntimeError> {
     log.write_header(LogHeader {
-        format_version: EVENT_FORMAT_VERSION,
+        format_version: FORMAT_VERSION,
         config: engine_config,
     })
     .map_err(|error| RuntimeError::Startup(error.to_string()))?;
@@ -617,7 +616,7 @@ fn bind_matching_core(index: Option<usize>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::durable::InMemoryEventSnapshotStore;
+    use crate::durable::InMemorySnapshotStore;
     use crate::runtime::snapshot_gate::GateDecision;
     use crate::types::{OrderRequest, OrderType, Side, TimeInForce};
     use std::time::Duration;
@@ -674,7 +673,7 @@ mod tests {
             config,
             MatchingEngine::new(EngineConfig::default()),
             Box::new(crate::durable::InMemoryEventLog::new()),
-            Box::new(InMemoryEventSnapshotStore::new()),
+            Box::new(InMemorySnapshotStore::new()),
             EventCursor::fresh(),
             Arc::new(InProcessBus::new()),
             |_cadence, _sink| PanickingGate { panic_after: 1 },

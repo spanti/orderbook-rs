@@ -15,7 +15,7 @@ use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use crate::durable::{DurableError, EVENT_FORMAT_VERSION, EventCursor, EventRecord};
+use crate::durable::{DurableError, EventCursor, EventRecord, FORMAT_VERSION};
 use crate::engine::MatchingEngine;
 
 use super::RuntimeConfig;
@@ -345,7 +345,7 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
             .iter()
             .enumerate()
             .map(|(offset, event)| EventRecord {
-                format_version: EVENT_FORMAT_VERSION,
+                format_version: FORMAT_VERSION,
                 sequence: first_event_sequence.saturating_add(offset as u64),
                 command_id,
                 event: event.clone(),
@@ -448,8 +448,8 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
 mod tests {
     use super::*;
     use crate::durable::{
-        DurableError, EVENT_FORMAT_VERSION, EventCursor, EventRecord, EventSnapshot,
-        EventSnapshotStore, InMemoryEventSnapshotStore,
+        DurableError, EventCursor, EventRecord, FORMAT_VERSION, InMemorySnapshotStore,
+        SnapshotStore, StoredSnapshot,
     };
     use crate::event::DomainEvent;
     use crate::runtime::error::SubmitError;
@@ -637,7 +637,7 @@ mod tests {
         }
     }
 
-    /// An inspectable [`EventSnapshotStore`] that can block, fail, and compare each
+    /// An inspectable [`SnapshotStore`] that can block, fail, and compare each
     /// saved sequence with the live durability watermark.
     #[derive(Clone)]
     struct TestSnapshotStore {
@@ -694,8 +694,8 @@ mod tests {
         }
     }
 
-    impl EventSnapshotStore for TestSnapshotStore {
-        fn save(&mut self, snapshot: EventSnapshot) -> Result<(), DurableError> {
+    impl SnapshotStore for TestSnapshotStore {
+        fn save(&mut self, snapshot: StoredSnapshot) -> Result<(), DurableError> {
             self.calls.fetch_add(1, Ordering::AcqRel);
             if let Some(gate) = &self.gate {
                 gate.wait();
@@ -713,11 +713,11 @@ mod tests {
             Ok(())
         }
 
-        fn load_latest(&self) -> Result<Option<EventSnapshot>, DurableError> {
+        fn load_latest(&self) -> Result<Option<StoredSnapshot>, DurableError> {
             Ok(None)
         }
 
-        fn load_previous(&self) -> Result<Option<EventSnapshot>, DurableError> {
+        fn load_previous(&self) -> Result<Option<StoredSnapshot>, DurableError> {
             Ok(None)
         }
     }
@@ -820,7 +820,7 @@ mod tests {
 
     #[test]
     fn cadence_zero_disables_automatic_snapshots() {
-        let store = InMemoryEventSnapshotStore::new();
+        let store = InMemorySnapshotStore::new();
         let (sink, worker) = snapshot::spawn(Box::new(store.handle()));
         let mut gate = CadenceSnapshotGate::new(0, sink);
         let engine = executed(5);
@@ -842,7 +842,7 @@ mod tests {
 
     #[test]
     fn cadence_boundary_is_captured_exactly_once() {
-        let store = InMemoryEventSnapshotStore::new();
+        let store = InMemorySnapshotStore::new();
         let (sink, worker) = snapshot::spawn(Box::new(store.handle()));
         let mut gate = CadenceSnapshotGate::new(2, sink);
         let engine = executed(4);
@@ -887,7 +887,7 @@ mod tests {
 
     #[test]
     fn gate_pauses_and_refuses_a_snapshot_ahead_of_durability() {
-        let store = InMemoryEventSnapshotStore::new();
+        let store = InMemorySnapshotStore::new();
         let (sink, worker) = snapshot::spawn(Box::new(store.handle()));
         let mut gate = CadenceSnapshotGate::new(2, sink);
         let engine = executed(4);
@@ -1083,8 +1083,8 @@ mod tests {
         // Fill the single-slot worker channel while the worker is blocked in
         // its first save: one job is in the worker, one waits in the channel.
         let filler = sink.clone();
-        let filler_job = || EventSnapshot {
-            format_version: EVENT_FORMAT_VERSION,
+        let filler_job = || StoredSnapshot {
+            format_version: FORMAT_VERSION,
             applied_seq: 0,
             last_command_id: 0,
             snapshot: engine.capture_snapshot(),
@@ -1184,7 +1184,7 @@ mod tests {
     #[test]
     fn final_snapshot_is_present_after_shutdown() {
         let journal = TestJournal::with_watermark();
-        let snapshots = InMemoryEventSnapshotStore::new();
+        let snapshots = InMemorySnapshotStore::new();
         let (sink, worker) = snapshot::spawn(Box::new(snapshots.handle()));
 
         let (submitter, tickets, shared, handle) = spawn_matching(
@@ -1420,8 +1420,7 @@ mod tests {
         assert_eq!(durable, applied);
 
         shared.close();
-        let engine = handle.join().expect("matching thread");
-        assert!(engine.events().is_empty(), "the runtime retains no events");
+        let _engine = handle.join().expect("matching thread");
         assert_eq!(journal.record_count(), 2);
     }
 
@@ -1490,7 +1489,6 @@ mod tests {
             direct.capture_snapshot(),
             "runtime and direct execution reach the same decision state"
         );
-        assert!(runtime_engine.events().is_empty());
 
         let expected_events: Vec<DomainEvent> = expected
             .iter()
@@ -1499,7 +1497,7 @@ mod tests {
         let logged = journal.records();
         assert_eq!(logged.len(), expected_events.len());
         for (index, (record, event)) in logged.iter().zip(&expected_events).enumerate() {
-            assert_eq!(record.format_version, EVENT_FORMAT_VERSION);
+            assert_eq!(record.format_version, FORMAT_VERSION);
             assert_eq!(record.sequence, index as u64 + 1);
             assert_eq!(&record.event, event);
         }
@@ -1534,7 +1532,7 @@ mod tests {
 
     #[test]
     fn one_producers_commands_reach_the_log_in_submission_order() {
-        let commands = vec![
+        let commands = [
             submit("BTC-USDT", 1, Side::Ask, 100, 5),
             submit("BTC-USDT", 2, Side::Bid, 100, 3),
             cancel("BTC-USDT", 1),
@@ -1665,8 +1663,7 @@ mod tests {
         wait_until(|| journal.record_count() == 2);
 
         shared.close();
-        let engine = handle.join().expect("matching thread");
-        assert!(engine.events().is_empty());
+        let _engine = handle.join().expect("matching thread");
     }
 
     #[test]
@@ -1816,8 +1813,7 @@ mod tests {
             Err(SubmitError::EngineFailed(error)) if error == failure
         ));
 
-        let engine = handle.join().expect("matching thread");
-        assert!(engine.events().is_empty());
+        let _engine = handle.join().expect("matching thread");
         assert!(shared.is_failed());
     }
 
@@ -1915,7 +1911,7 @@ mod tests {
             Err(SubmitError::Shutdown)
         ));
 
-        let engine = handle.join().expect("matching thread");
+        let _engine = handle.join().expect("matching thread");
         for ticket in &tickets {
             ticket
                 .wait_durable_timeout(WAIT)
@@ -1923,6 +1919,5 @@ mod tests {
         }
         assert_eq!(metrics.applied(), 5);
         assert_eq!(journal.record_count(), 10);
-        assert!(engine.events().is_empty());
     }
 }

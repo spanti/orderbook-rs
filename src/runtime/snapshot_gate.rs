@@ -1,7 +1,7 @@
 //! Snapshot gating: when the matching thread may capture a snapshot.
 //!
 //! The gate owns only the cadence policy. Capture happens on the matching
-//! thread at a command boundary; the `EventSnapshotStore::save` call happens on
+//! thread at a command boundary; the `SnapshotStore::save` call happens on
 //! the snapshot worker through [`SnapshotSink`].
 //!
 //! `snapshot_cadence` is measured in **event** sequences: a snapshot is due once
@@ -10,7 +10,7 @@
 //! a snapshot never covers a half-applied command or an event the log does not
 //! hold.
 
-use crate::durable::{EVENT_FORMAT_VERSION, EventSnapshot};
+use crate::durable::{FORMAT_VERSION, StoredSnapshot};
 use crate::engine::MatchingEngine;
 
 use super::snapshot::{SnapshotSend, SnapshotSink};
@@ -93,8 +93,8 @@ impl CadenceSnapshotGate {
             return true;
         }
 
-        let stored = EventSnapshot {
-            format_version: EVENT_FORMAT_VERSION,
+        let stored = StoredSnapshot {
+            format_version: FORMAT_VERSION,
             applied_seq,
             last_command_id,
             snapshot: engine.capture_snapshot(),

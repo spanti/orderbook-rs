@@ -129,7 +129,7 @@ _Avoid_: journal thread、dispatcher
 ## Recovery
 
 **Durable Matching Engine** / 持久化撮合引擎:
-组合在纯内存撮合引擎之外的同步持久化门面（`DurableMatchingEngine`）；先决策、追加事件、再应用事件（append-before-apply），并按阈值生成引擎快照。它不同于 apply-first 的 Matching Runtime；两者共享恢复算法与存储 trait。撮合引擎本身不感知 IO。
+组合在纯内存撮合引擎之外的同步持久化门面（`DurableMatchingEngine`）；先决策、追加事件、再应用事件（append-before-apply），并可按需生成引擎快照。自动、按事件阈值触发的快照属于 Matching Runtime 的 Snapshot Gate，不在本门面内。它不同于 apply-first 的 Matching Runtime；两者共享 `decide`/`apply`、恢复算法与存储 trait。撮合引擎本身不感知 IO。
 _Avoid_: persistent engine、matching service
 
 **Replay** / 重放:
