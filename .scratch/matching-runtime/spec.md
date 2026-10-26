@@ -106,8 +106,8 @@ Use the glossary terms: Command Queue, Command Envelope, Ticket, Matching Thread
 - **Producers** only hold `EngineHandle` clones.
 - Ingress: `std::sync::mpsc::sync_channel(queue_capacity)` of `CommandEnvelope`; producers use `try_send`. `queue_capacity` default 1024.
 - Journal input: `sync_channel(journal_batch_capacity)` of `Vec<CommandRecord>`; `journal_batch_capacity` default 64 batches. The maximum number of records that may be applied but not yet handed to the journal is `journal_batch_capacity * apply_batch_max`; `apply_batch_max` default 64.
-- Snapshot jobs: `sync_channel(1)`; a full channel drops the job and retries at the next opportunity. Snapshots are best effort.
-- Shared state: `Arc<AtomicBool>` closed, `Arc<AtomicBool>` failed, `Arc<Mutex<Option<DurableError>>>` fatal error, `Arc<AtomicU64>` durable watermark, `Arc<RuntimeMetrics>` optional, and the response-slot pool.
+- Snapshot jobs: `sync_channel(1)`; a full channel keeps the snapshot due and retries at a later durability boundary rather than blocking or growing. Automatic snapshots are best effort and never stall matching.
+- Shared state: `Arc<AtomicBool>` closed, `Arc<AtomicBool>` failed, `Arc<Mutex<Option<DurableError>>>` fatal error, `Arc<AtomicU64>` applied sequence, `Arc<AtomicU64>` durable watermark, a shutdown deadline plus timed-out flag (bounded shutdown), an ingress-depth counter used only for metrics, `Arc<RuntimeMetrics>` optional, and the response-slot pool.
 
 ### Public API
 
@@ -120,7 +120,7 @@ pub struct RuntimeConfig {
     pub journal_flush_interval: Duration, // 100µs upper bound on buffering
     pub snapshot_cadence: u64,          // 0 = no automatic snapshots
     pub idle: IdleStrategy,             // Backoff
-    pub matching_core: Option<usize>,   // None
+    pub matching_core: Option<usize>,   // None; index into core_affinity::get_core_ids()
     pub shutdown_timeout: Duration,     // 5s
     pub metrics: Option<Arc<RuntimeMetrics>>,
 }
@@ -161,16 +161,28 @@ pub enum SubmitError { QueueFull, Shutdown, EngineFailed(DurableError) }
 
 pub enum RuntimeError {
     EngineFailed(DurableError),
+    QueueFull,
+    Shutdown,
     EngineStopped,
     Timeout,
     WorkerPanicked(&'static str),
     SnapshotFailed(DurableError),
     Startup(String),
 }
+
+impl From<SubmitError> for RuntimeError {
+    fn from(error: SubmitError) -> Self {
+        match error {
+            SubmitError::QueueFull => Self::QueueFull,
+            SubmitError::Shutdown => Self::Shutdown,
+            SubmitError::EngineFailed(error) => Self::EngineFailed(error),
+        }
+    }
+}
 ```
 
 - `try_submit` takes ownership of the command and does not return it on `QueueFull`; callers that retry clone it first (`EngineCommand: Clone`).
-- `submit_and_wait` = `try_submit` + `wait_durable`; `submit_and_wait_applied` = `try_submit` + `wait_applied`.
+- `submit_and_wait` = `try_submit` + `wait_durable`; `submit_and_wait_applied` = `try_submit` + `wait_applied`. Submission failures are preserved, not collapsed into a wait failure: `QueueFull` becomes `RuntimeError::QueueFull`, `Shutdown` becomes `RuntimeError::Shutdown`, and `EngineFailed` becomes `RuntimeError::EngineFailed`.
 - `Ticket` waits take `&self`, so a caller may observe both levels on the same command.
 - A `Ticket` holds a response slot until it is dropped and the worker is finished with it. Callers must drop tickets; the pool is bounded and its exhaustion is reported as `QueueFull`.
 
@@ -211,7 +223,7 @@ pub enum RuntimeError {
 
 - Receive one `Vec<CommandRecord>` (blocking `recv`), then drain further batches with `try_recv` until `journal_coalesce_max` records or the channel is momentarily empty.
 - Call `CommandLog::append_batch(records)`. On success, store the highest sequence into the durability watermark with `Release` and `unpark` the matching thread. On failure, store the error, set failed, `unpark` the matching thread, and exit.
-- Record journal append duration and batch size in metrics.
+- Record journal append duration and append count in metrics. Batch size and batch count are recorded once by the matching thread at handoff, so coalesced groups are not double-counted.
 - `CommandLog` gains `append_batch` and the supertraits `Send + 'static`:
 
 ```rust
@@ -234,12 +246,13 @@ pub trait CommandLog: Send + 'static {
 - On journal failure, every pending-durable command receives `Err(EngineFailed(...))`; every queued-but-not-applied envelope receives `Err(EngineFailed(...))` for both levels. New submissions return `SubmitError::EngineFailed`.
 - On matching-thread panic, the response-slot handles drop and mark slots `stopped`; all waiters return `EngineStopped`. `shutdown`/join reports `WorkerPanicked("matching")`.
 - On journal-thread panic, the matching thread observes a disconnected journal channel or the failed flag and fail-stops; `shutdown` reports `WorkerPanicked("journal")`.
+- On snapshot-worker panic, automatic snapshots stop; durable commands are unaffected and `shutdown` reports `WorkerPanicked("snapshot")`.
 
 ### Snapshot gate and Snapshot Worker
 
 - Automatic snapshots run when `snapshot_cadence > 0`, `applied_seq > 0`, `applied_seq % snapshot_cadence == 0`, and `applied_seq == durable_seq`.
 - If the cadence boundary is reached while `applied_seq > durable_seq`, set `snapshot_due` and stop draining new commands until `durable_seq == applied_seq`; then capture and resume. This is a deliberate, infrequent pause: without it, a continuously loaded engine could starve snapshots forever because applied always leads durable.
-- Capture `engine.capture_snapshot()` on the matching thread, build `StoredSnapshot { format_version, applied_seq, snapshot }`, and `try_send` it to the snapshot worker. If the worker's channel is full, keep `snapshot_due` and retry; snapshots are best effort.
+- Capture `engine.capture_snapshot()` on the matching thread, build `StoredSnapshot { format_version, applied_seq, snapshot }`, and `try_send` it to the snapshot worker. If the worker's channel is full, keep the snapshot due and retry at a later durability boundary without pausing intake; snapshots are best effort and never stall matching.
 - Track `last_snapshot_seq` so a boundary is not captured repeatedly.
 - The snapshot worker calls `SnapshotStore::save`. Failures are stored in a shared `last_snapshot_error` and never fail an already-durable command.
 - Explicit `shutdown` waits for `durable_seq == applied_seq` (bounded by `shutdown_timeout`), captures a final snapshot regardless of cadence, and waits for the worker to save it. A final snapshot failure is returned as `SnapshotFailed`.
@@ -255,7 +268,7 @@ pub trait CommandLog: Send + 'static {
 
 ### Shutdown and lifecycle
 
-- `shutdown(self)` sets closed, rejects new submissions, drains the ingress, flushes the journal buffer, waits for durability, sends the final snapshot, drops the thread senders, and joins the matching, journal, and snapshot threads.
+- `shutdown(self)` sets closed, rejects new submissions, and joins the matching thread, which drains the ingress, flushes the journal buffer, and waits for durability up to the deadline. If `applied_seq == durable_seq`, shutdown then captures the final snapshot through the snapshot worker and waits for its save; it finally drops the sinks and joins the journal and snapshot threads.
 - `Drop` performs the same stop without a final snapshot and ignores errors/panics; it blocks until the threads exit.
 - If `shutdown_timeout` expires while waiting for durability, stop applying, skip the final snapshot, and return `Timeout`. The timeout bounds the matching thread's wait; a journal thread already blocked in fsync cannot be interrupted, so the final join may still take as long as that fsync. Document this rather than pretending shutdown is hard-real-time.
 - The runtime holds an ingress sender clone so the channel does not disconnect while handles exist; shutdown is signalled by the closed flag, not by sender drop.
@@ -276,29 +289,29 @@ pub trait CommandLog: Send + 'static {
 - `IdleStrategy::{Spin, Backoff}`. `Backoff` spins `spin_iters` (10_000), then `yield_now`, then `park_timeout(50µs)`. `Spin` only calls `spin_loop()`.
 - Default is `Backoff`; bench uses `Spin` to measure the low-latency target.
 - The Journal Thread `unpark`s the matching thread after advancing the watermark, so a parked matching thread wakes immediately.
-- `matching_core: Option<usize>` binds the matching thread with `core_affinity`. Add `core_affinity = "0.8"` to `Cargo.toml`. Invalid or unavailable cores fail startup (`RuntimeError::Startup`). Do not pin journal/snapshot threads; document external isolation (`isolcpus`, `taskset`, Windows affinity) and that a busy-spin core must not be shared.
+- `matching_core: Option<usize>` is an **index** into `core_affinity::get_core_ids()`, not a raw platform processor id; the mapping is stable only for the process lifetime. Add `core_affinity = "0.8"` to `Cargo.toml`. An unsupported platform, an out-of-range index, or a failed bind fails startup (`RuntimeError::Startup`); the runtime never silently runs unpinned. Do not pin journal/snapshot threads; document external isolation (`isolcpus`, `taskset`, Windows affinity) and that a busy-spin core must not be shared.
 
 ### Bench integration
 
 - Extend the existing bench with `--path direct|runtime` (default `direct`).
-- Runtime flags: `--queue-capacity`, `--journal-batch-capacity`, `--apply-batch-max`, `--journal-coalesce-max`, `--idle spin|backoff` (bench default `spin`), `--affinity <CORE>`, `--snapshot-cadence`, `--log memory|file`, `--data-dir <PATH>`, `--in-flight <N>` (default 1 for latency).
+- Runtime flags: `--queue-capacity`, `--journal-batch-capacity`, `--apply-batch-max`, `--journal-coalesce-max`, `--journal-flush-us`, `--idle spin|backoff` (bench default `spin`), `--affinity <CORE_INDEX>`, `--snapshot-cadence`, `--log memory|file`, `--data-dir <PATH>`, and `--in-flight <N>` (default 1 for latency). `--path direct|runtime` defaults to `direct`.
 - Runtime path uses the same workload generator; because the runtime has no read API, the single producer maintains a shadow `MatchingEngine` updated after each receipt to drive book-aware actions. The shadow work happens outside the timed window.
-- Report, in addition to existing fields: `applied_latency` (submit → applied), `durable_latency` (submit → durable), `queue_wait`, `apply_service`, `durable_wait`, `journal_append`, `batch_size`, `queue_depth`, `queue_full`, and the fsync share (journal append time / durable latency).
+- Report, in addition to existing fields: `applied_latency` (submit → applied), `durable_latency` (submit → durable), `queue_wait`, `apply_service`, `durable_wait`, `journal_append`, `batch_size_mean` and `batch_count`, `queue_depth_max`, `queue_full`, `applied_count`, `durable_count`, `fsync_share` (journal append time / durable wait), and an `slo` object with each level's target, p50/p99/p99.9, and pass/fail. The global `service` row mirrors applied for the runtime path; engine-service time is `apply_service`, measured inside the matching thread.
 - `direct` path output and behavior remain unchanged.
 
 ### Acceptance SLOs
 
-Measured in-process on Linux, release build, one producer, `--idle spin`, matching thread pinned:
+Measured per command in-process from submission to receipt with the monotonic clock, on Linux, release build, one producer, `--path runtime --idle spin`, matching thread pinned:
 
 - `submit → applied` p99 ≤ 10µs at 100k commands/s with `InMemoryCommandLog`; `queue_full == 0`.
 - `submit → durable` p99 ≤ 500µs at the same rate with `FileCommandLog` on NVMe; `queue_full == 0`.
-- Matching service time and journal append time are reported separately; durable latency must be explainable as queue wait + apply + journal append + wakeup.
-- Windows is for functional validation only; do not claim the numeric SLOs there.
+- The report prints both levels' p50/p99/p99.9 and marks PASS when p99 ≤ target. Matching service time and journal append time are reported separately (`apply_service`, `journal_append`); durable latency must be explainable as queue wait + apply + journal append + wakeup.
+- Windows is for functional validation only (QPC granularity is about 100ns); do not claim the numeric SLOs there. The PASS/FAIL line is informational outside the Linux release/pinned/spin setup.
 
 ### Known deviations and non-goals
 
-- Ingress is std `sync_channel` (crossbeam array flavor), not a custom Disruptor ring.
-- The response slot pool removes per-command channel allocation, but the ingress channel still has a bounded array and atomic head/tail; the command itself may still allocate when constructed by the caller.
+- Ingress is std `sync_channel`, not a custom Disruptor ring.
+- The response slot pool removes per-command channel allocation, but the ingress channel still has bounded internal buffering and synchronization; the command itself may still allocate when constructed by the caller.
 - One journal thread, group commit, no replication, no `io_uring`.
 - No real-time priority, NUMA control, or isolated-core management; affinity is opt-in.
 - No market-data output stream; engine events are cleared. No read/query API through the handle.
