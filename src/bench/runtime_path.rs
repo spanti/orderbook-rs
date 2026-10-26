@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::durable::{
-    EventLog, EventSnapshotStore, FileEventLog, FileEventSnapshotStore, InMemoryEventLog,
-    InMemoryEventSnapshotStore,
+    EventLog, FileEventLog, FileSnapshotStore, InMemoryEventLog, InMemorySnapshotStore,
+    SnapshotStore,
 };
 use crate::engine::MatchingEngine;
 use crate::runtime::{
@@ -77,10 +77,7 @@ pub(crate) fn run_runtime(config: &BenchConfig) -> Result<BenchReport, BenchErro
     let wall_time_ns = duration_ns(measured_start.elapsed());
     let delta = MetricsSnapshot::read(&metrics).delta(&baseline);
 
-    // The runtime's own counter is the domain-event volume. The shadow still
-    // drives the workload, but `MatchingEngine::execute` records the legacy
-    // `EngineEvent` shape, which is not the event-sourced volume this report
-    // must show. Ticket 09 removes that legacy path.
+    // The runtime's own counter is the domain-event volume.
     let engine_events = delta.event_records;
     let trades = (shadow.trades().len() - trades_before) as u64;
     let final_depth_levels = count_depth(&shadow, &symbols);
@@ -196,10 +193,10 @@ fn create_runtime(
 ) -> Result<(EngineHandle, EngineRuntime), BenchError> {
     let runtime_config = config.runtime_config(metrics);
 
-    let (log, snapshots): (Box<dyn EventLog>, Box<dyn EventSnapshotStore>) = match config.log {
+    let (log, snapshots): (Box<dyn EventLog>, Box<dyn SnapshotStore>) = match config.log {
         LogKind::Memory => (
             Box::new(InMemoryEventLog::new()),
-            Box::new(InMemoryEventSnapshotStore::new()),
+            Box::new(InMemorySnapshotStore::new()),
         ),
         LogKind::File => {
             let dir = config
@@ -218,7 +215,7 @@ fn create_runtime(
             let log = FileEventLog::open(&log_path).map_err(|error| {
                 BenchError::Io(format!("cannot open {}: {error}", log_path.display()))
             })?;
-            let snapshots = FileEventSnapshotStore::open(&snapshot_dir).map_err(|error| {
+            let snapshots = FileSnapshotStore::open(&snapshot_dir).map_err(|error| {
                 BenchError::Io(format!(
                     "cannot open snapshot directory {}: {error}",
                     snapshot_dir.display()
@@ -343,8 +340,8 @@ fn drain_one(
         stats.send_lag.push(send_lag_ns);
     }
 
-    let outcome = shadow.execute(command);
-    record_workload(workload, &action, outcome, |id| shadow.is_open(id));
+    let events = shadow.execute(command);
+    record_workload(workload, &action, &events, |id| shadow.is_open(id));
     Ok(())
 }
 

@@ -337,8 +337,8 @@ An `EventLog` implementation must:
 - Read records back in append order.
 - Never invent, reorder, or deduplicate sequences. Sequence gaps and duplicates
   are the durable layer's concern; the adapter reports exactly what is stored.
-- Keep physical bounds private. `first_sequence`/`last_sequence` are event
-  sequences; a Kafka offset or file offset is an adapter detail.
+- Keep physical bounds private. `first_sequence`/`last_stored_sequence` are
+  event sequences; a Kafka offset or file offset is an adapter detail.
 - Preserve `command_id`; it is metadata, but consumers use it to group a
   command's events.
 

@@ -18,11 +18,6 @@ pub struct EngineSnapshot {
     pub config: EngineConfig,
     pub next_order_id: u64,
     pub next_trade_id: u64,
-    /// Next **event** sequence counter, restored so event ids continue.
-    ///
-    /// This is the engine's derived-output counter, not the durable command
-    /// boundary (see [`crate::durable::StoredSnapshot::applied_seq`]).
-    pub next_event_sequence: u64,
     /// Every book, including empty ones, sorted by symbol.
     pub books: Vec<BookState>,
     /// Every ledger record, sorted by ascending order id.
@@ -87,7 +82,6 @@ mod tests {
             config: EngineConfig::default(),
             next_order_id: 3,
             next_trade_id: 2,
-            next_event_sequence: 4,
             books: vec![BookState {
                 symbol: "BTC-USDT".to_string(),
                 bids: vec![PriceLevelState {
@@ -139,7 +133,6 @@ mod tests {
             config: EngineConfig::default(),
             next_order_id: 1,
             next_trade_id: 1,
-            next_event_sequence: 1,
             books: Vec::new(),
             ledger: Vec::new(),
             stops: Vec::new(),

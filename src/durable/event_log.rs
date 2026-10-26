@@ -1,10 +1,6 @@
 //! Event-sourced durable layer: the event log is the fact source.
 //!
-//! This module is the ticket-01 tracer for the event-sourced path. It lives
-//! beside the command-sourced [`crate::durable::DurableMatchingEngine`]; the
-//! old path keeps its own v1 log until ticket 09 retires it.
-//!
-//! [`EventSourcedEngine`] composes the pure engine decision with an
+//! [`DurableMatchingEngine`] composes the pure engine decision with an
 //! append-before-apply write path:
 //!
 //! 1. `decide` produces the command's events without mutating the engine;
@@ -17,16 +13,16 @@
 
 use std::fmt;
 
-use crate::durable::{DurableError, EventSnapshot, EventSnapshotStore, LogHeader};
+use crate::durable::{DurableError, LogHeader, SnapshotStore, StoredSnapshot};
 use crate::engine::MatchingEngine;
 use crate::event::DomainEvent;
 use crate::types::{EngineCommand, EngineConfig};
 
-/// Format version written into every event-log header and record.
+/// Format version written into every event-log header, record and snapshot.
 ///
-/// The command log keeps [`crate::durable::FORMAT_VERSION`] (1); the event log
-/// is explicitly v2 so the two formats cannot be confused.
-pub const EVENT_FORMAT_VERSION: u32 = 2;
+/// Version 1 was the retired command-log format; it is refused rather than
+/// migrated.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// One event in the durable log.
 ///
@@ -43,9 +39,8 @@ pub struct EventRecord {
 
 /// The single globally ordered, append-only event stream.
 ///
-/// Contract mirrors the command log: implementations make an appended record
-/// durable before returning, never invent or reorder sequences, and report
-/// gaps to the caller. The old command-log trait is intentionally separate.
+/// Implementations make an appended record durable before returning, never
+/// invent or reorder sequences, and report gaps to the caller.
 pub trait EventLog: Send + 'static {
     /// Read the log header, or `None` when the log has no header yet.
     fn read_header(&self) -> Result<Option<LogHeader>, DurableError>;
@@ -74,7 +69,7 @@ pub trait EventLog: Send + 'static {
     fn first_sequence(&self) -> Option<u64>;
 
     /// Last stored event sequence, cached with no IO.
-    fn last_sequence(&self) -> Option<u64>;
+    fn last_stored_sequence(&self) -> Option<u64>;
 
     /// `command_id` of the last stored record, cached with no IO.
     fn last_command_id(&self) -> Option<u64>;
@@ -112,18 +107,18 @@ impl EventCursor {
 ///
 /// The synchronous façade keeps append-before-apply: a failed append applies
 /// no event and fails the instance closed.
-pub struct EventSourcedEngine {
+pub struct DurableMatchingEngine {
     engine: MatchingEngine,
     log: Box<dyn EventLog>,
-    snapshots: Box<dyn EventSnapshotStore>,
+    snapshots: Box<dyn SnapshotStore>,
     cursor: EventCursor,
     failed: bool,
     last_snapshot_error: Option<DurableError>,
 }
 
-impl fmt::Debug for EventSourcedEngine {
+impl fmt::Debug for DurableMatchingEngine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("EventSourcedEngine")
+        f.debug_struct("DurableMatchingEngine")
             .field("cursor", &self.cursor)
             .field("failed", &self.failed)
             .field("last_snapshot_error", &self.last_snapshot_error)
@@ -137,24 +132,24 @@ impl fmt::Debug for EventSourcedEngine {
 /// Every recovery check lives here so the snapshot boundary, duplicate, gap and
 /// command-id rules cannot drift between the synchronous façade and the
 /// matching runtime. Borrows both stores and never writes.
-pub(crate) fn recover_event(
+pub(crate) fn recover(
     log: &dyn EventLog,
-    snapshots: &dyn EventSnapshotStore,
+    snapshots: &dyn SnapshotStore,
 ) -> Result<(MatchingEngine, EventCursor), DurableError> {
     let header = log.read_header()?.ok_or(DurableError::MissingHeader)?;
-    if header.format_version != EVENT_FORMAT_VERSION {
+    if header.format_version != FORMAT_VERSION {
         return Err(DurableError::UnsupportedVersion {
             found: header.format_version,
-            supported: EVENT_FORMAT_VERSION,
+            supported: FORMAT_VERSION,
         });
     }
 
     let (mut engine, mut applied_seq, mut next_command_id) = match snapshots.load_latest()? {
         Some(stored) => {
-            if stored.format_version != EVENT_FORMAT_VERSION {
+            if stored.format_version != FORMAT_VERSION {
                 return Err(DurableError::UnsupportedVersion {
                     found: stored.format_version,
-                    supported: EVENT_FORMAT_VERSION,
+                    supported: FORMAT_VERSION,
                 });
             }
             if stored.snapshot.config != header.config {
@@ -165,7 +160,7 @@ pub(crate) fn recover_event(
             }
 
             // A snapshot may never cover events the log no longer contains.
-            let log_last_seq = log.last_sequence().unwrap_or(0);
+            let log_last_seq = log.last_stored_sequence().unwrap_or(0);
             if stored.applied_seq > log_last_seq {
                 return Err(DurableError::SnapshotAhead {
                     applied_seq: stored.applied_seq,
@@ -173,8 +168,10 @@ pub(crate) fn recover_event(
                 });
             }
 
+            let mut engine = MatchingEngine::restore_snapshot(stored.snapshot);
+            engine.set_last_applied_sequence(stored.applied_seq);
             (
-                MatchingEngine::restore_snapshot(stored.snapshot),
+                engine,
                 stored.applied_seq,
                 stored.last_command_id.saturating_add(1).max(1),
             )
@@ -195,10 +192,10 @@ pub(crate) fn recover_event(
     }
 
     for record in log.read_from(expected_first)? {
-        if record.format_version != EVENT_FORMAT_VERSION {
+        if record.format_version != FORMAT_VERSION {
             return Err(DurableError::UnsupportedVersion {
                 found: record.format_version,
-                supported: EVENT_FORMAT_VERSION,
+                supported: FORMAT_VERSION,
             });
         }
 
@@ -223,7 +220,7 @@ pub(crate) fn recover_event(
 
     // A recovered writer must continue after the log's tail even when the tail
     // was all duplicates, and after the snapshot when the tail is empty.
-    let log_last = log.last_sequence();
+    let log_last = log.last_stored_sequence();
     let durable_seq = log_last.unwrap_or(applied_seq);
     let next_sequence = log_last
         .map(|last| last.saturating_add(1))
@@ -244,15 +241,15 @@ pub(crate) fn recover_event(
     ))
 }
 
-impl EventSourcedEngine {
+impl DurableMatchingEngine {
     /// Create a fresh event-sourced engine and write the v2 log header.
     pub fn create(
         config: EngineConfig,
         mut log: Box<dyn EventLog>,
-        snapshots: Box<dyn EventSnapshotStore>,
+        snapshots: Box<dyn SnapshotStore>,
     ) -> Result<Self, DurableError> {
         log.write_header(LogHeader {
-            format_version: EVENT_FORMAT_VERSION,
+            format_version: FORMAT_VERSION,
             config,
         })?;
 
@@ -273,9 +270,9 @@ impl EventSourcedEngine {
     /// non-contiguous sequence aborts recovery.
     pub fn open(
         log: Box<dyn EventLog>,
-        snapshots: Box<dyn EventSnapshotStore>,
+        snapshots: Box<dyn SnapshotStore>,
     ) -> Result<Self, DurableError> {
-        let (engine, cursor) = recover_event(log.as_ref(), snapshots.as_ref())?;
+        let (engine, cursor) = recover(log.as_ref(), snapshots.as_ref())?;
 
         Ok(Self {
             engine,
@@ -294,8 +291,8 @@ impl EventSourcedEngine {
     /// command boundary. A failure is recorded on the engine and surfaced
     /// through [`Self::last_snapshot_error`]; it never undoes a durable command.
     pub fn snapshot_now(&mut self) -> Result<(), DurableError> {
-        let stored = EventSnapshot {
-            format_version: EVENT_FORMAT_VERSION,
+        let stored = StoredSnapshot {
+            format_version: FORMAT_VERSION,
             applied_seq: self.cursor.applied_seq,
             last_command_id: self.cursor.next_command_id.saturating_sub(1),
             snapshot: self.engine.capture_snapshot(),
@@ -340,7 +337,7 @@ impl EventSourcedEngine {
             .iter()
             .enumerate()
             .map(|(offset, event)| EventRecord {
-                format_version: EVENT_FORMAT_VERSION,
+                format_version: FORMAT_VERSION,
                 sequence: first_sequence.saturating_add(offset as u64),
                 command_id,
                 event: event.clone(),
@@ -353,15 +350,15 @@ impl EventSourcedEngine {
             return Err(error);
         }
 
-        let mut last_sequence = self.cursor.applied_seq;
+        let mut last_applied = self.cursor.applied_seq;
         for record in &records {
             self.engine.apply(&record.event, record.sequence);
-            last_sequence = record.sequence;
+            last_applied = record.sequence;
         }
 
-        self.cursor.applied_seq = last_sequence;
-        self.cursor.durable_seq = last_sequence;
-        self.cursor.next_sequence = last_sequence.saturating_add(1);
+        self.cursor.applied_seq = last_applied;
+        self.cursor.durable_seq = last_applied;
+        self.cursor.next_sequence = last_applied.saturating_add(1);
         self.cursor.next_command_id = command_id.saturating_add(1);
         Ok(events)
     }

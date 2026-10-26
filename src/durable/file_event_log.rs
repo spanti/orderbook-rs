@@ -17,7 +17,7 @@
 //! event log; there is no migration path.
 //!
 //! Parsed records are cached, so [`EventLog::read_from`],
-//! [`EventLog::first_sequence`], [`EventLog::last_sequence`] and
+//! [`EventLog::first_sequence`], [`EventLog::last_stored_sequence`] and
 //! [`EventLog::last_command_id`] need no IO.
 
 use std::fmt;
@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
 
-use crate::durable::event_log::{EVENT_FORMAT_VERSION, EventLog, EventRecord};
+use crate::durable::event_log::{EventLog, EventRecord, FORMAT_VERSION};
 use crate::durable::framing::{decode_line, encode_line};
 use crate::durable::{DurableError, LogHeader};
 
@@ -143,10 +143,10 @@ impl EventLog for FileEventLog {
     }
 
     fn write_header(&mut self, header: LogHeader) -> Result<(), DurableError> {
-        if header.format_version != EVENT_FORMAT_VERSION {
+        if header.format_version != FORMAT_VERSION {
             return Err(DurableError::UnsupportedVersion {
                 found: header.format_version,
-                supported: EVENT_FORMAT_VERSION,
+                supported: FORMAT_VERSION,
             });
         }
         if self.header.is_some() {
@@ -241,7 +241,7 @@ impl EventLog for FileEventLog {
                 ))
             })?;
 
-        // Cache only after durability: `last_sequence` must never advertise a
+        // Cache only after durability: `last_stored_sequence` must never advertise a
         // record a crash could lose.
         self.records.extend(records);
         Ok(())
@@ -260,7 +260,7 @@ impl EventLog for FileEventLog {
         self.records.first().map(|record| record.sequence)
     }
 
-    fn last_sequence(&self) -> Option<u64> {
+    fn last_stored_sequence(&self) -> Option<u64> {
         self.records.last().map(|record| record.sequence)
     }
 
@@ -270,10 +270,10 @@ impl EventLog for FileEventLog {
 }
 
 fn check_record_version(record: &EventRecord) -> Result<(), DurableError> {
-    if record.format_version != EVENT_FORMAT_VERSION {
+    if record.format_version != FORMAT_VERSION {
         return Err(DurableError::UnsupportedVersion {
             found: record.format_version,
-            supported: EVENT_FORMAT_VERSION,
+            supported: FORMAT_VERSION,
         });
     }
     Ok(())
@@ -343,10 +343,10 @@ fn decode_versioned<T: DeserializeOwned>(line: &str, context: &str) -> Result<T,
     let found = u32::try_from(found).map_err(|_| DurableError::CorruptRecord {
         detail: format!("{context}: format_version is out of range"),
     })?;
-    if found != EVENT_FORMAT_VERSION {
+    if found != FORMAT_VERSION {
         return Err(DurableError::UnsupportedVersion {
             found,
-            supported: EVENT_FORMAT_VERSION,
+            supported: FORMAT_VERSION,
         });
     }
 

@@ -2,15 +2,13 @@
 //!
 //! These tests exercise the event-sourced path only through public seams: the
 //! pure `decide`, the sole state-write entry `apply`, and the append-before-
-//! apply `EventSourcedEngine`. Expected event streams and state are literals
+//! apply `DurableMatchingEngine`. Expected event streams and state are literals
 //! derived from the ticket and the event catalog, never recomputed by the code
 //! under test.
 
 use std::collections::HashMap;
 
-use orderbook_rs::durable::{
-    EventSourcedEngine, InMemoryEventLog, InMemoryEventSnapshotStore,
-};
+use orderbook_rs::durable::{DurableMatchingEngine, InMemoryEventLog, InMemorySnapshotStore};
 use orderbook_rs::engine::MatchingEngine;
 use orderbook_rs::event::{DomainEvent, OrderCancelReason};
 use orderbook_rs::snapshot::EngineSnapshot;
@@ -324,13 +322,17 @@ fn submitting_a_stop_emits_stop_placed_and_apply_registers_a_pending_record() {
 
     let events = engine.decide(&command);
 
-    assert_eq!(events, vec![stop_placed(1, &request)], "one StopPlaced event");
+    assert_eq!(
+        events,
+        vec![stop_placed(1, &request)],
+        "one StopPlaced event"
+    );
 
     // Purity: deciding twice allocates the same local id and mutates nothing.
     assert_eq!(engine.decide(&command), events);
     assert_eq!(engine.order_count(), 0);
     assert!(engine.stop_order(1).is_none());
-    assert_eq!(engine.last_sequence(), 0);
+    assert_eq!(engine.last_applied_sequence(), 0);
 
     apply_all(&mut engine, &events);
 
@@ -365,10 +367,10 @@ fn a_rejected_stop_emits_one_order_rejected_and_allocates_no_id() {
     assert_eq!(engine.order_count(), 2, "only the two seed trades");
 
     let log = InMemoryEventLog::new();
-    let mut durable = EventSourcedEngine::create(
+    let mut durable = DurableMatchingEngine::create(
         EngineConfig::default(),
         Box::new(log.handle()),
-        Box::new(InMemoryEventSnapshotStore::new()),
+        Box::new(InMemorySnapshotStore::new()),
     )
     .expect("fresh event log");
     // The durable engine starts empty, so use an invalid stop there.
@@ -574,14 +576,30 @@ fn cascading_triggers_emit_in_trigger_order() {
                 trade: trade(2, 5, 7, 95, 1, Side::Ask, 7),
             },
             stop_triggered(
-                converted(first, Side::Ask, 0, 1, 7, OrderType::Market, TimeInForce::IOC),
+                converted(
+                    first,
+                    Side::Ask,
+                    0,
+                    1,
+                    7,
+                    OrderType::Market,
+                    TimeInForce::IOC
+                ),
                 95
             ),
             DomainEvent::TradeExecuted {
                 trade: trade(3, 6, first, 93, 1, Side::Ask, 7),
             },
             stop_triggered(
-                converted(second, Side::Ask, 0, 1, 7, OrderType::Market, TimeInForce::IOC),
+                converted(
+                    second,
+                    Side::Ask,
+                    0,
+                    1,
+                    7,
+                    OrderType::Market,
+                    TimeInForce::IOC
+                ),
                 93
             ),
             DomainEvent::TradeExecuted {
@@ -593,7 +611,10 @@ fn cascading_triggers_emit_in_trigger_order() {
 
     assert_eq!(engine.last_trade_price(BTC), Some(93));
     assert!(engine.stop_orders(BTC, Side::Ask).is_empty());
-    assert_eq!(engine.order_record(first).unwrap().status, OrderStatus::Filled);
+    assert_eq!(
+        engine.order_record(first).unwrap().status,
+        OrderStatus::Filled
+    );
     assert_eq!(
         engine.order_record(second).unwrap().status,
         OrderStatus::Filled
@@ -624,7 +645,11 @@ fn triggered_limit_stop_rests_behind_existing_orders_at_the_level() {
         .find(|level| level.price == 104)
         .expect("level 104 exists");
     assert_eq!(
-        level.orders.iter().map(|order| order.id).collect::<Vec<_>>(),
+        level
+            .orders
+            .iter()
+            .map(|order| order.id)
+            .collect::<Vec<_>>(),
         vec![existing, stop],
         "the activated stop joins the back of the level"
     );
@@ -632,12 +657,10 @@ fn triggered_limit_stop_rests_behind_existing_orders_at_the_level() {
     // A sell into the level fills the older order first.
     let events = run(&mut engine, &submit(BTC, limit(Side::Ask, 104, 1, 7)));
     assert_eq!(
-        events
-            .iter()
-            .find_map(|event| match event {
-                DomainEvent::TradeExecuted { trade } => Some(trade.maker_order_id),
-                _ => None,
-            }),
+        events.iter().find_map(|event| match event {
+            DomainEvent::TradeExecuted { trade } => Some(trade.maker_order_id),
+            _ => None,
+        }),
         Some(existing)
     );
 }
@@ -650,7 +673,7 @@ fn decide_is_pure_for_stop_submit_and_triggering_submits() {
     rest(&mut engine, limit(Side::Bid, 95, 5, 4));
 
     let before = engine.capture_snapshot();
-    let sequence_before = engine.last_sequence();
+    let sequence_before = engine.last_applied_sequence();
 
     let stop_command = submit_stop(BTC, stop_limit(Side::Bid, 110, 109, 2, 5));
     let triggering = submit(BTC, limit(Side::Ask, 95, 1, 6));
@@ -668,7 +691,7 @@ fn decide_is_pure_for_stop_submit_and_triggering_submits() {
         before,
         "neither stop submission nor a cascade decision mutates state"
     );
-    assert_eq!(engine.last_sequence(), sequence_before);
+    assert_eq!(engine.last_applied_sequence(), sequence_before);
     assert_eq!(engine.last_trade_price(BTC), Some(100));
 }
 
@@ -781,38 +804,34 @@ fn every_prefix_is_valid_and_replay_equals_live_execution() {
         live_events.extend(events);
     }
 
-    // The live event-sourced state matches the old command path's decision
-    // state for the same commands.
-    let mut old = MatchingEngine::new(EngineConfig::default());
+    // The execute convenience must match the explicit decide/apply fold.
+    let mut convenience = MatchingEngine::new(EngineConfig::default());
     for command in &commands {
-        let _ = old.execute(command.clone());
+        let _ = convenience.execute(command.clone());
     }
     let live_snapshot = live.capture_snapshot();
-    let old_snapshot = old.capture_snapshot();
-    assert_eq!(live_snapshot.books, old_snapshot.books);
-    assert_eq!(live_snapshot.ledger, old_snapshot.ledger);
-    assert_eq!(live_snapshot.stops, old_snapshot.stops);
-    assert_eq!(live_snapshot.trades, old_snapshot.trades);
-    assert_eq!(live_snapshot.last_trades, old_snapshot.last_trades);
-    assert_eq!(live_snapshot.next_order_id, old_snapshot.next_order_id);
-    assert_eq!(live_snapshot.next_trade_id, old_snapshot.next_trade_id);
+    assert_eq!(
+        live_snapshot,
+        convenience.capture_snapshot(),
+        "decide/apply and the execute convenience must reach the same state"
+    );
 
     // Replay the same events from an empty engine through the durable seam.
     let log = InMemoryEventLog::new();
     {
-        let mut durable = EventSourcedEngine::create(
+        let mut durable = DurableMatchingEngine::create(
             EngineConfig::default(),
             Box::new(log.handle()),
-            Box::new(InMemoryEventSnapshotStore::new()),
+            Box::new(InMemorySnapshotStore::new()),
         )
         .expect("fresh event log");
         for command in &commands {
             durable.execute(command.clone()).expect("supported command");
         }
     }
-    let reopened = EventSourcedEngine::open(
+    let reopened = DurableMatchingEngine::open(
         Box::new(log.handle()),
-        Box::new(InMemoryEventSnapshotStore::new()),
+        Box::new(InMemorySnapshotStore::new()),
     )
     .expect("replay");
 
@@ -853,7 +872,10 @@ fn every_prefix_is_valid_and_replay_equals_live_execution() {
             first_by_command.push(record.command_id);
         }
     }
-    assert_eq!(first_by_command, (1..=commands.len() as u64).collect::<Vec<_>>());
+    assert_eq!(
+        first_by_command,
+        (1..=commands.len() as u64).collect::<Vec<_>>()
+    );
 
     // Counters continue after replay: the next stop gets the next order id.
     let mut reopened = reopened;

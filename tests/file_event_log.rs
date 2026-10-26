@@ -14,8 +14,7 @@ use std::io::Write;
 use std::path::Path;
 
 use orderbook_rs::durable::{
-    DurableError, EVENT_FORMAT_VERSION, EventLog, EventRecord, FileEventLog, InMemoryEventLog,
-    LogHeader,
+    DurableError, EventLog, EventRecord, FORMAT_VERSION, FileEventLog, InMemoryEventLog, LogHeader,
 };
 use orderbook_rs::event::DomainEvent;
 use orderbook_rs::types::{EngineConfig, Order, OrderType, Side, TimeInForce};
@@ -29,7 +28,7 @@ const BTC: &str = "BTC-USDT";
 
 fn header() -> LogHeader {
     LogHeader {
-        format_version: EVENT_FORMAT_VERSION,
+        format_version: FORMAT_VERSION,
         config: EngineConfig::default(),
     }
 }
@@ -63,7 +62,7 @@ fn record(sequence: u64) -> EventRecord {
         }
     };
     EventRecord {
-        format_version: EVENT_FORMAT_VERSION,
+        format_version: FORMAT_VERSION,
         sequence,
         command_id: order_id,
         event,
@@ -93,7 +92,7 @@ fn contract_append_requires_a_header(log: &mut dyn EventLog) {
 fn contract_append_and_bounds(log: &mut dyn EventLog) {
     log.write_header(header()).unwrap();
     assert_eq!(log.first_sequence(), None);
-    assert_eq!(log.last_sequence(), None);
+    assert_eq!(log.last_stored_sequence(), None);
     assert_eq!(log.last_command_id(), None);
 
     for sequence in 1..=4 {
@@ -101,7 +100,7 @@ fn contract_append_and_bounds(log: &mut dyn EventLog) {
     }
 
     assert_eq!(log.first_sequence(), Some(1));
-    assert_eq!(log.last_sequence(), Some(4));
+    assert_eq!(log.last_stored_sequence(), Some(4));
     assert_eq!(log.last_command_id(), Some(2));
     assert_eq!(
         log.read_from(1).unwrap(),
@@ -142,7 +141,7 @@ fn contract_non_contiguous_append_is_rejected(log: &mut dyn EventLog) {
         })
     );
     log.append(record(2)).unwrap();
-    assert_eq!(log.last_sequence(), Some(2));
+    assert_eq!(log.last_stored_sequence(), Some(2));
 }
 
 fn contract_batch_append(log: &mut dyn EventLog) {
@@ -153,7 +152,7 @@ fn contract_batch_append(log: &mut dyn EventLog) {
         log.read_from(1).unwrap(),
         (1..=4).map(record).collect::<Vec<_>>()
     );
-    assert_eq!(log.last_sequence(), Some(4));
+    assert_eq!(log.last_stored_sequence(), Some(4));
     assert_eq!(log.last_command_id(), Some(2));
 }
 
@@ -279,7 +278,7 @@ fn open_creates_an_empty_log_without_a_header() {
     assert!(path.exists(), "open must create the file when it is absent");
     assert_eq!(log.read_header().unwrap(), None);
     assert_eq!(log.first_sequence(), None);
-    assert_eq!(log.last_sequence(), None);
+    assert_eq!(log.last_stored_sequence(), None);
     assert_eq!(log.last_command_id(), None);
 }
 
@@ -293,7 +292,7 @@ fn acknowledged_records_are_read_back_in_order_after_reopen() {
     let reopened = FileEventLog::open(&path).unwrap();
 
     assert_eq!(reopened.first_sequence(), Some(1));
-    assert_eq!(reopened.last_sequence(), Some(5));
+    assert_eq!(reopened.last_stored_sequence(), Some(5));
     assert_eq!(reopened.last_command_id(), Some(3));
     assert_eq!(reopened.read_from(1).unwrap(), expected);
     assert_eq!(reopened.read_from(4).unwrap(), vec![record(4), record(5)]);
@@ -311,7 +310,7 @@ fn a_contiguous_batch_is_durable_and_readable_after_reopen() {
     log.append_batch(batch.clone()).unwrap();
 
     assert_eq!(log.first_sequence(), Some(1));
-    assert_eq!(log.last_sequence(), Some(4));
+    assert_eq!(log.last_stored_sequence(), Some(4));
     assert_eq!(log.read_from(1).unwrap(), batch);
 
     // A crash is a drop and reopen; the batch must be on disk, not just cached.
@@ -350,7 +349,7 @@ fn a_non_contiguous_batch_is_rejected_before_anything_is_written() {
         bytes_before,
         "a rejected batch must not write any line"
     );
-    assert_eq!(log.last_sequence(), Some(1));
+    assert_eq!(log.last_stored_sequence(), Some(1));
 }
 
 #[test]
@@ -371,7 +370,7 @@ fn a_partial_trailing_line_is_truncated_on_open() {
     let mut reopened = FileEventLog::open(&path).unwrap();
 
     assert_eq!(reopened.first_sequence(), Some(1));
-    assert_eq!(reopened.last_sequence(), Some(2));
+    assert_eq!(reopened.last_stored_sequence(), Some(2));
     assert_eq!(reopened.read_from(1).unwrap(), vec![record(1), record(2)]);
     assert_eq!(
         fs::metadata(&path).unwrap().len(),
@@ -381,7 +380,7 @@ fn a_partial_trailing_line_is_truncated_on_open() {
 
     // The truncated log still accepts the next contiguous record.
     reopened.append(record(3)).unwrap();
-    assert_eq!(reopened.last_sequence(), Some(3));
+    assert_eq!(reopened.last_stored_sequence(), Some(3));
 }
 
 #[test]
@@ -480,7 +479,7 @@ fn a_v1_header_is_refused_with_an_unsupported_version_error() {
         FileEventLog::open(&path).unwrap_err(),
         DurableError::UnsupportedVersion {
             found: 1,
-            supported: EVENT_FORMAT_VERSION,
+            supported: FORMAT_VERSION,
         }
     );
 }
@@ -503,7 +502,7 @@ fn a_v1_record_is_refused_with_an_unsupported_version_error() {
         FileEventLog::open(&path).unwrap_err(),
         DurableError::UnsupportedVersion {
             found: 1,
-            supported: EVENT_FORMAT_VERSION,
+            supported: FORMAT_VERSION,
         }
     );
 }
@@ -521,7 +520,7 @@ fn a_v1_header_cannot_be_written_and_a_v1_record_cannot_be_appended() {
         }),
         Err(DurableError::UnsupportedVersion {
             found: 1,
-            supported: EVENT_FORMAT_VERSION,
+            supported: FORMAT_VERSION,
         })
     );
 
@@ -532,10 +531,10 @@ fn a_v1_header_cannot_be_written_and_a_v1_record_cannot_be_appended() {
         log.append(v1),
         Err(DurableError::UnsupportedVersion {
             found: 1,
-            supported: EVENT_FORMAT_VERSION,
+            supported: FORMAT_VERSION,
         })
     );
-    assert_eq!(log.last_sequence(), None);
+    assert_eq!(log.last_stored_sequence(), None);
 }
 
 #[test]

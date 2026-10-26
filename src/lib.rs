@@ -13,3 +13,10 @@ mod stop_book;
 pub mod types;
 
 pub use bus::{BusError, EVENTS_TOPIC, InProcessBus, MessageBus};
+pub use durable::{
+    DurableMatchingEngine, EventCursor, EventLog, EventRecord, FORMAT_VERSION, FileEventLog,
+    FileSnapshotStore, InMemoryEventLog, InMemorySnapshotStore, SnapshotStore, StoredSnapshot,
+};
+pub use engine::MatchingEngine;
+pub use event::{DomainEvent, OrderCancelReason};
+pub use types::EngineCommand;

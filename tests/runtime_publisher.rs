@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use orderbook_rs::bus::{EVENTS_TOPIC, InProcessBus, MessageBus};
 use orderbook_rs::durable::{
-    DurableError, EventLog, EventRecord, EventSourcedEngine, InMemoryEventLog,
-    InMemoryEventSnapshotStore, LogHeader,
+    DurableError, DurableMatchingEngine, EventLog, EventRecord, InMemoryEventLog,
+    InMemorySnapshotStore, LogHeader,
 };
 use orderbook_rs::runtime::{EngineRuntime, RuntimeConfig};
 use orderbook_rs::types::{
@@ -99,7 +99,7 @@ fn subscribers_receive_durable_events_in_sequence_order() {
         RuntimeConfig::default(),
         EngineConfig::default(),
         Box::new(InMemoryEventLog::new()),
-        Box::new(InMemoryEventSnapshotStore::new()),
+        Box::new(InMemorySnapshotStore::new()),
         Arc::clone(&bus) as Arc<dyn MessageBus>,
     )
     .expect("create a runtime with a bus");
@@ -133,7 +133,7 @@ fn every_handler_on_the_events_endpoint_receives_every_event() {
         RuntimeConfig::default(),
         EngineConfig::default(),
         Box::new(InMemoryEventLog::new()),
-        Box::new(InMemoryEventSnapshotStore::new()),
+        Box::new(InMemorySnapshotStore::new()),
         Arc::clone(&bus) as Arc<dyn MessageBus>,
     )
     .expect("create");
@@ -197,8 +197,8 @@ impl EventLog for BlockingLog {
         self.inner.first_sequence()
     }
 
-    fn last_sequence(&self) -> Option<u64> {
-        self.inner.last_sequence()
+    fn last_stored_sequence(&self) -> Option<u64> {
+        self.inner.last_stored_sequence()
     }
 
     fn last_command_id(&self) -> Option<u64> {
@@ -247,7 +247,7 @@ fn only_events_at_or_below_the_durable_watermark_are_published() {
         config,
         EngineConfig::default(),
         Box::new(blocking),
-        Box::new(InMemoryEventSnapshotStore::new()),
+        Box::new(InMemorySnapshotStore::new()),
         Arc::clone(&bus) as Arc<dyn MessageBus>,
     )
     .expect("create");
@@ -276,10 +276,10 @@ fn only_events_at_or_below_the_durable_watermark_are_published() {
 fn the_publisher_starts_at_the_recovered_watermark_and_does_not_replay_history() {
     let log = InMemoryEventLog::new();
     {
-        let mut seeded = EventSourcedEngine::create(
+        let mut seeded = DurableMatchingEngine::create(
             EngineConfig::default(),
             Box::new(log.handle()),
-            Box::new(InMemoryEventSnapshotStore::new()),
+            Box::new(InMemorySnapshotStore::new()),
         )
         .expect("seed the event log");
         for timestamp in 1..=3 {
@@ -288,7 +288,7 @@ fn the_publisher_starts_at_the_recovered_watermark_and_does_not_replay_history()
                 .expect("append-before-apply seed");
         }
     }
-    assert_eq!(log.last_sequence(), Some(6));
+    assert_eq!(log.last_stored_sequence(), Some(6));
 
     let bus = Arc::new(InProcessBus::new());
     let recorder = Recorder::default();
@@ -298,7 +298,7 @@ fn the_publisher_starts_at_the_recovered_watermark_and_does_not_replay_history()
     let (handle, runtime) = EngineRuntime::open_with_bus(
         RuntimeConfig::default(),
         Box::new(log.handle()),
-        Box::new(InMemoryEventSnapshotStore::new()),
+        Box::new(InMemorySnapshotStore::new()),
         Arc::clone(&bus) as Arc<dyn MessageBus>,
     )
     .expect("recover from the seeded log");
@@ -348,7 +348,7 @@ fn a_consumer_that_missed_publications_catches_up_from_the_event_log() {
         RuntimeConfig::default(),
         EngineConfig::default(),
         Box::new(log.handle()),
-        Box::new(InMemoryEventSnapshotStore::new()),
+        Box::new(InMemorySnapshotStore::new()),
         Arc::clone(&bus) as Arc<dyn MessageBus>,
     )
     .expect("create");
@@ -458,7 +458,7 @@ fn a_slow_handler_delays_publication_but_not_the_matching_thread() {
         config,
         EngineConfig::default(),
         Box::new(InMemoryEventLog::new()),
-        Box::new(InMemoryEventSnapshotStore::new()),
+        Box::new(InMemorySnapshotStore::new()),
         Arc::clone(&bus) as Arc<dyn MessageBus>,
     )
     .expect("create");

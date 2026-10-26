@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use orderbook_rs::bus::{BusError, EVENTS_TOPIC, InProcessBus, MessageBus};
-use orderbook_rs::durable::{EVENT_FORMAT_VERSION, EventRecord};
+use orderbook_rs::durable::{EventRecord, FORMAT_VERSION};
 use orderbook_rs::event::DomainEvent;
 use orderbook_rs::types::{EngineCommand, EngineError};
 
@@ -21,7 +21,7 @@ struct Message {
 
 fn event_record(sequence: u64) -> EventRecord {
     EventRecord {
-        format_version: EVENT_FORMAT_VERSION,
+        format_version: FORMAT_VERSION,
         sequence,
         command_id: sequence,
         event: DomainEvent::OrderRejected {

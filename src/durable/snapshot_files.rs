@@ -1,12 +1,9 @@
-//! Shared implementation of the file-backed snapshot stores.
+//! Shared implementation of the file-backed snapshot store.
 //!
-//! Both the command-sourced [`StoredSnapshot`](crate::durable::StoredSnapshot)
-//! and the event-sourced [`EventSnapshot`](crate::durable::EventSnapshot)
-//! stores use the same on-disk layout: one file per snapshot named
-//! `snapshot-{applied_seq:020}.json`, containing a single
+//! [`StoredSnapshot`](crate::durable::StoredSnapshot) is written with one file
+//! per snapshot named `snapshot-{applied_seq:020}.json`, containing a single
 //! `{crc32:08x} {json}\n` line. This module owns the directory scanning,
-//! atomic replace, retention and corruption fallback so the two adapters cannot
-//! drift while ticket 09 unifies the record types.
+//! atomic replace, retention and corruption fallback.
 //!
 //! Saving writes a temporary file in the same directory, flushes and fsyncs it,
 //! renames it over the target, best-effort fsyncs the directory, and only then

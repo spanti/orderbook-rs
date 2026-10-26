@@ -2,11 +2,11 @@
 //!
 //! These tests exercise the new path only through public seams: the pure
 //! `decide`, the sole state-write entry `apply`, and the append-before-apply
-//! `EventSourcedEngine`. The existing command-sourced path keeps its own tests.
+//! `DurableMatchingEngine`. The existing command-sourced path keeps its own tests.
 
 use orderbook_rs::durable::{
-    DurableError, EVENT_FORMAT_VERSION, EventLog, EventRecord, EventSourcedEngine,
-    InMemoryEventLog, InMemoryEventSnapshotStore, LogHeader,
+    DurableError, DurableMatchingEngine, EventLog, EventRecord, FORMAT_VERSION, InMemoryEventLog,
+    InMemorySnapshotStore, LogHeader,
 };
 use orderbook_rs::engine::MatchingEngine;
 use orderbook_rs::event::DomainEvent;
@@ -103,7 +103,7 @@ fn decide_returns_accepted_then_rested_for_a_non_crossing_limit_submit() {
     }
 
     // `decide` is pure: no book, ledger, counter or sequence mutation.
-    assert_eq!(engine.last_sequence(), 0);
+    assert_eq!(engine.last_applied_sequence(), 0);
     assert_eq!(engine.order_count(), 0);
     assert!(engine.book(BTC).is_none());
 }
@@ -145,7 +145,7 @@ fn applying_either_prefix_of_the_decision_leaves_a_valid_engine_state() {
 
     // Prefix 2: OrderRested inserts the order and advances the applied sequence.
     engine.apply(&events[1], 2);
-    assert_eq!(engine.last_sequence(), 2);
+    assert_eq!(engine.last_applied_sequence(), 2);
     let snapshot = engine.snapshot(BTC, 10).expect("book exists after rest");
     assert_eq!(
         snapshot.sequence, 2,
@@ -186,12 +186,12 @@ fn decide_allocates_the_order_id_without_mutating_counters() {
 #[test]
 fn event_records_carry_format_version_contiguous_sequence_and_one_command_id() {
     let log = InMemoryEventLog::new();
-    let mut engine = EventSourcedEngine::create(
+    let mut engine = DurableMatchingEngine::create(
         EngineConfig::default(),
         Box::new(log.handle()),
-        Box::new(InMemoryEventSnapshotStore::new()),
+        Box::new(InMemorySnapshotStore::new()),
     )
-        .expect("fresh event log");
+    .expect("fresh event log");
 
     engine
         .execute(submit(BTC, limit(Side::Bid, 99, 5, 1)))
@@ -207,10 +207,10 @@ fn event_records_carry_format_version_contiguous_sequence_and_one_command_id() {
     assert!(
         history
             .iter()
-            .all(|record| record.format_version == EVENT_FORMAT_VERSION)
+            .all(|record| record.format_version == FORMAT_VERSION)
     );
     assert_eq!(
-        EVENT_FORMAT_VERSION, 2,
+        FORMAT_VERSION, 2,
         "the event format is distinct from command v1"
     );
 
@@ -227,13 +227,12 @@ fn event_records_carry_format_version_contiguous_sequence_and_one_command_id() {
 fn reopening_from_the_in_memory_event_log_reproduces_decision_state() {
     let log = InMemoryEventLog::new();
     let expected = {
-        let mut engine =
-            EventSourcedEngine::create(
-        EngineConfig::default(),
-        Box::new(log.handle()),
-        Box::new(InMemoryEventSnapshotStore::new()),
-    )
-                .expect("fresh event log");
+        let mut engine = DurableMatchingEngine::create(
+            EngineConfig::default(),
+            Box::new(log.handle()),
+            Box::new(InMemorySnapshotStore::new()),
+        )
+        .expect("fresh event log");
         // Same price level on BTC proves FIFO priority survives; ETH proves
         // per-symbol isolation survives.
         engine
@@ -248,11 +247,11 @@ fn reopening_from_the_in_memory_event_log_reproduces_decision_state() {
         engine.engine().capture_snapshot()
     };
 
-    let mut reopened = EventSourcedEngine::open(
+    let mut reopened = DurableMatchingEngine::open(
         Box::new(log.handle()),
-        Box::new(InMemoryEventSnapshotStore::new()),
+        Box::new(InMemorySnapshotStore::new()),
     )
-        .expect("recovery folds the event log alone");
+    .expect("recovery folds the event log alone");
 
     assert_eq!(reopened.engine().capture_snapshot(), expected);
     assert_eq!(reopened.applied_seq(), 6);
@@ -338,8 +337,8 @@ impl EventLog for FailingEventLog {
         self.inner.first_sequence()
     }
 
-    fn last_sequence(&self) -> Option<u64> {
-        self.inner.last_sequence()
+    fn last_stored_sequence(&self) -> Option<u64> {
+        self.inner.last_stored_sequence()
     }
 
     fn last_command_id(&self) -> Option<u64> {
@@ -350,10 +349,10 @@ impl EventLog for FailingEventLog {
 #[test]
 fn a_failed_append_applies_nothing_and_fails_the_instance_closed() {
     let log = InMemoryEventLog::new();
-    let mut engine = EventSourcedEngine::create(
+    let mut engine = DurableMatchingEngine::create(
         EngineConfig::default(),
         Box::new(FailingEventLog::new(log.handle())),
-        Box::new(InMemoryEventSnapshotStore::new()),
+        Box::new(InMemorySnapshotStore::new()),
     )
     .expect("header write succeeds");
 
@@ -363,7 +362,7 @@ fn a_failed_append_applies_nothing_and_fails_the_instance_closed() {
     assert!(matches!(error, DurableError::AppendFailed(_)));
 
     // Append-before-apply: nothing reached the engine.
-    assert_eq!(engine.engine().last_sequence(), 0);
+    assert_eq!(engine.engine().last_applied_sequence(), 0);
     assert_eq!(engine.engine().order_count(), 0);
     assert!(engine.engine().book(BTC).is_none());
     assert_eq!(engine.applied_seq(), 0);
@@ -375,18 +374,18 @@ fn a_failed_append_applies_nothing_and_fails_the_instance_closed() {
         .execute(submit(BTC, limit(Side::Bid, 98, 1, 2)))
         .expect_err("a failed instance is closed");
     assert!(matches!(error, DurableError::EngineFailed));
-    assert_eq!(engine.engine().last_sequence(), 0);
+    assert_eq!(engine.engine().last_applied_sequence(), 0);
 }
 
 #[test]
 fn rejected_commands_are_journaled_as_events_and_change_no_state() {
     let log = InMemoryEventLog::new();
-    let mut engine = EventSourcedEngine::create(
+    let mut engine = DurableMatchingEngine::create(
         EngineConfig::default(),
         Box::new(log.handle()),
-        Box::new(InMemoryEventSnapshotStore::new()),
+        Box::new(InMemorySnapshotStore::new()),
     )
-        .expect("fresh event log");
+    .expect("fresh event log");
 
     let modify = EngineCommand::ModifyOrder {
         symbol: BTC.to_string(),

@@ -1,7 +1,7 @@
 //! Contract, retention, framing and corruption-fallback tests for the
 //! event-sequence snapshot stores.
 //!
-//! [`EventSnapshot`] is tagged with the last applied **event** sequence and the
+//! [`StoredSnapshot`] is tagged with the last applied **event** sequence and the
 //! last `command_id`, not with a command sequence. Both the in-memory and file
 //! adapters keep the two newest complete snapshots so a corrupt newest file can
 //! fall back to the previous one. A version-mismatched snapshot is deliberately
@@ -11,8 +11,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use orderbook_rs::durable::{
-    DurableError, EVENT_FORMAT_VERSION, EventSnapshot, EventSnapshotStore, FileEventSnapshotStore,
-    InMemoryEventSnapshotStore, StoredSnapshot,
+    DurableError, FORMAT_VERSION, FileSnapshotStore, InMemorySnapshotStore, SnapshotStore,
+    StoredSnapshot,
 };
 use orderbook_rs::engine::MatchingEngine;
 use orderbook_rs::types::EngineConfig;
@@ -22,9 +22,9 @@ use tempfile::tempdir;
 // Fixtures and file helpers
 // ---------------------------------------------------------------------------
 
-fn snapshot_at(applied_seq: u64, last_command_id: u64) -> EventSnapshot {
-    EventSnapshot {
-        format_version: EVENT_FORMAT_VERSION,
+fn snapshot_at(applied_seq: u64, last_command_id: u64) -> StoredSnapshot {
+    StoredSnapshot {
+        format_version: FORMAT_VERSION,
         applied_seq,
         last_command_id,
         snapshot: MatchingEngine::new(EngineConfig::default()).capture_snapshot(),
@@ -66,7 +66,7 @@ fn snapshot_sequences(dir: &Path) -> Vec<u64> {
 
 /// Place a valid snapshot file without going through the store's floor/prune
 /// logic, simulating a file left by an earlier run.
-fn write_snapshot_file(dir: &Path, snapshot: &EventSnapshot) {
+fn write_snapshot_file(dir: &Path, snapshot: &StoredSnapshot) {
     let json = serde_json::to_vec(snapshot).unwrap();
     fs::write(snapshot_path(dir, snapshot.applied_seq), encode_line(&json)).unwrap();
 }
@@ -87,7 +87,7 @@ fn truncate_file(path: &Path) {
 // Store contract: round trip, retention, floor
 // ---------------------------------------------------------------------------
 
-fn contract_round_trip_and_retention(store: &mut dyn EventSnapshotStore) {
+fn contract_round_trip_and_retention(store: &mut dyn SnapshotStore) {
     assert!(store.load_latest().unwrap().is_none());
     assert!(store.load_previous().unwrap().is_none());
 
@@ -107,14 +107,14 @@ fn contract_round_trip_and_retention(store: &mut dyn EventSnapshotStore) {
 
 #[test]
 fn the_in_memory_store_round_trips_and_keeps_two_snapshots() {
-    contract_round_trip_and_retention(&mut InMemoryEventSnapshotStore::new());
+    contract_round_trip_and_retention(&mut InMemorySnapshotStore::new());
 }
 
 #[test]
 fn the_file_store_round_trips_and_keeps_two_snapshots() {
     let dir = tempdir().unwrap();
     let store_dir = dir.path().join("snapshots");
-    let mut store = FileEventSnapshotStore::open(&store_dir).unwrap();
+    let mut store = FileSnapshotStore::open(&store_dir).unwrap();
 
     contract_round_trip_and_retention(&mut store);
     assert_eq!(
@@ -125,7 +125,7 @@ fn the_file_store_round_trips_and_keeps_two_snapshots() {
     assert_eq!(store.dir(), store_dir.as_path());
 }
 
-fn contract_refuses_below_floor(store: &mut dyn EventSnapshotStore) {
+fn contract_refuses_below_floor(store: &mut dyn SnapshotStore) {
     store.save(snapshot_at(5, 2)).unwrap();
     store.save(snapshot_at(6, 3)).unwrap();
     assert_eq!(
@@ -144,10 +144,10 @@ fn contract_refuses_below_floor(store: &mut dyn EventSnapshotStore) {
 
 #[test]
 fn both_stores_refuse_a_snapshot_below_the_floor() {
-    contract_refuses_below_floor(&mut InMemoryEventSnapshotStore::new());
+    contract_refuses_below_floor(&mut InMemorySnapshotStore::new());
 
     let dir = tempdir().unwrap();
-    let mut store = FileEventSnapshotStore::open(dir.path().join("snapshots")).unwrap();
+    let mut store = FileSnapshotStore::open(dir.path().join("snapshots")).unwrap();
     contract_refuses_below_floor(&mut store);
 }
 
@@ -161,7 +161,7 @@ fn open_creates_the_directory_and_starts_empty() {
     let store_dir = dir.path().join("nested").join("snapshots");
     assert!(!store_dir.exists());
 
-    let store = FileEventSnapshotStore::open(&store_dir).unwrap();
+    let store = FileSnapshotStore::open(&store_dir).unwrap();
 
     assert!(store_dir.is_dir());
     assert!(store.load_latest().unwrap().is_none());
@@ -172,7 +172,7 @@ fn open_creates_the_directory_and_starts_empty() {
 fn the_file_store_uses_the_v2_checksummed_framing() {
     let dir = tempdir().unwrap();
     let store_dir = dir.path().join("snapshots");
-    let mut store = FileEventSnapshotStore::open(&store_dir).unwrap();
+    let mut store = FileSnapshotStore::open(&store_dir).unwrap();
     let saved = snapshot_at(3, 2);
     store.save(saved.clone()).unwrap();
 
@@ -185,7 +185,7 @@ fn the_file_store_uses_the_v2_checksummed_framing() {
         format!("{:08x}", crc32fast::hash(json.as_bytes())),
         "the checksum covers exactly the JSON bytes"
     );
-    let decoded: EventSnapshot = serde_json::from_str(json).unwrap();
+    let decoded: StoredSnapshot = serde_json::from_str(json).unwrap();
     assert_eq!(decoded, saved);
 }
 
@@ -193,7 +193,7 @@ fn the_file_store_uses_the_v2_checksummed_framing() {
 fn a_crc_corrupt_newest_snapshot_falls_back_to_the_previous_one() {
     let dir = tempdir().unwrap();
     let store_dir = dir.path().join("snapshots");
-    let mut store = FileEventSnapshotStore::open(&store_dir).unwrap();
+    let mut store = FileSnapshotStore::open(&store_dir).unwrap();
     store.save(snapshot_at(3, 2)).unwrap();
     store.save(snapshot_at(4, 2)).unwrap();
 
@@ -211,7 +211,7 @@ fn a_crc_corrupt_newest_snapshot_falls_back_to_the_previous_one() {
 fn a_truncated_newest_snapshot_falls_back_to_the_previous_one() {
     let dir = tempdir().unwrap();
     let store_dir = dir.path().join("snapshots");
-    let mut store = FileEventSnapshotStore::open(&store_dir).unwrap();
+    let mut store = FileSnapshotStore::open(&store_dir).unwrap();
     store.save(snapshot_at(3, 2)).unwrap();
     store.save(snapshot_at(4, 2)).unwrap();
 
@@ -224,18 +224,18 @@ fn a_truncated_newest_snapshot_falls_back_to_the_previous_one() {
 fn a_version_mismatched_but_valid_snapshot_is_returned_for_the_durable_layer() {
     let dir = tempdir().unwrap();
     let store_dir = dir.path().join("snapshots");
-    let mut store = FileEventSnapshotStore::open(&store_dir).unwrap();
+    let mut store = FileSnapshotStore::open(&store_dir).unwrap();
     store.save(snapshot_at(1, 1)).unwrap();
 
     let mut mismatched = snapshot_at(2, 1);
-    mismatched.format_version = EVENT_FORMAT_VERSION + 1;
+    mismatched.format_version = FORMAT_VERSION + 1;
     store.save(mismatched.clone()).unwrap();
 
     let latest = store.load_latest().unwrap().unwrap();
     assert_eq!(latest, mismatched);
     assert_eq!(
         latest.format_version,
-        EVENT_FORMAT_VERSION + 1,
+        FORMAT_VERSION + 1,
         "an unknown version must be surfaced to the durable layer, not skipped"
     );
 }
@@ -252,12 +252,13 @@ fn a_v1_stored_snapshot_decodes_so_the_durable_layer_can_refuse_it() {
     let v1 = StoredSnapshot {
         format_version: 1,
         applied_seq: 7,
+        last_command_id: 0,
         snapshot: MatchingEngine::new(EngineConfig::default()).capture_snapshot(),
     };
     let json = serde_json::to_vec(&v1).unwrap();
     fs::write(snapshot_path(&store_dir, 7), encode_line(&json)).unwrap();
 
-    let store = FileEventSnapshotStore::open(&store_dir).unwrap();
+    let store = FileSnapshotStore::open(&store_dir).unwrap();
     let latest = store
         .load_latest()
         .unwrap()
@@ -271,7 +272,7 @@ fn a_v1_stored_snapshot_decodes_so_the_durable_layer_can_refuse_it() {
 fn a_hand_written_extra_candidate_pruned_only_after_a_successful_save() {
     let dir = tempdir().unwrap();
     let store_dir = dir.path().join("snapshots");
-    let mut store = FileEventSnapshotStore::open(&store_dir).unwrap();
+    let mut store = FileSnapshotStore::open(&store_dir).unwrap();
     store.save(snapshot_at(5, 2)).unwrap();
     store.save(snapshot_at(6, 3)).unwrap();
     assert_eq!(snapshot_sequences(&store_dir), vec![5, 6]);

@@ -9,8 +9,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::durable::{
-    CommandLog, CommandRecord, DurableError, EVENT_FORMAT_VERSION, EventLog, EventRecord,
-    EventSnapshot, EventSnapshotStore, LogHeader, SnapshotStore, StoredSnapshot,
+    DurableError, EventLog, EventRecord, FORMAT_VERSION, LogHeader, SnapshotStore, StoredSnapshot,
 };
 
 /// Lock a mutex, recovering the guard if a previous holder panicked.
@@ -24,90 +23,6 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 #[derive(Debug, Default)]
-struct LogState {
-    header: Option<LogHeader>,
-    records: Vec<CommandRecord>,
-}
-
-/// In-memory [`CommandLog`] shared by every clone of a handle.
-#[derive(Debug, Clone, Default)]
-pub struct InMemoryCommandLog {
-    state: Arc<Mutex<LogState>>,
-}
-
-impl InMemoryCommandLog {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Another handle to the same log, used to reopen after a simulated crash.
-    pub fn handle(&self) -> Self {
-        self.clone()
-    }
-}
-
-impl CommandLog for InMemoryCommandLog {
-    fn read_header(&self) -> Result<Option<LogHeader>, DurableError> {
-        Ok(lock(&self.state).header.clone())
-    }
-
-    fn write_header(&mut self, header: LogHeader) -> Result<(), DurableError> {
-        let mut state = lock(&self.state);
-        if state.header.is_some() {
-            return Err(DurableError::HeaderAlreadyPresent);
-        }
-        state.header = Some(header);
-        Ok(())
-    }
-
-    fn append(&mut self, record: CommandRecord) -> Result<(), DurableError> {
-        let mut state = lock(&self.state);
-        if state.header.is_none() {
-            return Err(DurableError::MissingHeader);
-        }
-
-        let expected = state
-            .records
-            .last()
-            .map(|last| last.sequence.saturating_add(1))
-            .unwrap_or(1);
-        if record.sequence != expected {
-            return Err(DurableError::NonContiguousSequence {
-                expected,
-                found: record.sequence,
-            });
-        }
-
-        state.records.push(record);
-        Ok(())
-    }
-
-    fn read_from(&self, from: u64) -> Result<Vec<CommandRecord>, DurableError> {
-        let state = lock(&self.state);
-        Ok(state
-            .records
-            .iter()
-            .filter(|record| record.sequence >= from)
-            .cloned()
-            .collect())
-    }
-
-    fn first_sequence(&self) -> Option<u64> {
-        lock(&self.state)
-            .records
-            .first()
-            .map(|record| record.sequence)
-    }
-
-    fn last_sequence(&self) -> Option<u64> {
-        lock(&self.state)
-            .records
-            .last()
-            .map(|record| record.sequence)
-    }
-}
-
-#[derive(Debug, Default)]
 struct EventLogState {
     header: Option<LogHeader>,
     records: Vec<EventRecord>,
@@ -115,9 +30,8 @@ struct EventLogState {
 
 /// In-memory [`EventLog`] shared by every clone of a handle.
 ///
-/// This is the ticket-01 event-log adapter: fast recovery tests can drop an
-/// [`EventSourcedEngine`](crate::durable::EventSourcedEngine) and reopen from a
-/// second handle to the same log.
+/// Fast recovery tests can drop a [`DurableMatchingEngine`](crate::durable::DurableMatchingEngine)
+/// and reopen from a second handle to the same log.
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryEventLog {
     state: Arc<Mutex<EventLogState>>,
@@ -140,10 +54,10 @@ impl EventLog for InMemoryEventLog {
     }
 
     fn write_header(&mut self, header: LogHeader) -> Result<(), DurableError> {
-        if header.format_version != EVENT_FORMAT_VERSION {
+        if header.format_version != FORMAT_VERSION {
             return Err(DurableError::UnsupportedVersion {
                 found: header.format_version,
-                supported: EVENT_FORMAT_VERSION,
+                supported: FORMAT_VERSION,
             });
         }
         let mut state = lock(&self.state);
@@ -159,10 +73,10 @@ impl EventLog for InMemoryEventLog {
         if state.header.is_none() {
             return Err(DurableError::MissingHeader);
         }
-        if record.format_version != EVENT_FORMAT_VERSION {
+        if record.format_version != FORMAT_VERSION {
             return Err(DurableError::UnsupportedVersion {
                 found: record.format_version,
-                supported: EVENT_FORMAT_VERSION,
+                supported: FORMAT_VERSION,
             });
         }
 
@@ -189,11 +103,11 @@ impl EventLog for InMemoryEventLog {
         }
         if let Some(record) = records
             .iter()
-            .find(|record| record.format_version != EVENT_FORMAT_VERSION)
+            .find(|record| record.format_version != FORMAT_VERSION)
         {
             return Err(DurableError::UnsupportedVersion {
                 found: record.format_version,
-                supported: EVENT_FORMAT_VERSION,
+                supported: FORMAT_VERSION,
             });
         }
 
@@ -235,7 +149,7 @@ impl EventLog for InMemoryEventLog {
             .map(|record| record.sequence)
     }
 
-    fn last_sequence(&self) -> Option<u64> {
+    fn last_stored_sequence(&self) -> Option<u64> {
         lock(&self.state)
             .records
             .last()
@@ -304,60 +218,6 @@ impl SnapshotStore for InMemorySnapshotStore {
     }
 }
 
-/// In-memory [`EventSnapshotStore`] shared by every clone of a handle.
-#[derive(Debug, Clone, Default)]
-pub struct InMemoryEventSnapshotStore {
-    snapshots: Arc<Mutex<Vec<EventSnapshot>>>,
-}
-
-impl InMemoryEventSnapshotStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Another handle to the same store, used to reopen after a simulated crash.
-    pub fn handle(&self) -> Self {
-        self.clone()
-    }
-}
-
-impl EventSnapshotStore for InMemoryEventSnapshotStore {
-    fn save(&mut self, snapshot: EventSnapshot) -> Result<(), DurableError> {
-        let mut snapshots = lock(&self.snapshots);
-        let floor = snapshots
-            .iter()
-            .map(|stored| stored.applied_seq)
-            .max()
-            .unwrap_or(0);
-        if snapshot.applied_seq < floor {
-            return Err(DurableError::SnapshotBelowFloor {
-                applied_seq: snapshot.applied_seq,
-                floor,
-            });
-        }
-
-        snapshots.push(snapshot);
-        // Retain the two newest complete snapshots.
-        while snapshots.len() > 2 {
-            snapshots.remove(0);
-        }
-        Ok(())
-    }
-
-    fn load_latest(&self) -> Result<Option<EventSnapshot>, DurableError> {
-        Ok(lock(&self.snapshots).last().cloned())
-    }
-
-    fn load_previous(&self) -> Result<Option<EventSnapshot>, DurableError> {
-        let snapshots = lock(&self.snapshots);
-        let len = snapshots.len();
-        if len < 2 {
-            return Ok(None);
-        }
-        Ok(Some(snapshots[len - 2].clone()))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,13 +236,14 @@ mod tests {
     }
 
     #[test]
-    fn a_poisoned_log_lock_does_not_panic_trait_methods() {
-        let log = InMemoryCommandLog::new();
+    fn a_poisoned_event_log_lock_does_not_panic_trait_methods() {
+        let log = InMemoryEventLog::new();
         poison(&log.state);
 
         assert_eq!(log.read_header().unwrap(), None);
         assert_eq!(log.first_sequence(), None);
-        assert_eq!(log.last_sequence(), None);
+        assert_eq!(log.last_stored_sequence(), None);
+        assert_eq!(log.last_command_id(), None);
         assert!(log.read_from(1).unwrap().is_empty());
     }
 

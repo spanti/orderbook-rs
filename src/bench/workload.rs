@@ -2,7 +2,8 @@
 
 use std::collections::HashMap;
 
-use crate::types::{EngineError, ExecutionReport, OrderBookId, OrderStatus, Side};
+use crate::event::DomainEvent;
+use crate::types::{OrderBookId, Side};
 
 use super::config::BenchConfig;
 use super::rng::SplitMix64;
@@ -133,50 +134,56 @@ impl Workload {
         self.limit_action(symbol_index, &book, timestamp, true)
     }
 
-    /// Reconcile the cancelable-order pool with the outcome of one submit.
+    /// Reconcile the cancelable-order pool with one submit's event stream.
     ///
-    /// The pool stores ids only; whether a maker is still working is answered
-    /// by `is_open`, which the harness points at the engine's lifecycle
-    /// records after the command completes. Callers must run this outside any
-    /// timed region because it queries the engine.
-    pub fn on_submit_result<F>(
-        &mut self,
-        action: &Action,
-        result: &Result<ExecutionReport, EngineError>,
-        is_open: F,
-    ) where
+    /// Outcomes are derived from events, not a separate report: a rejection is
+    /// a lone `OrderRejected`, a fill is a `TradeExecuted`, and whether the new
+    /// order is still working is answered by `is_open`, which the harness
+    /// points at the engine's ledger after the command completes. Callers must
+    /// run this outside any timed region because it queries the engine.
+    pub fn on_submit_events<F>(&mut self, action: &Action, events: &[DomainEvent], is_open: F)
+    where
         F: Fn(OrderBookId) -> bool,
     {
         debug_assert_ne!(action.kind, CommandKind::Cancel);
 
-        match result {
-            Ok(report) => {
-                for fill in &report.fills {
-                    if !is_open(fill.maker_order_id) {
-                        self.open_orders.remove(fill.maker_order_id);
-                    }
-                }
-                if matches!(
-                    report.status,
-                    OrderStatus::New | OrderStatus::PartiallyFilled
-                ) {
-                    self.open_orders
-                        .insert(report.order_id, action.symbol_index);
-                }
+        let Some(DomainEvent::OrderAccepted { order, .. }) = events.first() else {
+            // A submit is either accepted or rejected; a rejection changes no
+            // state and consumes no order id.
+            self.rejections = self.rejections.saturating_add(1);
+            self.update_peak();
+            return;
+        };
+        let taker_id = order.id;
+
+        for event in events {
+            if let DomainEvent::TradeExecuted { trade } = event
+                && !is_open(trade.maker_order_id)
+            {
+                self.open_orders.remove(trade.maker_order_id);
             }
-            Err(_) => {
-                self.rejections = self.rejections.saturating_add(1);
-            }
+        }
+        if is_open(taker_id) {
+            self.open_orders.insert(taker_id, action.symbol_index);
         }
 
         self.update_peak();
     }
 
-    pub fn on_cancel_result(&mut self, action: &Action, result: Option<&ExecutionReport>) {
+    /// Reconcile the cancelable-order pool with one cancel's event stream.
+    ///
+    /// A cancel that produced no `OrderCanceled`/`StopCanceled` was rejected;
+    /// the harness selected a stale order, so it is counted like a rejection.
+    pub fn on_cancel_events(&mut self, action: &Action, events: &[DomainEvent]) {
         debug_assert_eq!(action.kind, CommandKind::Cancel);
-        if result.is_none() {
-            // A cancel that the engine did not apply means the harness selected
-            // a stale order. Treat it like a rejection so it is visible.
+
+        let applied = events.iter().any(|event| {
+            matches!(
+                event,
+                DomainEvent::OrderCanceled { .. } | DomainEvent::StopCanceled { .. }
+            )
+        });
+        if !applied {
             self.rejections = self.rejections.saturating_add(1);
         }
         if let Some(order_id) = action.target_order_id {
@@ -366,9 +373,8 @@ impl OpenOrders {
 mod tests {
     use super::*;
     use crate::engine::MatchingEngine;
-    use crate::types::{
-        CommandOutcome, EngineCommand, EngineConfig, OrderRequest, OrderType, TimeInForce, Trade,
-    };
+    use crate::event::DomainEvent;
+    use crate::types::{EngineCommand, EngineConfig, OrderRequest, OrderType, TimeInForce};
 
     fn actions(seed: u64) -> Vec<Action> {
         let mut config = BenchConfig::default();
@@ -380,48 +386,51 @@ mod tests {
             .collect()
     }
 
-    fn report(
-        order_id: u64,
-        status: OrderStatus,
-        original_quantity: u64,
-        filled_quantity: u64,
-        remaining_quantity: u64,
-        fills: Vec<Trade>,
-    ) -> ExecutionReport {
-        ExecutionReport {
-            order_id,
-            symbol: format!("{SYMBOL_PREFIX}0"),
-            status,
-            original_quantity,
-            filled_quantity,
-            remaining_quantity,
-            fills,
+    fn limit_action(action: &Action) -> OrderRequest {
+        OrderRequest {
+            side: action.side,
+            price: action.price,
+            quantity: action.quantity,
+            timestamp: action.timestamp,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            post_only: false,
         }
     }
 
-    /// Submit a limit action through the real engine command seam.
-    fn engine_submit(
-        engine: &mut MatchingEngine,
-        symbol: &str,
-        action: &Action,
-    ) -> ExecutionReport {
-        assert_eq!(action.kind, CommandKind::Limit);
-        let outcome = engine.execute(EngineCommand::SubmitOrder {
-            symbol: symbol.to_string(),
-            request: OrderRequest {
-                side: action.side,
-                price: action.price,
-                quantity: action.quantity,
-                timestamp: action.timestamp,
-                order_type: OrderType::Limit,
-                time_in_force: TimeInForce::GTC,
-                post_only: false,
+    fn execute(engine: &mut MatchingEngine, action: &Action) -> Vec<DomainEvent> {
+        let symbol = format!("{SYMBOL_PREFIX}{}", action.symbol_index);
+        let command = match action.kind {
+            CommandKind::Limit | CommandKind::Market => {
+                let mut request = limit_action(action);
+                if action.kind == CommandKind::Market {
+                    request.order_type = OrderType::Market;
+                    request.price = 0;
+                    request.time_in_force = TimeInForce::IOC;
+                }
+                EngineCommand::SubmitOrder { symbol, request }
+            }
+            CommandKind::Cancel => EngineCommand::CancelOrder {
+                symbol,
+                order_id: action.target_order_id.expect("cancel target"),
             },
-        });
-        match outcome {
-            CommandOutcome::Accepted(report) => report,
-            other => panic!("expected Accepted, got {other:?}"),
-        }
+        };
+        engine.execute(command)
+    }
+
+    fn submit(
+        engine: &mut MatchingEngine,
+        workload: &mut Workload,
+        action: &Action,
+    ) -> Vec<DomainEvent> {
+        let events = execute(engine, action);
+        workload.on_submit_events(action, &events, |id| engine.is_open(id));
+        events
+    }
+
+    fn cancel(engine: &mut MatchingEngine, workload: &mut Workload, action: &Action) {
+        let events = execute(engine, action);
+        workload.on_cancel_events(action, &events);
     }
 
     #[test]
@@ -512,108 +521,71 @@ mod tests {
         config.symbols = 1;
         let mut workload = Workload::new(&config);
         let mut engine = MatchingEngine::new(EngineConfig::default());
-        let symbol = format!("{SYMBOL_PREFIX}0");
 
         // A maker rests 10 at 100 and enters the pool as a cancel candidate.
         let maker_action = Action::submit(0, CommandKind::Limit, Side::Bid, 100, 10, 1);
-        let maker_report = engine_submit(&mut engine, &symbol, &maker_action);
-        assert_eq!(maker_report.order_id, 1);
-        workload.on_submit_result(&maker_action, &Ok(maker_report), |id| engine.is_open(id));
+        submit(&mut engine, &mut workload, &maker_action);
         assert_eq!(workload.open_len(), 1);
 
         // A taker fills 4 of the maker and is itself fully filled. The maker is
         // still open, so it must stay cancelable even though its quantity fell.
         let partial_action = Action::submit(0, CommandKind::Limit, Side::Ask, 100, 4, 2);
-        let partial_report = engine_submit(&mut engine, &symbol, &partial_action);
-        assert_eq!(partial_report.status, OrderStatus::Filled);
-        assert_eq!(partial_report.fills[0].maker_order_id, 1);
+        submit(&mut engine, &mut workload, &partial_action);
         assert!(engine.is_open(1));
-        workload.on_submit_result(&partial_action, &Ok(partial_report), |id| {
-            engine.is_open(id)
-        });
         assert_eq!(workload.open_len(), 1);
 
         // A second taker exhausts the maker and rests its own remainder. The
-        // engine reports the maker closed and the taker open; the pool must
-        // swap one for the other without doing quantity arithmetic.
+        // pool swaps one for the other without doing quantity arithmetic.
         let full_action = Action::submit(0, CommandKind::Limit, Side::Ask, 100, 15, 3);
-        let full_report = engine_submit(&mut engine, &symbol, &full_action);
-        assert_eq!(full_report.status, OrderStatus::PartiallyFilled);
-        assert_eq!(full_report.fills[0].maker_order_id, 1);
+        let events = submit(&mut engine, &mut workload, &full_action);
         assert!(!engine.is_open(1));
-        assert!(engine.is_open(full_report.order_id));
-        workload.on_submit_result(&full_action, &Ok(full_report.clone()), |id| {
-            engine.is_open(id)
-        });
+        assert!(engine.is_open(3));
         assert_eq!(workload.open_len(), 1);
         assert!(!workload.open_orders.entries.contains_key(&1));
+        assert!(workload.open_orders.entries.contains_key(&3));
         assert!(
-            workload
-                .open_orders
-                .entries
-                .contains_key(&full_report.order_id)
+            events.iter().any(
+                |event| matches!(event, DomainEvent::OrderRested { order, .. } if order.id == 3)
+            )
         );
     }
 
     #[test]
-    fn taker_is_inserted_only_while_open() {
+    fn taker_is_inserted_only_while_the_engine_keeps_it_open() {
         let mut config = BenchConfig::default();
         config.symbols = 1;
         let mut workload = Workload::new(&config);
-        let action = Action::submit(0, CommandKind::Limit, Side::Bid, 100, 10, 1);
+        let mut engine = MatchingEngine::new(EngineConfig::default());
 
-        workload.on_submit_result(
-            &action,
-            &Ok(report(1, OrderStatus::New, 10, 0, 10, Vec::new())),
-            |_| false,
-        );
+        // A resting bid stays open.
+        let resting = Action::submit(0, CommandKind::Limit, Side::Bid, 100, 10, 1);
+        submit(&mut engine, &mut workload, &resting);
         assert_eq!(workload.open_len(), 1);
 
-        workload.on_submit_result(
-            &action,
-            &Ok(report(
-                2,
-                OrderStatus::PartiallyFilled,
-                10,
-                4,
-                6,
-                Vec::new(),
-            )),
-            |_| false,
-        );
-        assert_eq!(workload.open_len(), 2);
-
-        workload.on_submit_result(
-            &action,
-            &Ok(report(3, OrderStatus::Filled, 10, 10, 0, Vec::new())),
-            |_| false,
-        );
-        assert_eq!(workload.open_len(), 2);
-
-        workload.on_submit_result(
-            &action,
-            &Ok(report(4, OrderStatus::Canceled, 10, 0, 10, Vec::new())),
-            |_| false,
-        );
-        assert_eq!(workload.open_len(), 2);
+        // A market sell partially fills the maker: the taker is fully filled,
+        // so it never enters the cancelable pool while the maker stays open.
+        let filled = Action::submit(0, CommandKind::Market, Side::Ask, 100, 5, 2);
+        submit(&mut engine, &mut workload, &filled);
+        assert_eq!(workload.open_len(), 1);
+        assert!(!workload.open_orders.entries.contains_key(&2));
+        assert!(engine.is_open(1));
     }
 
     #[test]
-    fn cancel_result_removes_the_target() {
+    fn cancel_removes_the_target() {
         let mut config = BenchConfig::default();
         config.symbols = 1;
         let mut workload = Workload::new(&config);
+        let mut engine = MatchingEngine::new(EngineConfig::default());
 
-        for order_id in 1..=2 {
-            let action = Action::submit(0, CommandKind::Limit, Side::Bid, 100, 10, order_id);
-            let report = report(order_id, OrderStatus::New, 10, 0, 10, Vec::new());
-            workload.on_submit_result(&action, &Ok(report), |_| false);
+        for (timestamp, price) in [(1, 100), (2, 99)] {
+            let action = Action::submit(0, CommandKind::Limit, Side::Bid, price, 10, timestamp);
+            submit(&mut engine, &mut workload, &action);
         }
         assert_eq!(workload.open_len(), 2);
 
-        let cancel = Action::cancel(0, 1, 3);
-        let cancel_report = report(1, OrderStatus::Canceled, 10, 0, 10, Vec::new());
-        workload.on_cancel_result(&cancel, Some(&cancel_report));
+        let cancel_action = Action::cancel(0, 1, 3);
+        cancel(&mut engine, &mut workload, &cancel_action);
 
         assert_eq!(workload.open_len(), 1);
         assert!(!workload.open_orders.entries.contains_key(&1));
@@ -625,9 +597,14 @@ mod tests {
         let mut config = BenchConfig::default();
         config.symbols = 1;
         let mut workload = Workload::new(&config);
+        let mut engine = MatchingEngine::new(EngineConfig::default());
 
-        let action = Action::submit(0, CommandKind::Limit, Side::Bid, 100, 10, 1);
-        workload.on_submit_result(&action, &Err(EngineError::QuantityOutOfRange), |_| false);
+        let action = Action::submit(0, CommandKind::Limit, Side::Bid, 100, 0, 1);
+        let events = submit(&mut engine, &mut workload, &action);
+        assert!(matches!(
+            events.as_slice(),
+            [DomainEvent::OrderRejected { .. }]
+        ));
         assert_eq!(workload.rejections(), 1);
         assert_eq!(workload.open_len(), 0);
     }
@@ -637,17 +614,20 @@ mod tests {
         let mut config = BenchConfig::default();
         config.symbols = 1;
         let mut workload = Workload::new(&config);
+        let mut engine = MatchingEngine::new(EngineConfig::default());
 
-        let submit = Action::submit(0, CommandKind::Limit, Side::Bid, 100, 10, 1);
-        let submit_report = report(1, OrderStatus::New, 10, 0, 10, Vec::new());
-        workload.on_submit_result(&submit, &Ok(submit_report), |_| false);
+        let submit_action = Action::submit(0, CommandKind::Limit, Side::Bid, 100, 10, 1);
+        submit(&mut engine, &mut workload, &submit_action);
         assert_eq!(workload.open_len(), 1);
 
-        let cancel = Action::cancel(0, 1, 2);
-        workload.on_cancel_result(&cancel, None);
+        let cancel_action = Action::cancel(0, 1, 2);
+        cancel(&mut engine, &mut workload, &cancel_action);
+        assert_eq!(workload.rejections(), 0);
 
+        // Canceling an unknown id is a rejected event.
+        let stale = Action::cancel(0, 999, 3);
+        cancel(&mut engine, &mut workload, &stale);
         assert_eq!(workload.rejections(), 1);
-        assert_eq!(workload.open_len(), 0);
     }
 
     #[test]
@@ -655,17 +635,16 @@ mod tests {
         let mut config = BenchConfig::default();
         config.symbols = 1;
         let mut workload = Workload::new(&config);
+        let mut engine = MatchingEngine::new(EngineConfig::default());
 
-        for order_id in 1..=3 {
-            let action = Action::submit(0, CommandKind::Limit, Side::Bid, 100, 10, order_id);
-            let report = report(order_id, OrderStatus::New, 10, 0, 10, Vec::new());
-            workload.on_submit_result(&action, &Ok(report), |_| false);
+        for (timestamp, price) in [(1, 100), (2, 99), (3, 98)] {
+            let action = Action::submit(0, CommandKind::Limit, Side::Bid, price, 10, timestamp);
+            submit(&mut engine, &mut workload, &action);
         }
         assert_eq!(workload.peak_open_orders(), 3);
 
-        let cancel = Action::cancel(0, 1, 4);
-        let cancel_report = report(1, OrderStatus::Canceled, 10, 0, 10, Vec::new());
-        workload.on_cancel_result(&cancel, Some(&cancel_report));
+        let cancel_action = Action::cancel(0, 1, 4);
+        cancel(&mut engine, &mut workload, &cancel_action);
         assert_eq!(workload.peak_open_orders(), 3);
 
         workload.start_measurement();
@@ -679,16 +658,16 @@ mod tests {
         let mut config = BenchConfig::default();
         config.symbols = 1;
         let mut workload = Workload::new(&config);
+        let mut engine = MatchingEngine::new(EngineConfig::default());
 
-        for order_id in 1..=3 {
-            let action = Action::submit(0, CommandKind::Limit, Side::Bid, 100, 10, order_id);
-            let report = report(order_id, OrderStatus::New, 10, 0, 10, Vec::new());
-            workload.on_submit_result(&action, &Ok(report), |_| false);
+        for (timestamp, price) in [(1, 100), (2, 99), (3, 98)] {
+            let action = Action::submit(0, CommandKind::Limit, Side::Bid, price, 10, timestamp);
+            submit(&mut engine, &mut workload, &action);
         }
         assert_eq!(workload.peak_open_orders(), 3);
 
-        let cancel = Action::cancel(0, 1, 4);
-        workload.on_cancel_result(&cancel, None);
+        let cancel_action = Action::cancel(0, 1, 4);
+        cancel(&mut engine, &mut workload, &cancel_action);
         assert_eq!(workload.open_len(), 2);
         assert_eq!(workload.peak_open_orders(), 3);
     }

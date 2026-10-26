@@ -3,10 +3,10 @@
 use std::time::{Duration, Instant};
 
 use crate::engine::MatchingEngine;
+use crate::event::DomainEvent;
 use crate::orderbook::OrderBook;
 use crate::types::{
-    CommandOutcome, EngineCommand, EngineConfig, OrderBookId, OrderRequest, OrderType, Side,
-    TimeInForce,
+    EngineCommand, EngineConfig, OrderBookId, OrderRequest, OrderType, Side, TimeInForce,
 };
 
 use super::config::{BenchConfig, BenchError, BenchPath};
@@ -163,9 +163,9 @@ fn run_direct(config: &BenchConfig) -> Result<BenchReport, BenchError> {
         if config.rate > 0 {
             pace(intended_time(warmup_start, index, config.rate));
         }
-        let outcome = engine.execute(command);
-        std::hint::black_box(&outcome);
-        record_workload(&mut workload, &action, outcome, |id| engine.is_open(id));
+        let events = engine.execute(command);
+        std::hint::black_box(&events);
+        record_workload(&mut workload, &action, &events, |id| engine.is_open(id));
     }
 
     let mut total_all = Samples::default();
@@ -181,7 +181,7 @@ fn run_direct(config: &BenchConfig) -> Result<BenchReport, BenchError> {
     workload.start_measurement();
 
     let measured_start = Instant::now();
-    let events_before = engine.events().len();
+    let mut measured_events = 0u64;
     let trades_before = engine.trades().len();
 
     for index in 0..config.events {
@@ -198,9 +198,9 @@ fn run_direct(config: &BenchConfig) -> Result<BenchReport, BenchError> {
         }
 
         let send = Instant::now();
-        let outcome = engine.execute(command);
+        let events = engine.execute(command);
         let done = Instant::now();
-        std::hint::black_box(&outcome);
+        std::hint::black_box(&events);
 
         let service = ns_between(send, done);
         let (total, send_lag) = match intended {
@@ -226,11 +226,12 @@ fn run_direct(config: &BenchConfig) -> Result<BenchReport, BenchError> {
             }
         }
 
-        record_workload(&mut workload, &action, outcome, |id| engine.is_open(id));
+        measured_events = measured_events.saturating_add(events.len() as u64);
+        record_workload(&mut workload, &action, &events, |id| engine.is_open(id));
     }
 
     let wall_time_ns = duration_ns(measured_start.elapsed());
-    let engine_events = (engine.events().len() - events_before) as u64;
+    let engine_events = measured_events;
     let trades = (engine.trades().len() - trades_before) as u64;
     let final_depth_levels = count_depth(&engine, &symbols);
 
@@ -334,25 +335,19 @@ pub(crate) fn command_from_action(action: &Action, symbols: &[String]) -> Engine
     }
 }
 
-/// Feed one command outcome back into the workload after the timed command
+/// Feed one command's events back into the workload after the timed command
 /// window has closed. The engine's lifecycle query is deliberately evaluated
 /// here, not inside `send..done`, so bookkeeping never enters a latency sample.
 pub(crate) fn record_workload(
     workload: &mut Workload,
     action: &Action,
-    outcome: CommandOutcome,
+    events: &[DomainEvent],
     is_open: impl Fn(OrderBookId) -> bool,
 ) {
-    match outcome {
-        CommandOutcome::Accepted(report) => workload.on_submit_result(action, &Ok(report), is_open),
-        CommandOutcome::Canceled(report) => workload.on_cancel_result(action, Some(&report)),
-        CommandOutcome::Rejected(reason) => {
-            if action.kind == CommandKind::Cancel {
-                workload.on_cancel_result(action, None);
-            } else {
-                workload.on_submit_result(action, &Err(reason), is_open);
-            }
-        }
+    if action.kind == CommandKind::Cancel {
+        workload.on_cancel_events(action, events);
+    } else {
+        workload.on_submit_events(action, events, is_open);
     }
 }
 

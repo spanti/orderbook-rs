@@ -18,7 +18,7 @@ accepted
 - 运行时（Matching Runtime）采用 **apply-first**：撮合线程 `decide` 后分配事件序号区间，逐条 `apply`，发送 Applied Acknowledgement（携带该命令的事件列表与首/末事件序号），再把全部 `EventRecord` 交给 Journal Thread；Journal Thread 批量追加并 fsync 后推进 Durability Watermark，撮合线程据此发送 Durable Acknowledgement。
 - 提交方显式选择等待级别：`wait_applied`（preliminary）或 `wait_durable`（默认）。Durable 回执只在**该命令的最后一个事件序号**落盘后发出；崩溃可能使已发 Applied 回执的命令丢失。
 - Ingress Command Queue 与 Journal 批次队列都有界：入站满时 `try_submit` 返回 `QueueFull`；日志队列满时撮合线程停止继续应用，让压力回到入站队列。禁止无界缓冲。
-- Event Snapshot 只在命令边界、且 `applied_seq == durable_seq` 时捕获，且以 `durable_seq`（事件序号）为边界；快照由独立 Snapshot Worker 写入，快照失败不失败已应用命令。`snapshot_cadence` 按事件序号计，在越过阈值的下一个命令边界捕获。
+- `StoredSnapshot` 只在命令边界、且 `applied_seq == durable_seq` 时捕获，且以 `durable_seq`（事件序号）为边界；快照由独立 Snapshot Worker 写入 `SnapshotStore`，快照失败不失败已应用命令。`snapshot_cadence` 按事件序号计，在越过阈值的下一个命令边界捕获。
 - 事件落盘后由独立的 Event Publisher 按 `sequence` 读取并发布到 MessageBus；匹配线程与 Journal Thread 都不等待消费者。见 ADR 0005。
 - 原有低延迟配套保留：Journal Thread + group commit、预分配回执槽（热路径不分配）、逐条应用而按批写日志、可选 `core_affinity` 绑核、可配置 spin/backoff。
 - 两条写路径共享 `decide`/`apply`、恢复算法与存储 trait，避免语义漂移。
