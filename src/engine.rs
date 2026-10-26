@@ -46,7 +46,6 @@ pub struct MatchingEngine {
     ledger: OrderLedger,
     next_order_id: u64,
     events: Vec<EngineEvent>,
-    commands: Vec<EngineCommand>,
     next_sequence_id: u64,
     stop_books: HashMap<String, StopBook>,
     last_trades: HashMap<String, LastTrade>,
@@ -62,7 +61,6 @@ impl Default for MatchingEngine {
             ledger: OrderLedger::default(),
             next_order_id: 1,
             events: Vec::new(),
-            commands: Vec::new(),
             stop_books: HashMap::new(),
             last_trades: HashMap::new(),
             next_sequence_id: 1,
@@ -80,7 +78,6 @@ impl MatchingEngine {
             ledger: OrderLedger::default(),
             next_order_id: 1,
             events: Vec::new(),
-            commands: Vec::new(),
             stop_books: HashMap::new(),
             last_trades: HashMap::new(),
             next_sequence_id: 1,
@@ -95,7 +92,7 @@ impl MatchingEngine {
 
     /// Capture the complete decision state as a deterministic snapshot.
     ///
-    /// Events and the command buffer are derived outputs and are not included.
+    /// Events are derived outputs and are not included.
     /// Books (including empty ones), ledger records, stop books and last trades
     /// are emitted in a canonical order so equal state has equal bytes.
     pub fn capture_snapshot(&self) -> EngineSnapshot {
@@ -158,7 +155,7 @@ impl MatchingEngine {
     ///
     /// Books recompute their price-level totals and order lookup indexes from
     /// the stored orders; the ledger and both stop indexes are reinserted
-    /// directly. Events and the command buffer start empty.
+    /// directly. Events start empty.
     pub fn restore_snapshot(snapshot: EngineSnapshot) -> Self {
         let order_books = snapshot
             .books
@@ -214,7 +211,6 @@ impl MatchingEngine {
             ledger,
             next_order_id: snapshot.next_order_id,
             events: Vec::new(),
-            commands: Vec::new(),
             next_sequence_id: snapshot.next_event_sequence,
             stop_books,
             last_trades,
@@ -232,18 +228,15 @@ impl MatchingEngine {
         })
     }
 
-    /// Apply one command and record it in the command log.
+    /// Apply one command through the engine's only write entry point.
     ///
-    /// The command is applied through a borrowed reference and only then moved
-    /// into the log, so the hot path does not clone the command or its symbol.
-    /// Rejected commands are recorded as well; replay can then reproduce them.
+    /// Durability and replay belong to the durable layer, which appends the
+    /// command before calling this method.
     pub fn execute(&mut self, command: EngineCommand) -> CommandOutcome {
-        let outcome = self.apply(&command);
-        self.commands.push(command);
-        outcome
+        self.apply(&command)
     }
 
-    /// Shared apply path for `execute` and replay. Never touches the log.
+    /// Core apply path used by `execute`. Never performs IO.
     fn apply(&mut self, command: &EngineCommand) -> CommandOutcome {
         let symbol = match command {
             EngineCommand::SubmitOrder { symbol, .. } => symbol,
@@ -713,28 +706,6 @@ impl MatchingEngine {
         Ok(())
     }
 
-    /// 将一条历史命令应用到当前引擎，不写入命令日志。
-    pub fn replay(&mut self, command: EngineCommand) {
-        let _ = self.apply(&command);
-    }
-
-    /// 重放一整段命令日志，不重复写入命令日志。
-    pub fn replay_commands(&mut self, commands: &[EngineCommand]) {
-        for command in commands {
-            self.replay(command.clone());
-        }
-    }
-
-    /// 从命令日志重建引擎：日志只恢复一次，随后逐条应用。
-    pub fn from_commands(config: EngineConfig, commands: &[EngineCommand]) -> Self {
-        let mut engine = Self::new(config);
-        engine.commands = commands.to_vec();
-        for command in commands {
-            engine.replay(command.clone());
-        }
-        engine
-    }
-
     fn record_fills(&mut self, symbol: &str, timestamp: u64, fills: Vec<Fill>) -> Vec<Trade> {
         let mut record_trades = Vec::with_capacity(fills.len());
         fills.iter().for_each(|fill| {
@@ -772,10 +743,6 @@ impl MatchingEngine {
 
     pub fn events(&self) -> &[EngineEvent] {
         &self.events
-    }
-
-    pub fn commands(&self) -> &[EngineCommand] {
-        &self.commands
     }
 
     fn allocate_sequence_id(&mut self) -> u64 {

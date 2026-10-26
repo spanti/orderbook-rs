@@ -86,8 +86,7 @@ fn modify_command(order_id: u64, price: u64, quantity: u64, timestamp: u64) -> E
     }
 }
 
-/// Execute a command while collecting the stream locally, so replay does not
-/// depend on the engine's in-memory command buffer.
+/// Execute a command while collecting the stream locally for durable replay.
 fn execute_recorded(
     engine: &mut MatchingEngine,
     commands: &mut Vec<EngineCommand>,
