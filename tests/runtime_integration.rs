@@ -1067,6 +1067,12 @@ fn metrics_counts_and_latencies_are_internally_consistent() {
     assert_eq!(metrics.stopped(), 0);
     // Every submit is an `OrderAccepted` plus an `OrderRested`.
     assert_eq!(metrics.batch_records_sum(), 2 * N);
+    assert_eq!(
+        metrics.event_records(),
+        2 * N,
+        "event volume is counted in event records, not commands"
+    );
+    assert_eq!(metrics.batch_records_max(), 2);
     assert!(metrics.batch_count() >= 1);
     assert!(metrics.journal_append_count() >= 1);
     let queue_capacity = 1024u64;

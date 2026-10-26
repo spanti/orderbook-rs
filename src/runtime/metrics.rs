@@ -46,6 +46,9 @@ struct IngressMetrics {
 #[derive(Debug, Default)]
 struct ApplyMetrics {
     applied: AtomicU64,
+    /// Event records applied across every command. Together with `applied`
+    /// this is the event volume per command.
+    events: AtomicU64,
     queue_wait_ns_sum: AtomicU64,
     queue_wait_ns_max: AtomicU64,
     apply_ns_sum: AtomicU64,
@@ -64,6 +67,7 @@ struct DurabilityMetrics {
     journal_append_ns_max: AtomicU64,
     journal_append_count: AtomicU64,
     batch_records_sum: AtomicU64,
+    batch_records_max: AtomicU64,
     batch_count: AtomicU64,
 }
 
@@ -110,6 +114,18 @@ impl RuntimeMetrics {
         count(&self.apply.applied);
     }
 
+    /// Record how many event records one command produced and applied.
+    ///
+    /// Event volume is counted in records, not commands: a resting submit
+    /// emits at least `OrderAccepted` plus `OrderRested`, and a sweep emits one
+    /// `TradeExecuted` per fill.
+    pub fn record_events(&self, events: usize) {
+        add(
+            &self.apply.events,
+            u64::try_from(events).unwrap_or(u64::MAX),
+        );
+    }
+
     pub fn record_queue_wait(&self, wait: Duration) {
         let nanos = nanos(wait);
         add(&self.apply.queue_wait_ns_sum, nanos);
@@ -146,10 +162,9 @@ impl RuntimeMetrics {
     /// The matching thread knows the batch size; append timing belongs to the
     /// journal thread. Ticket 06 must not count the same records again.
     pub fn record_journal_batch(&self, records: usize) {
-        add(
-            &self.durability.batch_records_sum,
-            u64::try_from(records).unwrap_or(u64::MAX),
-        );
+        let records = u64::try_from(records).unwrap_or(u64::MAX);
+        add(&self.durability.batch_records_sum, records);
+        observe_max(&self.durability.batch_records_max, records);
         count(&self.durability.batch_count);
     }
 
@@ -186,6 +201,12 @@ impl RuntimeMetrics {
 
     pub fn applied(&self) -> u64 {
         self.apply.applied.load(Ordering::Relaxed)
+    }
+
+    /// Total event records applied. Divide by [`Self::applied`] for the mean
+    /// event volume per command.
+    pub fn event_records(&self) -> u64 {
+        self.apply.events.load(Ordering::Relaxed)
     }
 
     pub fn queue_wait_ns_sum(&self) -> u64 {
@@ -240,6 +261,10 @@ impl RuntimeMetrics {
         self.durability.batch_records_sum.load(Ordering::Relaxed)
     }
 
+    pub fn batch_records_max(&self) -> u64 {
+        self.durability.batch_records_max.load(Ordering::Relaxed)
+    }
+
     pub fn batch_count(&self) -> u64 {
         self.durability.batch_count.load(Ordering::Relaxed)
     }
@@ -269,6 +294,8 @@ mod tests {
         metrics.observe_queue_depth(3);
         metrics.observe_queue_depth(9);
         metrics.observe_queue_depth(4);
+        metrics.record_events(6);
+        metrics.record_events(4);
         metrics.record_journal_batch(10);
         metrics.record_journal_batch(2);
         metrics.record_journal_append(Duration::from_micros(20));
@@ -293,7 +320,9 @@ mod tests {
         assert_eq!(metrics.journal_append_ns_max(), 20_000);
         assert_eq!(metrics.journal_append_count(), 2);
         assert_eq!(metrics.batch_records_sum(), 12);
+        assert_eq!(metrics.batch_records_max(), 10);
         assert_eq!(metrics.batch_count(), 2);
+        assert_eq!(metrics.event_records(), 10);
     }
 
     #[test]
@@ -320,6 +349,26 @@ mod tests {
             metrics.batch_count(),
             2,
             "batch count is counted at handoff, not again on append"
+        );
+    }
+
+    #[test]
+    fn metrics_report_event_volume_and_batch_extremes() {
+        let metrics = RuntimeMetrics::new();
+
+        // Two commands produced 2 and 5 events respectively.
+        metrics.record_events(2);
+        metrics.record_events(5);
+        // Journal handoffs are counted in event records, not commands.
+        metrics.record_journal_batch(3);
+        metrics.record_journal_batch(7);
+
+        assert_eq!(metrics.event_records(), 7);
+        assert_eq!(metrics.batch_records_sum(), 10);
+        assert_eq!(
+            metrics.batch_records_max(),
+            7,
+            "the largest handoff is reported in event records"
         );
     }
 

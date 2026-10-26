@@ -10,7 +10,10 @@ use crate::types::{
 };
 
 use super::config::{BenchConfig, BenchError, BenchPath};
-use super::report::{BenchReport, CategoryStats, DepthLevels, EnvInfo, LatencyReport, RunStats};
+use super::report::{
+    APPLIED_SLO_NS, BenchReport, CategoryStats, DecideReport, DepthLevels, EnvInfo, LatencyReport,
+    RunStats, SloCheck,
+};
 use super::stats::{Samples, Summary};
 use super::workload::{Action, CommandKind, SYMBOL_PREFIX, Workload};
 
@@ -70,12 +73,14 @@ fn run_decide(config: &BenchConfig) -> Result<BenchReport, BenchError> {
     }
 
     let mut samples = Samples::default();
+    let mut events_total = 0u64;
     let measured_start = Instant::now();
     for _ in 0..config.events {
         let start = Instant::now();
         let events = engine.decide(&command);
         let elapsed = ns_between(start, Instant::now());
         std::hint::black_box(&events);
+        events_total = events_total.saturating_add(events.len() as u64);
         samples.push(elapsed);
     }
 
@@ -86,6 +91,19 @@ fn run_decide(config: &BenchConfig) -> Result<BenchReport, BenchError> {
     } else {
         config.events as f64 / (wall_time_ns as f64 / 1e9)
     };
+    let events_per_command = events_total as f64 / config.events as f64;
+    // The pure decide path is gated against the applied SLO: if it cannot
+    // produce the events within that budget, the shortfall is reported rather
+    // than moving the runtime onto a different execution path.
+    //
+    // Windows QPC resolves around 100 ns, so a sub-tick comparison is not a
+    // numeric claim. Report the percentiles and mark this SLO not applicable
+    // there; the Linux release build is the judging environment.
+    let slo = if cfg!(target_os = "windows") {
+        SloCheck::not_applicable(summary, APPLIED_SLO_NS, 0)
+    } else {
+        SloCheck::new(summary, APPLIED_SLO_NS, 0)
+    };
 
     Ok(BenchReport {
         config: config.clone(),
@@ -93,8 +111,8 @@ fn run_decide(config: &BenchConfig) -> Result<BenchReport, BenchError> {
             wall_time_ns,
             achieved_rate,
             commands: config.events,
-            // A non-crossing resting submit decides two events.
-            engine_events: config.events.saturating_mul(2),
+            engine_events: events_total,
+            events_per_command,
             trades: 0,
             rejections: 0,
             final_open_orders: 1,
@@ -122,6 +140,12 @@ fn run_decide(config: &BenchConfig) -> Result<BenchReport, BenchError> {
             send_lag: Summary::default(),
         },
         runtime: None,
+        decide: Some(DecideReport {
+            latency: summary,
+            events_total,
+            events_per_command,
+            slo,
+        }),
         env: EnvInfo::current(),
     })
 }
@@ -231,6 +255,7 @@ fn run_direct(config: &BenchConfig) -> Result<BenchReport, BenchError> {
     } else {
         config.events as f64 / (wall_time_ns as f64 / 1e9)
     };
+    let events_per_command = events_per_command(engine_events, config.events);
 
     Ok(BenchReport {
         config: config.clone(),
@@ -239,6 +264,7 @@ fn run_direct(config: &BenchConfig) -> Result<BenchReport, BenchError> {
             achieved_rate,
             commands: config.events,
             engine_events,
+            events_per_command,
             trades,
             rejections: workload.rejections(),
             final_open_orders: workload.open_len(),
@@ -247,8 +273,17 @@ fn run_direct(config: &BenchConfig) -> Result<BenchReport, BenchError> {
         },
         latency,
         runtime: None,
+        decide: None,
         env: EnvInfo::current(),
     })
+}
+
+pub(crate) fn events_per_command(events: u64, commands: u64) -> f64 {
+    if commands == 0 {
+        0.0
+    } else {
+        events as f64 / commands as f64
+    }
 }
 
 /// The bench's symbol names, in workload-index order.
@@ -427,9 +462,33 @@ mod tests {
             report.run.engine_events, 400,
             "two events per resting submit"
         );
+        assert_eq!(
+            report.run.events_per_command, 2.0,
+            "the run reports event volume per command"
+        );
         assert_eq!(report.run.final_open_orders, 1, "only the seeded ask rests");
         assert!(report.runtime.is_none());
-        assert!(report.render_text().contains("engine events"));
+
+        let decide = report.decide.as_ref().expect("decide SLO section");
+        assert_eq!(
+            decide.slo.target_ns,
+            crate::bench::report::APPLIED_SLO_NS,
+            "the pure decide path is gated against the applied SLO"
+        );
+        assert_eq!(decide.events_total, 400);
+        assert_eq!(decide.events_per_command, 2.0);
+        assert_eq!(decide.latency.count, 200);
+
+        let text = report.render_text();
+        assert!(text.contains("engine events"));
+        assert!(text.contains("event volume"));
+        assert!(text.contains("submit -> decide"));
+        assert!(text.contains("target=10,000 ns"));
+
+        let json = report.to_json();
+        assert!(json.contains("\"decide\""));
+        assert!(json.contains("\"submit_to_decide\""));
+        assert!(json.contains("\"events_per_command\""));
     }
 
     #[test]
@@ -558,12 +617,25 @@ mod tests {
         assert_eq!(runtime.applied_count, 100);
         assert_eq!(runtime.durable_count, 100);
         assert_eq!(runtime.queue_full, 0);
+        assert_eq!(runtime.events_total, report.run.engine_events);
+        assert!(
+            runtime.events_total >= runtime.applied_count,
+            "every applied command emits at least one event"
+        );
+        assert!(runtime.events_per_command >= 1.0);
+        assert_eq!(
+            runtime.events_per_command,
+            runtime.events_total as f64 / runtime.applied_count as f64
+        );
+        assert!(runtime.batch_size_max >= 1);
 
         let text = report.render_text();
         assert!(text.contains("runtime latency (ns)"));
         assert!(text.contains("applied"));
         assert!(text.contains("durable"));
         assert!(text.contains("slo"));
+        assert!(text.contains("event volume"));
+        assert!(text.contains("events/command"));
         assert!(text.contains("target=10,000 ns"));
         assert!(text.contains("target=500,000 ns"));
 
@@ -577,6 +649,9 @@ mod tests {
         assert!(json.contains("\"journal_append\""));
         assert!(json.contains("\"queue_full\""));
         assert!(json.contains("\"fsync_share\""));
+        assert!(json.contains("\"events_total\""));
+        assert!(json.contains("\"events_per_command\""));
+        assert!(json.contains("\"batch_size_max\""));
         assert!(json.contains("\"slo\""));
     }
 

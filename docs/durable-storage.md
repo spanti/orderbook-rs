@@ -280,13 +280,27 @@ describe the acceptance workload. The required setup is a Linux release build,
 durable level. With `--log memory` the durable SLO is marked **NOT APPLICABLE**
 rather than PASS/FAIL, because an in-memory log cannot exercise fsync. The report
 prints p50/p99/p99.9 for both levels, the queue-wait, apply-service, durable-wait,
-and journal-append components, the mean batch size, maximum queue depth,
-`queue_full`, and the fsync share (journal append time as a share of durable
-wait). Event volume per command affects the journal append component.
+and journal-append components, the mean and maximum journal handoff batch in
+**event records**, event volume per command (total event records and mean
+events/command), maximum queue depth, `queue_full`, and the fsync share (journal
+append time as a share of durable wait). Event volume per command affects the
+journal append component. The event counters are maintained by the matching and
+journal threads only when `RuntimeConfig::metrics` is `Some`; with metrics
+disabled the hot path performs no clock reads and no metric atomics.
+
+The pure decision path (`bench --path decide`) reports command -> events latency
+against the same applied budget (`p99 <= 10 µs`, `queue_full == 0`), plus its own
+event volume. It reads engine state and emits events without mutating the engine.
+A miss is recorded as a measured shortfall; the runtime is never silently moved
+onto a different path. Changing the decision strategy instead requires an
+explicit ADR amendment.
 
 **Windows is functional-only.** Its clocks (QPC) typically tick at about 100 ns,
 so sub-tick differences are not meaningful; do not claim the numeric SLOs there.
-Run the functional test suite on Windows and measure the SLOs on Linux.
+Run the functional test suite on Windows and measure the SLOs on Linux. The
+decide-path SLO is reported as **NOT APPLICABLE** on Windows for the same
+reason: its percentiles are printed for functional inspection, not as a numeric
+PASS.
 
 ### Known deviations
 
