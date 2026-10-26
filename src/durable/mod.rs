@@ -205,6 +205,134 @@ impl fmt::Debug for DurableMatchingEngine {
     }
 }
 
+/// Everything recovery restores from one log and snapshot store.
+///
+/// Both the synchronous [`DurableMatchingEngine`] and the matching runtime
+/// consume this, so the two write paths cannot drift on log decoding or
+/// recovery checks.
+pub(crate) struct Recovered {
+    pub(crate) engine: MatchingEngine,
+    /// Engine config from the log header. The synchronous façade already holds
+    /// one; the matching runtime uses this to start from an empty engine.
+    #[allow(dead_code)]
+    pub(crate) config: EngineConfig,
+    /// Last **command** sequence applied to the engine.
+    pub(crate) applied_seq: u64,
+    /// Last **command** sequence known durable. For this append-before-apply
+    /// path it is the log's tail, or `applied_seq` when the log is empty.
+    #[allow(dead_code)]
+    pub(crate) durable_seq: u64,
+    pub(crate) next_command_sequence: u64,
+}
+
+/// Restore engine state from the latest snapshot plus the log tail.
+///
+/// Borrows both stores and never writes: callers keep ownership. Every
+/// recovery check lives here so both durable write paths apply them unchanged.
+pub(crate) fn recover(
+    log: &dyn CommandLog,
+    snapshots: &dyn SnapshotStore,
+) -> Result<Recovered, DurableError> {
+    let header = log.read_header()?.ok_or(DurableError::MissingHeader)?;
+    if header.format_version != FORMAT_VERSION {
+        return Err(DurableError::UnsupportedVersion {
+            found: header.format_version,
+            supported: FORMAT_VERSION,
+        });
+    }
+
+    let (mut engine, applied_seq) = match snapshots.load_latest()? {
+        Some(stored) => {
+            if stored.format_version != FORMAT_VERSION {
+                return Err(DurableError::UnsupportedVersion {
+                    found: stored.format_version,
+                    supported: FORMAT_VERSION,
+                });
+            }
+            if stored.snapshot.config != header.config {
+                return Err(DurableError::ConfigMismatch {
+                    header: header.config,
+                    snapshot: stored.snapshot.config,
+                });
+            }
+            match log.last_sequence() {
+                Some(last) if stored.applied_seq > last => {
+                    return Err(DurableError::SnapshotAhead {
+                        applied_seq: stored.applied_seq,
+                        log_last_seq: last,
+                    });
+                }
+                None if stored.applied_seq > 0 => {
+                    return Err(DurableError::SnapshotAhead {
+                        applied_seq: stored.applied_seq,
+                        log_last_seq: 0,
+                    });
+                }
+                _ => {}
+            }
+
+            (
+                MatchingEngine::restore_snapshot(stored.snapshot),
+                stored.applied_seq,
+            )
+        }
+        None => (MatchingEngine::new(header.config), 0),
+    };
+
+    // The log must cover every command after the snapshot boundary. With no
+    // snapshot that boundary is zero, so the log must start at sequence 1.
+    let expected_first = applied_seq.saturating_add(1);
+    if let Some(first) = log.first_sequence()
+        && first > expected_first
+    {
+        return Err(DurableError::RecoveryGap {
+            expected: expected_first,
+            found: Some(first),
+        });
+    }
+
+    let mut applied_seq = applied_seq;
+    let tail = log.read_from(applied_seq.saturating_add(1))?;
+    for record in tail {
+        if record.format_version != FORMAT_VERSION {
+            return Err(DurableError::UnsupportedVersion {
+                found: record.format_version,
+                supported: FORMAT_VERSION,
+            });
+        }
+        if record.sequence <= applied_seq {
+            // At-least-once delivery: this sequence is already applied.
+            continue;
+        }
+        let expected = applied_seq.saturating_add(1);
+        if record.sequence != expected {
+            return Err(DurableError::NonContiguousSequence {
+                expected,
+                found: record.sequence,
+            });
+        }
+        let _ = engine.execute(record.command);
+        applied_seq = record.sequence;
+    }
+
+    // A recovered engine must continue after the log's tail even when the tail
+    // was all duplicates, and after the snapshot when the tail is empty.
+    let log_last = log.last_sequence();
+    let durable_seq = log_last.unwrap_or(applied_seq);
+    let next_command_sequence = log_last
+        .map(|last| last.saturating_add(1))
+        .unwrap_or(1)
+        .max(applied_seq.saturating_add(1));
+
+    Ok(Recovered {
+        engine,
+        config: header.config,
+        applied_seq,
+        durable_seq,
+        next_command_sequence,
+    })
+}
+
 impl DurableMatchingEngine {
     /// Create a fresh engine, writing the log header. The log must not already
     /// have a header and both stores must start empty.
@@ -238,110 +366,23 @@ impl DurableMatchingEngine {
         snapshots: Box<dyn SnapshotStore>,
         snapshot_cadence: u64,
     ) -> Result<Self, DurableError> {
-        let header = log.read_header()?.ok_or(DurableError::MissingHeader)?;
-        if header.format_version != FORMAT_VERSION {
-            return Err(DurableError::UnsupportedVersion {
-                found: header.format_version,
-                supported: FORMAT_VERSION,
-            });
-        }
+        let Recovered {
+            engine,
+            applied_seq,
+            next_command_sequence,
+            ..
+        } = recover(log.as_ref(), snapshots.as_ref())?;
 
-        let (engine, applied_seq) = match snapshots.load_latest()? {
-            Some(stored) => {
-                if stored.format_version != FORMAT_VERSION {
-                    return Err(DurableError::UnsupportedVersion {
-                        found: stored.format_version,
-                        supported: FORMAT_VERSION,
-                    });
-                }
-                if stored.snapshot.config != header.config {
-                    return Err(DurableError::ConfigMismatch {
-                        header: header.config,
-                        snapshot: stored.snapshot.config,
-                    });
-                }
-                match log.last_sequence() {
-                    Some(last) if stored.applied_seq > last => {
-                        return Err(DurableError::SnapshotAhead {
-                            applied_seq: stored.applied_seq,
-                            log_last_seq: last,
-                        });
-                    }
-                    None if stored.applied_seq > 0 => {
-                        return Err(DurableError::SnapshotAhead {
-                            applied_seq: stored.applied_seq,
-                            log_last_seq: 0,
-                        });
-                    }
-                    _ => {}
-                }
-
-                (
-                    MatchingEngine::restore_snapshot(stored.snapshot),
-                    stored.applied_seq,
-                )
-            }
-            None => (MatchingEngine::new(header.config), 0),
-        };
-
-        // The log must cover every command after the snapshot boundary. With no
-        // snapshot that boundary is zero, so the log must start at sequence 1.
-        let expected_first = applied_seq.saturating_add(1);
-        if let Some(first) = log.first_sequence()
-            && first > expected_first
-        {
-            return Err(DurableError::RecoveryGap {
-                expected: expected_first,
-                found: Some(first),
-            });
-        }
-
-        let mut durable = Self {
+        Ok(Self {
             engine,
             log,
             snapshots,
-            next_command_sequence: 1,
+            next_command_sequence,
             applied_seq,
             snapshot_cadence,
             failed: false,
             last_snapshot_error: None,
-        };
-
-        let tail = durable
-            .log
-            .read_from(durable.applied_seq.saturating_add(1))?;
-        for record in tail {
-            if record.format_version != FORMAT_VERSION {
-                return Err(DurableError::UnsupportedVersion {
-                    found: record.format_version,
-                    supported: FORMAT_VERSION,
-                });
-            }
-            if record.sequence <= durable.applied_seq {
-                // At-least-once delivery: this sequence is already applied.
-                continue;
-            }
-            let expected = durable.applied_seq.saturating_add(1);
-            if record.sequence != expected {
-                return Err(DurableError::NonContiguousSequence {
-                    expected,
-                    found: record.sequence,
-                });
-            }
-            durable.apply_replayed(record.command);
-            durable.applied_seq = record.sequence;
-        }
-
-        // A recovered engine must continue after the log's tail even when the
-        // tail was all duplicates, and after the snapshot when the tail is empty.
-        durable.next_command_sequence = durable
-            .log
-            .last_sequence()
-            .map(|last| last.saturating_add(1))
-            .unwrap_or(1)
-            .max(durable.applied_seq.saturating_add(1));
-
-        Ok(durable)
+        })
     }
 
     /// Create a fresh durable engine and seed it through the append-then-apply
@@ -391,13 +432,6 @@ impl DurableMatchingEngine {
         }
 
         Ok(outcome)
-    }
-
-    /// Private recovery path: apply a logged command without appending it.
-    /// Only [`Self::open`] may call this, so no public caller can create
-    /// unlogged engine state.
-    fn apply_replayed(&mut self, command: EngineCommand) -> CommandOutcome {
-        self.engine.execute(command)
     }
 
     /// Write a snapshot of the current decision state. A failure is stored on
@@ -450,5 +484,139 @@ impl DurableMatchingEngine {
     /// no further commands until reopened.
     pub fn is_failed(&self) -> bool {
         self.failed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::durable::memory::{InMemoryCommandLog, InMemorySnapshotStore};
+    use crate::types::{OrderRequest, OrderType, Side, TimeInForce};
+
+    fn submit(price: u64) -> EngineCommand {
+        EngineCommand::SubmitOrder {
+            symbol: "BTC-USDT".to_string(),
+            request: OrderRequest {
+                side: Side::Bid,
+                price,
+                quantity: 1,
+                timestamp: price,
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::GTC,
+                post_only: false,
+            },
+        }
+    }
+
+    fn commands(count: usize) -> Vec<EngineCommand> {
+        (1..=count as u64).map(submit).collect()
+    }
+
+    /// Seed a log through the public append-before-apply path, then drop the
+    /// engine so only the durable log remains.
+    fn seeded_log(count: usize) -> InMemoryCommandLog {
+        let log = InMemoryCommandLog::new();
+        DurableMatchingEngine::from_commands(
+            EngineConfig::default(),
+            &commands(count),
+            Box::new(log.handle()),
+            Box::new(InMemorySnapshotStore::new()),
+            0,
+        )
+        .unwrap();
+        log
+    }
+
+    #[test]
+    fn recover_without_a_snapshot_returns_the_log_tail_as_the_durable_sequence() {
+        let log = seeded_log(3);
+        let recovered = recover(&log, &InMemorySnapshotStore::new()).unwrap();
+
+        assert_eq!(recovered.config, EngineConfig::default());
+        assert_eq!(recovered.applied_seq, 3);
+        assert_eq!(recovered.durable_seq, 3);
+        assert_eq!(recovered.next_command_sequence, 4);
+
+        let mut expected = MatchingEngine::new(EngineConfig::default());
+        for command in commands(3) {
+            let _ = expected.execute(command);
+        }
+        assert_eq!(
+            recovered.engine.capture_snapshot(),
+            expected.capture_snapshot()
+        );
+    }
+
+    #[test]
+    fn recover_from_an_empty_log_uses_the_applied_sequence_as_the_durable_sequence() {
+        let log = InMemoryCommandLog::new();
+        DurableMatchingEngine::create(
+            EngineConfig::default(),
+            Box::new(log.handle()),
+            Box::new(InMemorySnapshotStore::new()),
+            0,
+        )
+        .unwrap();
+
+        let recovered = recover(&log, &InMemorySnapshotStore::new()).unwrap();
+        assert_eq!(recovered.applied_seq, 0);
+        assert_eq!(recovered.durable_seq, 0);
+        assert_eq!(recovered.next_command_sequence, 1);
+    }
+
+    #[test]
+    fn recover_with_a_snapshot_and_a_tail_returns_the_log_tail_as_the_durable_sequence() {
+        let log = InMemoryCommandLog::new();
+        let snapshots = InMemorySnapshotStore::new();
+        {
+            let mut durable = DurableMatchingEngine::create(
+                EngineConfig::default(),
+                Box::new(log.handle()),
+                Box::new(snapshots.handle()),
+                2,
+            )
+            .unwrap();
+            for command in commands(5) {
+                durable.execute(command).unwrap();
+            }
+        }
+        assert_eq!(
+            snapshots.load_latest().unwrap().unwrap().applied_seq,
+            4,
+            "cadence 2 must snapshot before the final command"
+        );
+
+        let recovered = recover(&log, &snapshots).unwrap();
+        assert_eq!(recovered.applied_seq, 5);
+        assert_eq!(recovered.durable_seq, 5);
+        assert_eq!(recovered.next_command_sequence, 6);
+    }
+
+    #[test]
+    fn a_snapshot_at_the_log_tail_yields_a_durable_sequence_equal_to_the_applied_sequence() {
+        let log = InMemoryCommandLog::new();
+        let snapshots = InMemorySnapshotStore::new();
+        {
+            let mut durable = DurableMatchingEngine::create(
+                EngineConfig::default(),
+                Box::new(log.handle()),
+                Box::new(snapshots.handle()),
+                4,
+            )
+            .unwrap();
+            for command in commands(4) {
+                durable.execute(command).unwrap();
+            }
+        }
+        assert_eq!(
+            snapshots.load_latest().unwrap().unwrap().applied_seq,
+            4,
+            "cadence 4 must snapshot at the log tail"
+        );
+
+        let recovered = recover(&log, &snapshots).unwrap();
+        assert_eq!(recovered.applied_seq, 4);
+        assert_eq!(recovered.durable_seq, recovered.applied_seq);
+        assert_eq!(recovered.next_command_sequence, 5);
     }
 }
