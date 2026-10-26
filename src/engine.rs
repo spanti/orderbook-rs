@@ -238,7 +238,15 @@ impl MatchingEngine {
     /// Durability and replay belong to the durable layer, which appends the
     /// command before calling this method.
     pub fn execute(&mut self, command: EngineCommand) -> CommandOutcome {
-        self.apply(&command)
+        self.execute_ref(&command)
+    }
+
+    /// Apply a command by reference.
+    ///
+    /// The runtime uses this to apply without cloning, then moves the same
+    /// command into its journal record.
+    pub fn execute_ref(&mut self, command: &EngineCommand) -> CommandOutcome {
+        self.apply(command)
     }
 
     /// Core apply path used by `execute`. Never performs IO.
@@ -748,6 +756,15 @@ impl MatchingEngine {
 
     pub fn events(&self) -> &[EngineEvent] {
         &self.events
+    }
+
+    /// Drop retained output events.
+    ///
+    /// Decision state, trades and the event sequence allocator are unaffected;
+    /// a long-running runtime calls this after each command so output history
+    /// does not grow without bound.
+    pub fn clear_events(&mut self) {
+        self.events.clear();
     }
 
     fn allocate_sequence_id(&mut self) -> u64 {
@@ -2536,5 +2553,49 @@ mod tests {
 
         let recovered = assert_recovered(&commands, &engine);
         assert_eq!(recovered.engine().book("BTC-USDT"), engine.book("BTC-USDT"));
+    }
+
+    #[test]
+    fn execute_ref_matches_execute_state_and_outcome() {
+        let commands = vec![
+            submit_command("BTC-USDT", limit(1, Side::Ask, 100, 5)),
+            submit_command("BTC-USDT", limit(2, Side::Bid, 100, 3)),
+            cancel_command("BTC-USDT", 1),
+            submit_command("BTC-USDT", limit(3, Side::Bid, 100, 0)),
+        ];
+
+        let mut by_value = MatchingEngine::new(EngineConfig::default());
+        let mut by_ref = MatchingEngine::new(EngineConfig::default());
+
+        for command in &commands {
+            let value_outcome = by_value.execute(command.clone());
+            let ref_outcome = by_ref.execute_ref(command);
+            assert_eq!(ref_outcome, value_outcome);
+        }
+
+        assert_eq!(by_ref.capture_snapshot(), by_value.capture_snapshot());
+        assert_eq!(by_ref.events(), by_value.events());
+        assert_eq!(by_ref.last_sequence(), by_value.last_sequence());
+    }
+
+    #[test]
+    fn clear_events_keeps_state_and_the_event_sequence_counter() {
+        let mut engine = MatchingEngine::new(EngineConfig::default());
+        submit(&mut engine, "BTC-USDT", limit(1, Side::Ask, 100, 5)).unwrap();
+        submit(&mut engine, "BTC-USDT", limit(2, Side::Bid, 100, 2)).unwrap();
+
+        let state_before = engine.capture_snapshot();
+        let sequence_before = engine.last_sequence();
+        assert!(!engine.events().is_empty());
+
+        engine.clear_events();
+
+        assert!(engine.events().is_empty());
+        assert_eq!(engine.last_sequence(), sequence_before);
+        assert_eq!(engine.capture_snapshot(), state_before);
+
+        // Clearing output history does not reset the sequence allocator.
+        submit(&mut engine, "BTC-USDT", limit(3, Side::Bid, 99, 1)).unwrap();
+        assert_eq!(engine.last_sequence(), sequence_before + 1);
     }
 }

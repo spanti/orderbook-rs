@@ -48,6 +48,120 @@ fn help_exits_zero_and_lists_options() {
     assert!(text.contains("--events"));
     assert!(text.contains("--warmup"));
     assert!(text.contains("--allow-debug"));
+    assert!(text.contains("--path direct|runtime"));
+    assert!(text.contains("--in-flight"));
+    assert!(text.contains("--journal-coalesce-max"));
+}
+
+#[test]
+fn runtime_path_runs_a_tiny_workload_and_prints_both_latency_families() {
+    let output = bench(&[
+        "--allow-debug",
+        "--path",
+        "runtime",
+        "--events",
+        "100",
+        "--warmup",
+        "10",
+        "--rate",
+        "0",
+        "--in-flight",
+        "1",
+    ]);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("runtime latency (ns)"));
+    assert!(text.contains("applied"));
+    assert!(text.contains("durable"));
+    assert!(text.contains("runtime metrics"));
+    assert!(text.contains("queue wait"));
+    assert!(text.contains("journal append"));
+    assert!(text.contains("queue full"));
+    assert!(text.contains("fsync share"));
+    assert!(text.contains("slo"));
+    assert!(text.contains("target=10,000 ns"));
+    assert!(text.contains("target=500,000 ns"));
+    assert!(text.contains("PASS") || text.contains("FAIL"));
+}
+
+#[test]
+fn runtime_path_supports_in_flight_and_file_log() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "orderbook-bench-data-{}-{unique}",
+        std::process::id()
+    ));
+
+    let output = bench(&[
+        "--allow-debug",
+        "--path",
+        "runtime",
+        "--log",
+        "file",
+        "--data-dir",
+        dir.to_str().expect("temporary path is utf-8"),
+        "--in-flight",
+        "4",
+        "--events",
+        "50",
+        "--warmup",
+        "0",
+        "--rate",
+        "0",
+    ]);
+
+    let stderr_text = stderr(&output);
+    let text = stdout(&output);
+    assert!(output.status.success(), "stderr: {stderr_text}");
+    assert!(text.contains("log=file"));
+    assert!(text.contains("in_flight=4"));
+    assert!(dir.join("commands.log").exists());
+    assert!(dir.join("snapshots").exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn invalid_runtime_flags_are_usage_errors() {
+    for args in [
+        vec!["--path", "hybrid"],
+        vec!["--idle", "busy"],
+        vec!["--log", "disk"],
+        vec!["--path", "runtime", "--in-flight", "0"],
+        vec!["--path", "runtime", "--queue-capacity", "0"],
+        vec!["--path", "runtime", "--log", "file"],
+    ] {
+        let output = bench(&args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "expected a usage exit for {args:?}; stderr: {}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains("invalid value")
+                || stderr(&output).contains("must be greater than 0")
+                || stderr(&output).contains("requires --data-dir"),
+            "unexpected stderr for {args:?}: {}",
+            stderr(&output)
+        );
+    }
+}
+
+#[test]
+fn direct_output_stays_runtime_free() {
+    let output = bench(&small_args());
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(!text.contains("runtime latency"));
+    assert!(!text.contains("runtime metrics"));
+    assert!(!text.contains("fsync share"));
+    assert!(!text.contains("slo"));
 }
 
 #[test]

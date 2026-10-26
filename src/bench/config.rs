@@ -4,6 +4,8 @@ use std::collections::HashSet;
 use std::fmt;
 use std::path::PathBuf;
 
+use crate::runtime::IdleStrategy;
+
 pub const DEFAULT_EVENTS: u64 = 500_000;
 pub const DEFAULT_RATE: u64 = 1_000_000;
 pub const DEFAULT_SEED: u64 = 42;
@@ -18,6 +20,33 @@ pub const DEFAULT_ORDER_QUANTITY: u64 = 10;
 pub const DEFAULT_MAX_OPEN_ORDERS: u64 = 100_000;
 pub const WARMUP_CAP: u64 = 100_000;
 pub const RATIO_TOLERANCE: f64 = 1e-6;
+
+pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;
+pub const DEFAULT_JOURNAL_BATCH_CAPACITY: usize = 64;
+pub const DEFAULT_APPLY_BATCH_MAX: usize = 64;
+pub const DEFAULT_JOURNAL_COALESCE_MAX: usize = 1024;
+pub const DEFAULT_JOURNAL_FLUSH_US: u64 = 100;
+pub const DEFAULT_IN_FLIGHT: usize = 1;
+
+/// Which execution path the benchmark drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BenchPath {
+    /// Call `MatchingEngine::execute` directly on the producer thread.
+    #[default]
+    Direct,
+    /// Submit through the matching runtime's bounded Command Queue.
+    Runtime,
+}
+
+/// Storage adapters used by the runtime path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogKind {
+    /// In-memory command log and snapshot store.
+    #[default]
+    Memory,
+    /// File-backed command log and snapshot store under `--data-dir`.
+    File,
+}
 
 pub const HELP: &str = "\
 orderbook-rs bench
@@ -42,6 +71,22 @@ Options:
   --allow-debug            Allow running a debug build
   -h, --help               Print this help
 
+Runtime path options:
+  --path direct|runtime    Execution path (default: direct)
+  --queue-capacity <N>     Ingress Command Queue capacity (default: 1024)
+  --journal-batch-capacity <N>
+                           Journal batches in flight before backpressure (default: 64)
+  --apply-batch-max <N>    Maximum records per journal batch (default: 64)
+  --journal-coalesce-max <N>
+                           Maximum records per journal append/fsync (default: 1024)
+  --journal-flush-us <N>   Upper bound on buffering before a flush, in us (default: 100)
+  --idle spin|backoff      Matching-thread idle strategy; runtime default: spin
+  --affinity <CORE>        Pin the matching thread to a core index
+  --snapshot-cadence <N>   Automatic snapshots every N commands; 0 disables (default: 0)
+  --log memory|file        Runtime storage adapters (default: memory)
+  --data-dir <PATH>        Directory for file adapters; required with --log file
+  --in-flight <N>          Commands in flight; 1 measures submit-to-ack latency (default: 1)
+
 The benchmark must be built with --release for meaningful numbers.
 ";
 
@@ -62,6 +107,18 @@ pub struct BenchConfig {
     pub max_open_orders: u64,
     pub json_out: Option<PathBuf>,
     pub allow_debug: bool,
+    pub path: BenchPath,
+    pub queue_capacity: usize,
+    pub journal_batch_capacity: usize,
+    pub apply_batch_max: usize,
+    pub journal_coalesce_max: usize,
+    pub journal_flush_us: u64,
+    pub idle: IdleStrategy,
+    pub affinity: Option<usize>,
+    pub snapshot_cadence: u64,
+    pub log: LogKind,
+    pub data_dir: Option<PathBuf>,
+    pub in_flight: usize,
 }
 
 impl Default for BenchConfig {
@@ -82,6 +139,20 @@ impl Default for BenchConfig {
             max_open_orders: DEFAULT_MAX_OPEN_ORDERS,
             json_out: None,
             allow_debug: false,
+            path: BenchPath::Direct,
+            queue_capacity: DEFAULT_QUEUE_CAPACITY,
+            journal_batch_capacity: DEFAULT_JOURNAL_BATCH_CAPACITY,
+            apply_batch_max: DEFAULT_APPLY_BATCH_MAX,
+            journal_coalesce_max: DEFAULT_JOURNAL_COALESCE_MAX,
+            journal_flush_us: DEFAULT_JOURNAL_FLUSH_US,
+            // The bench measures the low-latency target, so spin is the
+            // runtime default even though RuntimeConfig defaults to Backoff.
+            idle: IdleStrategy::Spin,
+            affinity: None,
+            snapshot_cadence: 0,
+            log: LogKind::Memory,
+            data_dir: None,
+            in_flight: DEFAULT_IN_FLIGHT,
         }
     }
 }
@@ -91,6 +162,30 @@ pub fn default_warmup(events: u64) -> u64 {
 }
 
 impl BenchConfig {
+    /// Convert the bench's flat tuning flags into the runtime's tuning type.
+    ///
+    /// This is the single conversion point. The CLI keeps a flat flag surface
+    /// (one flag per tuning value) so the help text, argument parser, and
+    /// report stay stable; only this method maps those values onto
+    /// [`crate::runtime::RuntimeConfig`].
+    pub fn runtime_config(
+        &self,
+        metrics: std::sync::Arc<crate::runtime::RuntimeMetrics>,
+    ) -> crate::runtime::RuntimeConfig {
+        crate::runtime::RuntimeConfig {
+            queue_capacity: self.queue_capacity,
+            journal_batch_capacity: self.journal_batch_capacity,
+            apply_batch_max: self.apply_batch_max,
+            journal_coalesce_max: self.journal_coalesce_max,
+            journal_flush_interval: std::time::Duration::from_micros(self.journal_flush_us),
+            snapshot_cadence: self.snapshot_cadence,
+            idle: self.idle,
+            matching_core: self.affinity,
+            metrics: Some(metrics),
+            ..crate::runtime::RuntimeConfig::default()
+        }
+    }
+
     pub fn validate(&self) -> Result<(), BenchError> {
         if self.events == 0 {
             return Err(BenchError::usage("--events must be greater than 0"));
@@ -131,6 +226,21 @@ impl BenchConfig {
             return Err(BenchError::usage(format!(
                 "--limit-ratio + --market-ratio + --cancel-ratio must equal 1 (got {sum})"
             )));
+        }
+
+        for (name, value) in [
+            ("--queue-capacity", self.queue_capacity),
+            ("--journal-batch-capacity", self.journal_batch_capacity),
+            ("--apply-batch-max", self.apply_batch_max),
+            ("--journal-coalesce-max", self.journal_coalesce_max),
+            ("--in-flight", self.in_flight),
+        ] {
+            if value == 0 {
+                return Err(BenchError::usage(format!("{name} must be greater than 0")));
+            }
+        }
+        if self.path == BenchPath::Runtime && self.log == LogKind::File && self.data_dir.is_none() {
+            return Err(BenchError::usage("--log file requires --data-dir <PATH>"));
         }
 
         Ok(())
@@ -204,6 +314,18 @@ where
     let mut max_open_orders = None;
     let mut json_out = None;
     let mut allow_debug = false;
+    let mut path = None;
+    let mut queue_capacity = None;
+    let mut journal_batch_capacity = None;
+    let mut apply_batch_max = None;
+    let mut journal_coalesce_max = None;
+    let mut journal_flush_us = None;
+    let mut idle = None;
+    let mut affinity = None;
+    let mut snapshot_cadence = None;
+    let mut log = None;
+    let mut data_dir = None;
+    let mut in_flight = None;
 
     let mut index = 0;
     while index < args.len() {
@@ -259,6 +381,18 @@ where
             "--order-quantity" => order_quantity = Some(parse_u64(flag, &value)?),
             "--max-open-orders" => max_open_orders = Some(parse_u64(flag, &value)?),
             "--json-out" => json_out = Some(PathBuf::from(value)),
+            "--path" => path = Some(parse_path(&value)?),
+            "--queue-capacity" => queue_capacity = Some(parse_usize(flag, &value)?),
+            "--journal-batch-capacity" => journal_batch_capacity = Some(parse_usize(flag, &value)?),
+            "--apply-batch-max" => apply_batch_max = Some(parse_usize(flag, &value)?),
+            "--journal-coalesce-max" => journal_coalesce_max = Some(parse_usize(flag, &value)?),
+            "--journal-flush-us" => journal_flush_us = Some(parse_u64(flag, &value)?),
+            "--idle" => idle = Some(parse_idle(&value)?),
+            "--affinity" => affinity = Some(parse_usize(flag, &value)?),
+            "--snapshot-cadence" => snapshot_cadence = Some(parse_u64(flag, &value)?),
+            "--log" => log = Some(parse_log(&value)?),
+            "--data-dir" => data_dir = Some(PathBuf::from(value)),
+            "--in-flight" => in_flight = Some(parse_usize(flag, &value)?),
             _ => unreachable!("takes_value accepted an unknown flag"),
         }
     }
@@ -280,6 +414,18 @@ where
         max_open_orders: max_open_orders.unwrap_or(DEFAULT_MAX_OPEN_ORDERS),
         json_out,
         allow_debug,
+        path: path.unwrap_or_default(),
+        queue_capacity: queue_capacity.unwrap_or(DEFAULT_QUEUE_CAPACITY),
+        journal_batch_capacity: journal_batch_capacity.unwrap_or(DEFAULT_JOURNAL_BATCH_CAPACITY),
+        apply_batch_max: apply_batch_max.unwrap_or(DEFAULT_APPLY_BATCH_MAX),
+        journal_coalesce_max: journal_coalesce_max.unwrap_or(DEFAULT_JOURNAL_COALESCE_MAX),
+        journal_flush_us: journal_flush_us.unwrap_or(DEFAULT_JOURNAL_FLUSH_US),
+        idle: idle.unwrap_or(IdleStrategy::Spin),
+        affinity,
+        snapshot_cadence: snapshot_cadence.unwrap_or(0),
+        log: log.unwrap_or_default(),
+        data_dir,
+        in_flight: in_flight.unwrap_or(DEFAULT_IN_FLIGHT),
     };
 
     config.validate()?;
@@ -303,7 +449,49 @@ fn takes_value(flag: &str) -> bool {
             | "--order-quantity"
             | "--max-open-orders"
             | "--json-out"
+            | "--path"
+            | "--queue-capacity"
+            | "--journal-batch-capacity"
+            | "--apply-batch-max"
+            | "--journal-coalesce-max"
+            | "--journal-flush-us"
+            | "--idle"
+            | "--affinity"
+            | "--snapshot-cadence"
+            | "--log"
+            | "--data-dir"
+            | "--in-flight"
     )
+}
+
+fn parse_path(value: &str) -> Result<BenchPath, BenchError> {
+    match value {
+        "direct" => Ok(BenchPath::Direct),
+        "runtime" => Ok(BenchPath::Runtime),
+        _ => Err(BenchError::usage(format!(
+            "invalid value for --path: {value} (expected direct or runtime)"
+        ))),
+    }
+}
+
+fn parse_idle(value: &str) -> Result<IdleStrategy, BenchError> {
+    match value {
+        "spin" => Ok(IdleStrategy::Spin),
+        "backoff" => Ok(IdleStrategy::Backoff),
+        _ => Err(BenchError::usage(format!(
+            "invalid value for --idle: {value} (expected spin or backoff)"
+        ))),
+    }
+}
+
+fn parse_log(value: &str) -> Result<LogKind, BenchError> {
+    match value {
+        "memory" => Ok(LogKind::Memory),
+        "file" => Ok(LogKind::File),
+        _ => Err(BenchError::usage(format!(
+            "invalid value for --log: {value} (expected memory or file)"
+        ))),
+    }
 }
 
 fn parse_u64(flag: &str, value: &str) -> Result<u64, BenchError> {
@@ -398,5 +586,158 @@ mod tests {
             parse_args(["-h".to_string()]).expect("help"),
             CliAction::Help
         );
+    }
+
+    #[test]
+    fn path_defaults_to_direct_and_runtime_flags_have_bench_defaults() {
+        let config = BenchConfig::default();
+        assert_eq!(config.path, BenchPath::Direct);
+        assert_eq!(config.queue_capacity, 1024);
+        assert_eq!(config.journal_batch_capacity, 64);
+        assert_eq!(config.apply_batch_max, 64);
+        assert_eq!(config.journal_coalesce_max, 1024);
+        assert_eq!(config.journal_flush_us, 100);
+        assert_eq!(config.idle, crate::runtime::IdleStrategy::Spin);
+        assert_eq!(config.affinity, None);
+        assert_eq!(config.snapshot_cadence, 0);
+        assert_eq!(config.log, LogKind::Memory);
+        assert_eq!(config.data_dir, None);
+        assert_eq!(config.in_flight, 1);
+    }
+
+    #[test]
+    fn parses_the_runtime_flag_surface() {
+        let action = parse_args([
+            "--path".to_string(),
+            "runtime".to_string(),
+            "--queue-capacity".to_string(),
+            "2048".to_string(),
+            "--journal-batch-capacity".to_string(),
+            "32".to_string(),
+            "--apply-batch-max".to_string(),
+            "16".to_string(),
+            "--journal-coalesce-max".to_string(),
+            "512".to_string(),
+            "--journal-flush-us".to_string(),
+            "50".to_string(),
+            "--idle".to_string(),
+            "backoff".to_string(),
+            "--affinity".to_string(),
+            "3".to_string(),
+            "--snapshot-cadence".to_string(),
+            "1000".to_string(),
+            "--log".to_string(),
+            "file".to_string(),
+            "--data-dir".to_string(),
+            "tmp/bench".to_string(),
+            "--in-flight".to_string(),
+            "8".to_string(),
+        ])
+        .expect("valid runtime arguments");
+
+        let CliAction::Run(config) = action else {
+            panic!("expected a run action");
+        };
+        assert_eq!(config.path, BenchPath::Runtime);
+        assert_eq!(config.queue_capacity, 2048);
+        assert_eq!(config.journal_batch_capacity, 32);
+        assert_eq!(config.apply_batch_max, 16);
+        assert_eq!(config.journal_coalesce_max, 512);
+        assert_eq!(config.journal_flush_us, 50);
+        assert_eq!(config.idle, crate::runtime::IdleStrategy::Backoff);
+        assert_eq!(config.affinity, Some(3));
+        assert_eq!(config.snapshot_cadence, 1000);
+        assert_eq!(config.log, LogKind::File);
+        assert_eq!(config.data_dir, Some(PathBuf::from("tmp/bench")));
+        assert_eq!(config.in_flight, 8);
+    }
+
+    #[test]
+    fn rejects_invalid_runtime_flag_values() {
+        for args in [
+            vec!["--path", "hybrid"],
+            vec!["--idle", "busy"],
+            vec!["--log", "disk"],
+            vec!["--path", "runtime", "--in-flight", "0"],
+            vec!["--path", "direct", "--in-flight", "0"],
+            vec!["--path", "runtime", "--queue-capacity", "0"],
+            vec!["--path", "runtime", "--journal-batch-capacity", "0"],
+            vec!["--path", "runtime", "--apply-batch-max", "0"],
+            vec!["--path", "runtime", "--journal-coalesce-max", "0"],
+            vec!["--path", "runtime", "--log", "file"],
+        ] {
+            let parsed: Result<CliAction, BenchError> =
+                parse_args(args.iter().map(|arg| arg.to_string()));
+            assert!(parsed.is_err(), "expected a usage error for {args:?}");
+        }
+    }
+
+    #[test]
+    fn runtime_numeric_flags_must_be_positive() {
+        let mut config = BenchConfig::default();
+        config.path = BenchPath::Runtime;
+        config.in_flight = 0;
+        assert!(matches!(config.validate(), Err(BenchError::Usage(_))));
+
+        config.in_flight = 1;
+        config.queue_capacity = 0;
+        assert!(matches!(config.validate(), Err(BenchError::Usage(_))));
+
+        config.queue_capacity = 1024;
+        config.journal_batch_capacity = 0;
+        assert!(matches!(config.validate(), Err(BenchError::Usage(_))));
+
+        config.journal_batch_capacity = 64;
+        config.apply_batch_max = 0;
+        assert!(matches!(config.validate(), Err(BenchError::Usage(_))));
+
+        config.apply_batch_max = 64;
+        config.journal_coalesce_max = 0;
+        assert!(matches!(config.validate(), Err(BenchError::Usage(_))));
+    }
+
+    #[test]
+    fn runtime_config_conversion_maps_every_tuning_field() {
+        let mut config = BenchConfig::default();
+        config.queue_capacity = 2048;
+        config.journal_batch_capacity = 32;
+        config.apply_batch_max = 16;
+        config.journal_coalesce_max = 512;
+        config.journal_flush_us = 55;
+        config.idle = IdleStrategy::Backoff;
+        config.affinity = Some(3);
+        config.snapshot_cadence = 1_000;
+
+        let metrics = std::sync::Arc::new(crate::runtime::RuntimeMetrics::new());
+        let runtime = config.runtime_config(std::sync::Arc::clone(&metrics));
+
+        assert_eq!(runtime.queue_capacity, 2048);
+        assert_eq!(runtime.journal_batch_capacity, 32);
+        assert_eq!(runtime.apply_batch_max, 16);
+        assert_eq!(runtime.journal_coalesce_max, 512);
+        assert_eq!(
+            runtime.journal_flush_interval,
+            std::time::Duration::from_micros(55)
+        );
+        assert_eq!(runtime.idle, IdleStrategy::Backoff);
+        assert_eq!(runtime.matching_core, Some(3));
+        assert_eq!(runtime.snapshot_cadence, 1_000);
+        assert!(
+            runtime
+                .metrics
+                .as_ref()
+                .is_some_and(|sink| std::sync::Arc::ptr_eq(sink, &metrics))
+        );
+    }
+
+    #[test]
+    fn file_log_requires_a_data_dir() {
+        let mut config = BenchConfig::default();
+        config.path = BenchPath::Runtime;
+        config.log = LogKind::File;
+        assert!(matches!(config.validate(), Err(BenchError::Usage(_))));
+
+        config.data_dir = Some(PathBuf::from("tmp/bench"));
+        assert!(config.validate().is_ok());
     }
 }

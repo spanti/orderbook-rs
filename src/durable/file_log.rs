@@ -3,7 +3,9 @@
 //! The file starts with a header line and continues with one command record per
 //! line. Every line is `{crc32:08x} {json}\n`, where the CRC-32 covers the JSON
 //! bytes. An append writes, flushes and fsyncs before returning, so an
-//! acknowledged record is on disk.
+//! acknowledged record is on disk. A batch append validates and encodes the
+//! whole batch first, then writes all lines with one flush and one fsync; the
+//! cached records change only after that fsync succeeds.
 //!
 //! On open only a final line without a terminating newline is truncated: that
 //! append was never acknowledged. Any newline-terminated line that fails its
@@ -177,6 +179,63 @@ impl CommandLog for FileCommandLog {
         })?;
 
         self.records.push(record);
+        Ok(())
+    }
+
+    fn append_batch(&mut self, records: Vec<CommandRecord>) -> Result<(), DurableError> {
+        if self.header.is_none() {
+            return Err(DurableError::MissingHeader);
+        }
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        // Validate the whole batch before touching the file, so a gap cannot
+        // leave a prefix of an invalid batch on disk.
+        let mut expected = self
+            .records
+            .last()
+            .map(|last| last.sequence.saturating_add(1))
+            .unwrap_or(1);
+        for record in &records {
+            if record.sequence != expected {
+                return Err(DurableError::NonContiguousSequence {
+                    expected,
+                    found: record.sequence,
+                });
+            }
+            expected = expected.saturating_add(1);
+        }
+
+        // Encode everything up front for the same reason: an encoding failure
+        // must not write part of the batch.
+        let mut bytes = Vec::new();
+        for record in &records {
+            let line = encode_line(record).map_err(|error| match error {
+                DurableError::Storage(detail) => {
+                    DurableError::AppendFailed(format!("cannot encode command: {detail}"))
+                }
+                other => other,
+            })?;
+            bytes.extend_from_slice(line.as_bytes());
+        }
+
+        // One write, one flush, one fsync for the whole group.
+        self.file
+            .seek(SeekFrom::End(0))
+            .and_then(|_| self.file.write_all(&bytes))
+            .and_then(|_| self.file.flush())
+            .and_then(|_| self.file.sync_all())
+            .map_err(|error| {
+                DurableError::AppendFailed(format!(
+                    "cannot append to {}: {error}",
+                    self.path.display()
+                ))
+            })?;
+
+        // Cache only after durability: `last_sequence` must never advertise a
+        // record a crash could lose.
+        self.records.extend(records);
         Ok(())
     }
 

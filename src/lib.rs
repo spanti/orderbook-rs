@@ -5,6 +5,7 @@ pub mod durable;
 pub mod engine;
 mod ledger;
 pub mod orderbook;
+pub mod runtime;
 pub mod snapshot;
 mod stop_book;
 pub mod types;
