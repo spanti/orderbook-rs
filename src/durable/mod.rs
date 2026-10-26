@@ -373,7 +373,16 @@ impl DurableMatchingEngine {
 
         self.next_command_sequence = sequence.saturating_add(1);
         self.applied_seq = sequence;
-        Ok(self.engine.execute(command))
+        let outcome = self.engine.execute(command);
+
+        // Automatic snapshots only run between commands, after a successful
+        // apply. A failure never fails an already-durable command: it is kept
+        // for `last_snapshot_error` and retried at the next cadence boundary.
+        if self.snapshot_cadence > 0 && self.applied_seq % self.snapshot_cadence == 0 {
+            let _ = self.snapshot_now();
+        }
+
+        Ok(outcome)
     }
 
     /// Private recovery path: apply a logged command without appending it.
