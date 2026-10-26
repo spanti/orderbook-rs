@@ -41,6 +41,11 @@ pub(crate) struct SharedState {
     failed: Arc<AtomicBool>,
     fatal: Arc<Mutex<Option<DurableError>>>,
     durable_seq: Arc<AtomicU64>,
+    applied_seq: Arc<AtomicU64>,
+    /// Deadline after which a closed matching thread stops waiting for the
+    /// journal and aborts shutdown with a timeout.
+    shutdown_deadline: Arc<Mutex<Option<Instant>>>,
+    timed_out: Arc<AtomicBool>,
     /// Envelopes currently in the ingress command queue. Used only to report
     /// queue-depth metrics; it is not a correctness signal.
     ingress_depth: Arc<AtomicU64>,
@@ -63,6 +68,9 @@ impl SharedState {
             failed: Arc::new(AtomicBool::new(false)),
             fatal: Arc::new(Mutex::new(None)),
             durable_seq,
+            applied_seq: Arc::new(AtomicU64::new(0)),
+            shutdown_deadline: Arc::new(Mutex::new(None)),
+            timed_out: Arc::new(AtomicBool::new(false)),
             ingress_depth: Arc::new(AtomicU64::new(0)),
             metrics,
         }
@@ -101,6 +109,36 @@ impl SharedState {
     /// Advance the durability watermark to at least `sequence`.
     pub(crate) fn publish_durable(&self, sequence: u64) {
         self.durable_seq.fetch_max(sequence, Ordering::Release);
+    }
+
+    /// The last command sequence the matching thread applied.
+    pub(crate) fn applied_seq(&self) -> u64 {
+        self.applied_seq.load(Ordering::Acquire)
+    }
+
+    /// Publish the last applied command sequence.
+    pub(crate) fn publish_applied(&self, sequence: u64) {
+        self.applied_seq.store(sequence, Ordering::Release);
+    }
+
+    /// Bound how long a closed matching thread waits for the journal.
+    pub(crate) fn set_shutdown_deadline(&self, deadline: Instant) {
+        *lock(&self.shutdown_deadline) = Some(deadline);
+    }
+
+    /// Whether shutdown's durability deadline has elapsed.
+    pub(crate) fn shutdown_expired(&self) -> bool {
+        lock(&self.shutdown_deadline).is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    /// Record that shutdown stopped waiting for durability.
+    pub(crate) fn mark_timed_out(&self) {
+        self.timed_out.store(true, Ordering::Release);
+    }
+
+    /// Whether shutdown aborted because the durability deadline elapsed.
+    pub(crate) fn timed_out(&self) -> bool {
+        self.timed_out.load(Ordering::Acquire)
     }
 }
 
@@ -437,6 +475,34 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
                 return self.engine;
             }
 
+            // Shutdown is bounded: once the deadline elapses the matching
+            // thread stops waiting for an unfinished journal instead of
+            // spinning forever. All work already completed still counts as a
+            // clean shutdown.
+            if self.shared.is_closed() && self.shared.shutdown_expired() {
+                if self.can_exit() {
+                    return self.engine;
+                }
+                // The deadline can expire in the same iteration that the last
+                // command became durable. Confirm the ingress is really empty
+                // before reporting a timeout.
+                if self.pending_durable.is_empty() && self.journal_buffer.is_empty() {
+                    match self.ingress.try_recv() {
+                        Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
+                            self.ingress_empty = true;
+                            return self.engine;
+                        }
+                        Ok(envelope) => {
+                            self.shared.ingress_depth.fetch_sub(1, Ordering::Relaxed);
+                            envelope.slot.set_applied(Err(RuntimeError::EngineStopped));
+                            envelope.slot.set_durable(Err(RuntimeError::EngineStopped));
+                        }
+                    }
+                }
+                self.abort_timeout();
+                return self.engine;
+            }
+
             // Durable acknowledgements are driven only by the watermark.
             self.drain_durable();
 
@@ -598,6 +664,7 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
         let sequence = self.next_command_sequence;
         self.next_command_sequence = sequence.saturating_add(1);
         self.applied_seq = sequence;
+        self.shared.publish_applied(sequence);
 
         slot.set_applied(Ok(CommandReceipt {
             outcome,
@@ -643,6 +710,30 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
             pending.slot.set_durable(Err(runtime_error.clone()));
         }
 
+        self.journal_buffer.clear();
+        self.buffer_started_at = None;
+    }
+
+    /// Stop waiting for durability at the shutdown deadline.
+    ///
+    /// Every command still queued or awaiting its durable acknowledgement is
+    /// released with [`RuntimeError::EngineStopped`]; nothing is applied after
+    /// this point.
+    fn abort_timeout(&mut self) {
+        let stopped = RuntimeError::EngineStopped;
+        self.shared.mark_timed_out();
+
+        while let Ok(envelope) = self.ingress.try_recv() {
+            self.shared.ingress_depth.fetch_sub(1, Ordering::Relaxed);
+            envelope.slot.set_applied(Err(stopped.clone()));
+            envelope.slot.set_durable(Err(stopped.clone()));
+        }
+
+        while let Some(pending) = self.pending_durable.pop_front() {
+            pending.slot.set_durable(Err(stopped.clone()));
+        }
+
+        self.ingress_empty = true;
         self.journal_buffer.clear();
         self.buffer_started_at = None;
     }

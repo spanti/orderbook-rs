@@ -42,6 +42,10 @@ impl std::error::Error for SubmitError {
 pub enum RuntimeError {
     /// The journal failed; queued and pending commands cannot become durable.
     EngineFailed(DurableError),
+    /// The ingress command queue or the response-slot pool is exhausted.
+    QueueFull,
+    /// The runtime is shutting down and accepts no new commands.
+    Shutdown,
     /// A worker stopped or panicked before completing the command.
     EngineStopped,
     /// The caller's timeout expired before the requested acknowledgement.
@@ -58,6 +62,8 @@ impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EngineFailed(error) => write!(f, "runtime engine failed: {error}"),
+            Self::QueueFull => write!(f, "command queue is full"),
+            Self::Shutdown => write!(f, "runtime is shut down"),
             Self::EngineStopped => {
                 write!(f, "runtime worker stopped before completing the command")
             }
@@ -73,9 +79,25 @@ impl std::error::Error for RuntimeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::EngineFailed(error) | Self::SnapshotFailed(error) => Some(error),
-            Self::EngineStopped | Self::Timeout | Self::WorkerPanicked(_) | Self::Startup(_) => {
-                None
-            }
+            Self::QueueFull
+            | Self::Shutdown
+            | Self::EngineStopped
+            | Self::Timeout
+            | Self::WorkerPanicked(_)
+            | Self::Startup(_) => None,
+        }
+    }
+}
+
+/// A convenience wrapper maps a refused submission to the matching runtime
+/// error, so `submit_and_wait` does not collapse `QueueFull` into a wait
+/// failure.
+impl From<SubmitError> for RuntimeError {
+    fn from(error: SubmitError) -> Self {
+        match error {
+            SubmitError::QueueFull => Self::QueueFull,
+            SubmitError::Shutdown => Self::Shutdown,
+            SubmitError::EngineFailed(error) => Self::EngineFailed(error),
         }
     }
 }
@@ -102,11 +124,15 @@ mod tests {
             RuntimeError::WorkerPanicked("matching").to_string(),
             "runtime worker panicked: matching"
         );
+        assert_eq!(RuntimeError::QueueFull.to_string(), "command queue is full");
+        assert_eq!(RuntimeError::Shutdown.to_string(), "runtime is shut down");
 
         let failed = RuntimeError::EngineFailed(DurableError::AppendFailed("disk".into()));
         assert!(failed.to_string().contains("disk"));
         assert!(std::error::Error::source(&failed).is_some());
         assert!(std::error::Error::source(&RuntimeError::EngineStopped).is_none());
+        assert!(std::error::Error::source(&RuntimeError::QueueFull).is_none());
+        assert!(std::error::Error::source(&RuntimeError::Shutdown).is_none());
 
         let snapshot = RuntimeError::SnapshotFailed(DurableError::Storage("io".into()));
         assert!(snapshot.to_string().contains("io"));
@@ -116,6 +142,24 @@ mod tests {
             RuntimeError::Startup("no matching core".into())
                 .to_string()
                 .contains("no matching core")
+        );
+    }
+
+    #[test]
+    fn submit_errors_convert_to_coherent_runtime_errors() {
+        assert_eq!(
+            RuntimeError::from(SubmitError::QueueFull),
+            RuntimeError::QueueFull
+        );
+        assert_eq!(
+            RuntimeError::from(SubmitError::Shutdown),
+            RuntimeError::Shutdown
+        );
+
+        let error = DurableError::AppendFailed("disk".into());
+        assert_eq!(
+            RuntimeError::from(SubmitError::EngineFailed(error.clone())),
+            RuntimeError::EngineFailed(error)
         );
     }
 }

@@ -8,6 +8,7 @@ pub mod envelope;
 pub mod error;
 pub mod idle;
 pub(crate) mod journal;
+pub(crate) mod lifecycle;
 pub(crate) mod matching;
 pub mod metrics;
 pub(crate) mod snapshot;
@@ -16,6 +17,7 @@ pub mod ticket;
 pub use envelope::CommandEnvelope;
 pub use error::{RuntimeError, SubmitError};
 pub use idle::{Idle, IdleStrategy};
+pub use lifecycle::{EngineHandle, EngineRuntime};
 pub use metrics::RuntimeMetrics;
 pub use ticket::{CommandReceipt, ResponseSlot, SlotHandle, SlotPool, SlotState, Ticket};
 
@@ -44,6 +46,12 @@ pub struct RuntimeConfig {
     /// How the matching thread waits when the queue is empty.
     pub idle: IdleStrategy,
     /// Optional core to pin the matching thread to.
+    ///
+    /// The value is an **index** into the list returned by
+    /// [`core_affinity::get_core_ids`], not a raw platform processor id. An
+    /// unsupported platform, an out-of-range index, or a failed bind makes
+    /// startup fail with [`RuntimeError::Startup`]; the runtime never silently
+    /// runs unpinned. The journal and snapshot threads are not pinned.
     pub matching_core: Option<usize>,
     /// Bound on shutdown's wait for durability.
     pub shutdown_timeout: Duration,
