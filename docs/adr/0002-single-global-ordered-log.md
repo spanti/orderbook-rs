@@ -1,0 +1,24 @@
+# 全局单一有序命令日志
+
+## Status
+
+accepted
+
+## Context
+
+引擎的 order id、trade id、event sequence 都是跨 symbol 的全局计数器，快照的 `applied_command_seq` 也是全局的。恢复必须保证同一命令流得到相同的 id 与成交顺序。Kafka 的并行度来自分区，但按 symbol 分区会打乱跨 symbol 的全局顺序；交易所的对应做法是每个引擎分片一个分区，分片内部保持全序（sequencer 架构）。
+
+## Decision
+
+每个 `DurableMatchingEngine` 实例只使用一条全局有序命令日志：单文件、Kafka 单分区、或等价的单一追加序列。所有 symbol 共享同一条命令序号空间；引擎保持单线程、无内部并行。
+
+## Considered Options
+
+- **按 symbol 分区**：本次拒绝。跨 symbol 的 trade id 与事件序号会重排，快照的全局 `applied_command_seq` 失去意义；跨 symbol 的订单簿交互虽然目前只有共享计数器，但恢复语义会变复杂。
+- **全局单日志**：采用。牺牲写入并行度，换取"同一条流 → 同一状态"的确定性，这也是后续热备/审计/迁移能复用的基础。
+
+## Consequences
+
+- 单写者成为吞吐上限；需要扩展时，拆成"每 symbol 一个引擎实例 + 每个实例自己的日志与序号"，而不是在簿内加线程。
+- 一旦未来分片，trade id 与 event sequence 将变成分片内唯一，跨分片不再有全局顺序；这是有意的取舍。
+- 公开 API 与快照格式都以全局序号为前提，分片化需要一次显式的格式/API 迁移。
