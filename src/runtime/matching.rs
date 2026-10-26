@@ -15,7 +15,7 @@ use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use crate::durable::{CommandRecord, DurableError, FORMAT_VERSION};
+use crate::durable::{CommandRecord, DurableError, FORMAT_VERSION, StoredSnapshot};
 use crate::engine::MatchingEngine;
 
 use super::RuntimeConfig;
@@ -23,6 +23,7 @@ use super::envelope::CommandEnvelope;
 use super::error::{RuntimeError, SubmitError};
 use super::idle::Idle;
 use super::metrics::RuntimeMetrics;
+use super::snapshot::{SnapshotSend, SnapshotSink};
 use super::ticket::{CommandReceipt, SlotHandle, SlotPool, Ticket};
 use crate::types::EngineCommand;
 
@@ -154,6 +155,121 @@ pub(crate) enum GateDecision {
 pub(crate) trait SnapshotGate: Send + 'static {
     fn poll(&mut self, engine: &MatchingEngine, applied_seq: u64, durable_seq: u64)
     -> GateDecision;
+}
+
+/// Automatic snapshots at a fixed command-sequence cadence.
+///
+/// The gate captures only when `applied_seq == durable_seq`. At a cadence
+/// boundary with durability lagging, it pauses intake until the watermark
+/// catches up; a full worker channel instead keeps the snapshot due without
+/// pausing, because snapshots are best effort and must never stall matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotPending {
+    /// No snapshot is waiting.
+    None,
+    /// A boundary was reached while durability lagged; intake is paused.
+    Watermark,
+    /// A capture is pending because the worker channel was full; keep
+    /// matching and retry at the next opportunity.
+    Due,
+}
+
+pub(crate) struct CadenceSnapshotGate {
+    sink: SnapshotSink,
+    cadence: u64,
+    pending: SnapshotPending,
+    last_snapshot_seq: u64,
+}
+
+impl CadenceSnapshotGate {
+    pub(crate) fn new(cadence: u64, sink: SnapshotSink) -> Self {
+        Self {
+            sink,
+            cadence,
+            pending: SnapshotPending::None,
+            last_snapshot_seq: 0,
+        }
+    }
+
+    /// The last command sequence this gate handed to the worker.
+    pub(crate) fn last_snapshot_seq(&self) -> u64 {
+        self.last_snapshot_seq
+    }
+
+    fn try_capture(&mut self, engine: &MatchingEngine, applied_seq: u64) -> bool {
+        if applied_seq <= self.last_snapshot_seq {
+            self.pending = SnapshotPending::None;
+            return true;
+        }
+
+        let stored = StoredSnapshot {
+            format_version: FORMAT_VERSION,
+            applied_seq,
+            snapshot: engine.capture_snapshot(),
+        };
+
+        match self.sink.try_send(stored) {
+            SnapshotSend::Sent => {
+                self.last_snapshot_seq = applied_seq;
+                self.pending = SnapshotPending::None;
+                true
+            }
+            SnapshotSend::Full | SnapshotSend::Disconnected => {
+                self.pending = SnapshotPending::Due;
+                false
+            }
+        }
+    }
+}
+
+impl SnapshotGate for CadenceSnapshotGate {
+    fn poll(
+        &mut self,
+        engine: &MatchingEngine,
+        applied_seq: u64,
+        durable_seq: u64,
+    ) -> GateDecision {
+        if self.cadence == 0 {
+            return GateDecision::Continue;
+        }
+
+        match self.pending {
+            SnapshotPending::Watermark => {
+                if applied_seq > durable_seq {
+                    return GateDecision::Pause;
+                }
+                // The watermark caught up; capturing may still find the
+                // worker channel full, in which case matching continues and
+                // the capture stays due.
+                self.try_capture(engine, applied_seq);
+                GateDecision::Continue
+            }
+            SnapshotPending::Due => {
+                // A full worker channel must never stall matching. Capture
+                // only at a durability boundary, and retry on later polls.
+                if applied_seq == durable_seq {
+                    self.try_capture(engine, applied_seq);
+                }
+                GateDecision::Continue
+            }
+            SnapshotPending::None => {
+                let at_boundary = applied_seq > 0 && applied_seq % self.cadence == 0;
+                if !at_boundary || applied_seq <= self.last_snapshot_seq {
+                    return GateDecision::Continue;
+                }
+
+                if applied_seq > durable_seq {
+                    // Deliberate, infrequent pause so continuous load cannot
+                    // starve snapshots forever.
+                    self.pending = SnapshotPending::Watermark;
+                    return GateDecision::Pause;
+                }
+
+                self.try_capture(engine, applied_seq);
+                GateDecision::Continue
+            }
+        }
+    }
 }
 
 /// A gate that never pauses. Correct when snapshots are disabled.
@@ -542,8 +658,9 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::durable::DurableError;
+    use crate::durable::{DurableError, InMemorySnapshotStore, SnapshotStore};
     use crate::runtime::metrics::RuntimeMetrics;
+    use crate::runtime::snapshot;
     use crate::types::{
         CommandOutcome, EngineConfig, ModifyRequest, OrderRequest, OrderType, Side, TimeInForce,
     };
@@ -602,6 +719,8 @@ mod tests {
     struct TestJournal {
         batches: Arc<Mutex<Vec<Vec<CommandRecord>>>>,
         watermark: Option<Arc<AtomicU64>>,
+        watermark_paused: Arc<AtomicBool>,
+        accepted_max: Arc<AtomicU64>,
         blocked: Arc<AtomicBool>,
         disconnected: Arc<AtomicBool>,
         failure: Arc<Mutex<Option<DurableError>>>,
@@ -625,6 +744,20 @@ mod tests {
 
         fn disconnect(&self) {
             self.disconnected.store(true, Ordering::Release);
+        }
+
+        /// Accept batches without moving the watermark, simulating a journal
+        /// that has received records but has not made them durable yet.
+        fn pause_watermark(&self) {
+            self.watermark_paused.store(true, Ordering::Release);
+        }
+
+        /// Make every accepted record durable and resume normal advancement.
+        fn release_watermark(&self) {
+            self.watermark_paused.store(false, Ordering::Release);
+            if let Some(watermark) = &self.watermark {
+                watermark.fetch_max(self.accepted_max.load(Ordering::Acquire), Ordering::Release);
+            }
         }
 
         fn set_failure(&self, error: DurableError) {
@@ -655,10 +788,14 @@ mod tests {
             if self.disconnected.load(Ordering::Acquire) {
                 return Err(batch);
             }
-            if let Some(watermark) = &self.watermark
-                && let Some(last) = batch.last()
-            {
-                watermark.fetch_max(last.sequence, Ordering::Release);
+            if let Some(last) = batch.last() {
+                self.accepted_max
+                    .fetch_max(last.sequence, Ordering::Release);
+                if let Some(watermark) = &self.watermark
+                    && !self.watermark_paused.load(Ordering::Acquire)
+                {
+                    watermark.fetch_max(last.sequence, Ordering::Release);
+                }
             }
             lock(&self.batches).push(batch);
             Ok(())
@@ -670,6 +807,115 @@ mod tests {
 
         fn failure(&self) -> Option<DurableError> {
             lock(&self.failure).clone()
+        }
+    }
+
+    /// A blocking gate for the test snapshot store.
+    #[derive(Clone, Default)]
+    struct StoreGate {
+        open: Arc<Mutex<bool>>,
+        ready: Arc<std::sync::Condvar>,
+    }
+
+    impl StoreGate {
+        fn wait(&self) {
+            let mut open = lock(&self.open);
+            while !*open {
+                open = self
+                    .ready
+                    .wait(open)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        }
+
+        fn open(&self) {
+            *lock(&self.open) = true;
+            self.ready.notify_all();
+        }
+    }
+
+    /// An inspectable [`SnapshotStore`] that can block, fail, and compare each
+    /// saved sequence with the live durability watermark.
+    #[derive(Clone)]
+    struct TestSnapshotStore {
+        saved: Arc<Mutex<Vec<u64>>>,
+        ahead: Arc<Mutex<Vec<(u64, u64)>>>,
+        calls: Arc<AtomicU64>,
+        fail: Arc<AtomicBool>,
+        durable: Option<Arc<AtomicU64>>,
+        gate: Option<StoreGate>,
+    }
+
+    impl TestSnapshotStore {
+        fn new() -> Self {
+            Self {
+                saved: Arc::new(Mutex::new(Vec::new())),
+                ahead: Arc::new(Mutex::new(Vec::new())),
+                calls: Arc::new(AtomicU64::new(0)),
+                fail: Arc::new(AtomicBool::new(false)),
+                durable: None,
+                gate: None,
+            }
+        }
+
+        fn watching(durable: Arc<AtomicU64>) -> Self {
+            Self {
+                durable: Some(durable),
+                ..Self::new()
+            }
+        }
+
+        fn failing() -> Self {
+            let store = Self::new();
+            store.fail.store(true, Ordering::Release);
+            store
+        }
+
+        fn blocked(gate: StoreGate) -> Self {
+            Self {
+                gate: Some(gate),
+                ..Self::new()
+            }
+        }
+
+        fn saved(&self) -> Vec<u64> {
+            lock(&self.saved).clone()
+        }
+
+        fn ahead(&self) -> Vec<(u64, u64)> {
+            lock(&self.ahead).clone()
+        }
+
+        fn calls(&self) -> u64 {
+            self.calls.load(Ordering::Acquire)
+        }
+    }
+
+    impl SnapshotStore for TestSnapshotStore {
+        fn save(&mut self, snapshot: StoredSnapshot) -> Result<(), DurableError> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            if let Some(gate) = &self.gate {
+                gate.wait();
+            }
+            if let Some(durable) = &self.durable {
+                let durable = durable.load(Ordering::Acquire);
+                if snapshot.applied_seq > durable {
+                    lock(&self.ahead).push((snapshot.applied_seq, durable));
+                }
+            }
+            if self.fail.load(Ordering::Acquire) {
+                return Err(DurableError::Storage("snapshot store failure".to_string()));
+            }
+            lock(&self.saved).push(snapshot.applied_seq);
+            Ok(())
+        }
+
+        fn load_latest(&self) -> Result<Option<StoredSnapshot>, DurableError> {
+            Ok(None)
+        }
+
+        fn load_previous(&self) -> Result<Option<StoredSnapshot>, DurableError> {
+            Ok(None)
         }
     }
 
@@ -754,6 +1000,351 @@ mod tests {
             submit("ETH-USDT", 5, Side::Ask, 200, 1),
             cancel("BTC-USDT", 2),
         ]
+    }
+
+    fn executed(count: u64) -> MatchingEngine {
+        let mut engine = MatchingEngine::new(EngineConfig::default());
+        for timestamp in 1..=count {
+            let _ = engine.execute(simple_command(timestamp));
+        }
+        engine
+    }
+
+    #[test]
+    fn cadence_zero_disables_automatic_snapshots() {
+        let store = InMemorySnapshotStore::new();
+        let (sink, worker) = snapshot::spawn(Box::new(store.handle()));
+        let mut gate = CadenceSnapshotGate::new(0, sink);
+        let engine = executed(5);
+
+        for _ in 0..5 {
+            assert_eq!(
+                gate.poll(&engine, 5, 5),
+                GateDecision::Continue,
+                "cadence zero never captures"
+            );
+        }
+        let last = gate.last_snapshot_seq();
+        drop(gate);
+        worker.join().expect("snapshot worker");
+
+        assert_eq!(last, 0);
+        assert!(store.load_latest().unwrap().is_none());
+    }
+
+    #[test]
+    fn cadence_boundary_is_captured_exactly_once() {
+        let store = InMemorySnapshotStore::new();
+        let (sink, worker) = snapshot::spawn(Box::new(store.handle()));
+        let mut gate = CadenceSnapshotGate::new(2, sink);
+        let engine = executed(4);
+
+        assert_eq!(gate.poll(&engine, 2, 2), GateDecision::Continue);
+        wait_until(|| {
+            store
+                .load_latest()
+                .unwrap()
+                .is_some_and(|stored| stored.applied_seq == 2)
+        });
+        assert_eq!(gate.last_snapshot_seq(), 2);
+
+        for _ in 0..3 {
+            assert_eq!(gate.poll(&engine, 2, 2), GateDecision::Continue);
+        }
+        assert_eq!(
+            store.load_previous().unwrap(),
+            None,
+            "the same boundary is not captured again"
+        );
+
+        assert_eq!(gate.poll(&engine, 4, 4), GateDecision::Continue);
+        wait_until(|| {
+            store
+                .load_latest()
+                .unwrap()
+                .is_some_and(|stored| stored.applied_seq == 4)
+        });
+        assert_eq!(
+            store
+                .load_previous()
+                .unwrap()
+                .map(|stored| stored.applied_seq),
+            Some(2)
+        );
+        assert_eq!(gate.last_snapshot_seq(), 4);
+
+        drop(gate);
+        worker.join().expect("snapshot worker");
+    }
+
+    #[test]
+    fn gate_pauses_and_refuses_a_snapshot_ahead_of_durability() {
+        let store = InMemorySnapshotStore::new();
+        let (sink, worker) = snapshot::spawn(Box::new(store.handle()));
+        let mut gate = CadenceSnapshotGate::new(2, sink);
+        let engine = executed(4);
+
+        assert_eq!(gate.poll(&engine, 4, 0), GateDecision::Pause);
+        assert_eq!(gate.poll(&engine, 4, 3), GateDecision::Pause);
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            store.load_latest().unwrap().is_none(),
+            "no snapshot may be saved above the watermark"
+        );
+        assert_eq!(gate.last_snapshot_seq(), 0);
+
+        assert_eq!(gate.poll(&engine, 4, 4), GateDecision::Continue);
+        wait_until(|| {
+            store
+                .load_latest()
+                .unwrap()
+                .is_some_and(|stored| stored.applied_seq == 4)
+        });
+        assert_eq!(gate.last_snapshot_seq(), 4);
+
+        drop(gate);
+        worker.join().expect("snapshot worker");
+    }
+
+    #[test]
+    fn a_snapshot_due_while_durability_lags_pauses_intake_and_resumes() {
+        let metrics = Arc::new(RuntimeMetrics::new());
+        let config = RuntimeConfig {
+            snapshot_cadence: 2,
+            apply_batch_max: 1,
+            journal_flush_interval: Duration::from_secs(10),
+            metrics: Some(Arc::clone(&metrics)),
+            ..RuntimeConfig::default()
+        };
+        let journal = TestJournal::with_watermark();
+        journal.pause_watermark();
+        let store = TestSnapshotStore::new();
+        let (sink, worker) = snapshot::spawn(Box::new(store.clone()));
+        let gate = CadenceSnapshotGate::new(2, sink);
+
+        let (submitter, tickets, shared, handle) = spawn_matching(
+            MatchingEngine::new(EngineConfig::default()),
+            config,
+            16,
+            64,
+            journal.clone(),
+            gate,
+            |submitter| {
+                (1..=4)
+                    .map(|timestamp| submitter.submit(simple_command(timestamp)).expect("submit"))
+                    .collect()
+            },
+        );
+        drop(submitter);
+
+        wait_until(|| metrics.applied() == 2 && journal.record_count() == 2);
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            metrics.applied(),
+            2,
+            "intake pauses at the cadence boundary while durability lags"
+        );
+        assert_eq!(journal.record_count(), 2);
+        assert!(
+            store.saved().is_empty(),
+            "nothing is captured above the watermark"
+        );
+
+        journal.release_watermark();
+        for ticket in &tickets {
+            ticket
+                .wait_applied_timeout(WAIT)
+                .expect("applied after resume");
+            ticket.wait_durable_timeout(WAIT).expect("durable");
+        }
+        wait_until(|| store.saved() == vec![2, 4]);
+
+        shared.close();
+        handle.join().expect("matching thread");
+        worker.join().expect("snapshot worker");
+    }
+
+    #[test]
+    fn a_slow_snapshot_store_does_not_stall_matching() {
+        let metrics = Arc::new(RuntimeMetrics::new());
+        let config = RuntimeConfig {
+            snapshot_cadence: 2,
+            apply_batch_max: 1,
+            journal_flush_interval: Duration::from_secs(10),
+            metrics: Some(Arc::clone(&metrics)),
+            ..RuntimeConfig::default()
+        };
+        let journal = TestJournal::with_watermark();
+        let store_gate = StoreGate::default();
+        let store = TestSnapshotStore::blocked(store_gate.clone());
+        let (sink, worker) = snapshot::spawn(Box::new(store.clone()));
+        let gate = CadenceSnapshotGate::new(2, sink);
+
+        let (submitter, tickets, shared, handle) = spawn_matching(
+            MatchingEngine::new(EngineConfig::default()),
+            config,
+            16,
+            64,
+            journal.clone(),
+            gate,
+            |submitter| {
+                (1..=6)
+                    .map(|timestamp| submitter.submit(simple_command(timestamp)).expect("submit"))
+                    .collect()
+            },
+        );
+        drop(submitter);
+
+        wait_until(|| store.calls() >= 1);
+        for ticket in &tickets {
+            ticket
+                .wait_applied_timeout(WAIT)
+                .expect("a slow store must not stop matching");
+        }
+        for ticket in &tickets {
+            ticket.wait_durable_timeout(WAIT).expect("durable");
+        }
+        assert_eq!(metrics.applied(), 6);
+
+        store_gate.open();
+        shared.close();
+        handle.join().expect("matching thread");
+        worker.join().expect("snapshot worker");
+        assert!(
+            !store.saved().is_empty(),
+            "queued snapshots are saved once the store resumes"
+        );
+    }
+
+    #[test]
+    fn a_failing_snapshot_store_does_not_fail_durable_commands() {
+        let config = RuntimeConfig {
+            snapshot_cadence: 2,
+            apply_batch_max: 1,
+            journal_flush_interval: Duration::from_secs(10),
+            ..RuntimeConfig::default()
+        };
+        let journal = TestJournal::with_watermark();
+        let store = TestSnapshotStore::failing();
+        let (sink, worker) = snapshot::spawn(Box::new(store.clone()));
+        let probe = sink.clone();
+        let gate = CadenceSnapshotGate::new(2, sink);
+
+        let (submitter, tickets, shared, handle) = spawn_matching(
+            MatchingEngine::new(EngineConfig::default()),
+            config,
+            16,
+            64,
+            journal.clone(),
+            gate,
+            |submitter| {
+                (1..=4)
+                    .map(|timestamp| submitter.submit(simple_command(timestamp)).expect("submit"))
+                    .collect()
+            },
+        );
+        drop(submitter);
+
+        for ticket in &tickets {
+            ticket.wait_applied_timeout(WAIT).expect("applied");
+            ticket
+                .wait_durable_timeout(WAIT)
+                .expect("snapshot failures never fail durable commands");
+        }
+
+        shared.close();
+        handle.join().expect("matching thread");
+        wait_until(|| probe.last_error().is_some());
+        assert!(store.saved().is_empty());
+        drop(probe);
+        worker.join().expect("snapshot worker");
+    }
+
+    #[test]
+    fn snapshots_are_never_saved_ahead_of_the_durability_watermark() {
+        let config = RuntimeConfig {
+            snapshot_cadence: 2,
+            apply_batch_max: 1,
+            journal_flush_interval: Duration::from_secs(10),
+            ..RuntimeConfig::default()
+        };
+        let journal = TestJournal::with_watermark();
+        let watermark = journal.watermark.clone().expect("test journal watermark");
+        let store = TestSnapshotStore::watching(watermark);
+        let (sink, worker) = snapshot::spawn(Box::new(store.clone()));
+        let gate = CadenceSnapshotGate::new(2, sink);
+
+        let (submitter, tickets, shared, handle) = spawn_matching(
+            MatchingEngine::new(EngineConfig::default()),
+            config,
+            16,
+            64,
+            journal.clone(),
+            gate,
+            |submitter| {
+                (1..=5)
+                    .map(|timestamp| submitter.submit(simple_command(timestamp)).expect("submit"))
+                    .collect()
+            },
+        );
+        drop(submitter);
+
+        for ticket in &tickets {
+            ticket.wait_durable_timeout(WAIT).expect("durable");
+        }
+
+        shared.close();
+        handle.join().expect("matching thread");
+        worker.join().expect("snapshot worker");
+
+        assert!(
+            store.ahead().is_empty(),
+            "every snapshot covers only durable commands: {:?}",
+            store.ahead()
+        );
+        assert_eq!(store.saved(), vec![2, 4]);
+    }
+
+    #[test]
+    fn final_snapshot_is_present_after_shutdown() {
+        let journal = TestJournal::with_watermark();
+        let snapshots = InMemorySnapshotStore::new();
+        let (sink, worker) = snapshot::spawn(Box::new(snapshots.handle()));
+
+        let (submitter, tickets, shared, handle) = spawn_matching(
+            MatchingEngine::new(EngineConfig::default()),
+            RuntimeConfig::default(),
+            16,
+            64,
+            journal.clone(),
+            NoopSnapshotGate,
+            |submitter| {
+                (1..=3)
+                    .map(|timestamp| submitter.submit(simple_command(timestamp)).expect("submit"))
+                    .collect()
+            },
+        );
+        drop(submitter);
+
+        for ticket in &tickets {
+            ticket.wait_durable_timeout(WAIT).expect("durable");
+        }
+        shared.close();
+        let engine = handle.join().expect("matching thread");
+
+        sink.capture_final(&engine, 3, 3)
+            .expect("the final snapshot is saved");
+        let stored = snapshots.load_latest().unwrap().expect("latest snapshot");
+        assert_eq!(stored.applied_seq, 3);
+
+        let mut direct = MatchingEngine::new(EngineConfig::default());
+        for timestamp in 1..=3 {
+            let _ = direct.execute(simple_command(timestamp));
+        }
+        assert_eq!(stored.snapshot, direct.capture_snapshot());
+
+        drop(sink);
+        worker.join().expect("snapshot worker");
     }
 
     #[test]

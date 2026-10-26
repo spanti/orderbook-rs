@@ -10,6 +10,7 @@ pub mod idle;
 pub(crate) mod journal;
 pub(crate) mod matching;
 pub mod metrics;
+pub(crate) mod snapshot;
 pub mod ticket;
 
 pub use envelope::CommandEnvelope;
