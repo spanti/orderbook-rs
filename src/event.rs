@@ -6,10 +6,23 @@
 //! envelope (format version, sequence and command id) lives in
 //! [`crate::durable::EventRecord`], not in the event itself.
 //!
-//! Ticket 01 implements only the resting-submit tracer: `OrderAccepted` then
-//! `OrderRested`. Later tickets add trades, cancels, stops and rejections.
+//! Ticket 02 adds matching and cancel: `TradeExecuted` and `OrderCanceled`.
+//! Tickets 03/04 add stops, modify and rejections.
 
-use crate::types::{Order, OrderBookId};
+use crate::types::{Order, OrderBookId, Trade};
+
+/// Why an order's remaining quantity left the book.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum OrderCancelReason {
+    /// The order's time-in-force or market type discarded the leftover.
+    UnfilledResidual,
+    /// The client canceled the open order.
+    UserCancel,
+    /// The order was canceled as the first half of a modify (ticket 04).
+    ///
+    /// Defined now so the event schema is stable; ticket 02 never emits it.
+    Modified,
+}
 
 /// A replayable fact emitted by the matching engine's decision step.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -31,13 +44,35 @@ pub enum DomainEvent {
     ///
     /// `order.quantity` is the remaining quantity after any fills.
     OrderRested { symbol: String, order: Order },
+    /// One fill between a resting maker and the incoming taker.
+    ///
+    /// Applying this event reduces the maker's book and ledger, increases the
+    /// taker's ledger, appends the trade and updates the last trade price. It
+    /// never re-runs matching.
+    TradeExecuted { trade: Trade },
+    /// The order's remaining quantity left the book.
+    ///
+    /// `canceled_quantity` is the quantity that was removed: the resting
+    /// remainder for a user cancel, or the leftover an IOC/market order could
+    /// not fill.
+    OrderCanceled {
+        symbol: String,
+        order_id: OrderBookId,
+        canceled_quantity: u64,
+        reason: OrderCancelReason,
+    },
 }
 
 impl DomainEvent {
-    /// The order id this event refers to, if it carries one.
+    /// The single order id this event refers to, if it has one.
+    ///
+    /// `TradeExecuted` carries both a maker and a taker id, so it deliberately
+    /// returns `None` rather than picking one.
     pub fn order_id(&self) -> Option<OrderBookId> {
         match self {
             Self::OrderAccepted { order, .. } | Self::OrderRested { order, .. } => Some(order.id),
+            Self::OrderCanceled { order_id, .. } => Some(*order_id),
+            Self::TradeExecuted { .. } => None,
         }
     }
 }
@@ -70,6 +105,36 @@ mod tests {
             DomainEvent::OrderRested {
                 symbol: "BTC-USDT".to_string(),
                 order: order(),
+            },
+            DomainEvent::TradeExecuted {
+                trade: Trade {
+                    id: 3,
+                    symbol: "BTC-USDT".to_string(),
+                    maker_order_id: 7,
+                    taker_order_id: 8,
+                    price: 100,
+                    quantity: 2,
+                    taker_side: Side::Ask,
+                    timestamp: 12,
+                },
+            },
+            DomainEvent::OrderCanceled {
+                symbol: "BTC-USDT".to_string(),
+                order_id: 7,
+                canceled_quantity: 3,
+                reason: OrderCancelReason::UnfilledResidual,
+            },
+            DomainEvent::OrderCanceled {
+                symbol: "BTC-USDT".to_string(),
+                order_id: 7,
+                canceled_quantity: 3,
+                reason: OrderCancelReason::UserCancel,
+            },
+            DomainEvent::OrderCanceled {
+                symbol: "BTC-USDT".to_string(),
+                order_id: 7,
+                canceled_quantity: 3,
+                reason: OrderCancelReason::Modified,
             },
         ] {
             let json = serde_json::to_string(&event).expect("event must serialize");

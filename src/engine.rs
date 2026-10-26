@@ -2,7 +2,7 @@ use colored::Colorize;
 
 use std::collections::HashMap;
 
-use crate::event::DomainEvent;
+use crate::event::{DomainEvent, OrderCancelReason};
 use crate::ledger::OrderLedger;
 use crate::orderbook::OrderBook;
 use crate::snapshot::{
@@ -98,41 +98,133 @@ impl<'a> DecisionScratch<'a> {
         }
     }
 
-    /// Decide a fresh submit produced by `command`.
+    /// Decide a fresh submit: policy, matching, then fill/rest/cancel events.
     ///
-    /// Only a non-crossing limit GTC submit is supported by ticket 01. Every
-    /// other command shape fails with [`EngineError::UnsupportedCommand`]
-    /// instead of being silently dropped; later tickets extend the catalog.
+    /// Matching runs against a clone of **only** the touched symbol's book.
+    /// The engine's book, ledger, trades, last price and counters are never
+    /// mutated; order and trade ids are allocated in local variables and only
+    /// become state when the events are applied.
     pub fn decide_submit(&self, request: &OrderRequest) -> Result<Vec<DomainEvent>, EngineError> {
-        self.engine.validate(request)?;
+        // Validation order matches the command-sourced path: validate, then
+        // post-only crossing, then FOK liquidity.
+        self.engine.check_taker_policy(self.symbol, request)?;
 
-        if request.order_type != OrderType::Limit || request.time_in_force != TimeInForce::GTC {
+        let order_id = self.order_id;
+        let accepted = request.to_order(order_id);
+
+        // The book this decision runs against: a private copy. `submit` both
+        // matches and decides whether the remainder rests.
+        let mut scratch_book = match self.engine.order_books.get(self.symbol) {
+            Some(book) => book.clone(),
+            None => OrderBook::new(),
+        };
+        let result = scratch_book.submit(accepted.clone());
+
+        // Ticket 03 owns stop activation. If this command's resulting last
+        // price would trigger a pending stop, reject the whole decision rather
+        // than emit a stream that omits `StopTriggered`.
+        let prospective_last_price = result.fills.last().map(|fill| fill.price).or_else(|| {
+            self.engine
+                .last_trades
+                .get(self.symbol)
+                .map(|last| last.price)
+        });
+        if prospective_last_price.is_some_and(|last_price| {
+            self.engine
+                .stop_books
+                .get(self.symbol)
+                .and_then(|stops| stops.next_triggered(last_price))
+                .is_some()
+        }) {
             return Err(EngineError::UnsupportedCommand);
         }
 
-        if self.engine.would_cross(self.symbol, request) {
-            return Err(if request.post_only {
-                EngineError::PostOnlyWouldCross
-            } else {
-                EngineError::UnsupportedCommand
-            });
+        let symbol = self.symbol.to_string();
+        let mut events = Vec::with_capacity(1 + result.fills.len() + 1);
+        events.push(DomainEvent::OrderAccepted {
+            symbol: symbol.clone(),
+            order: accepted.clone(),
+            post_only: request.post_only,
+        });
+
+        // Trade ids are allocated locally; `apply(TradeExecuted)` advances the
+        // real counter from the events.
+        let mut next_trade_id = self.engine.next_trade_id;
+        for fill in result.fills {
+            let trade = Trade {
+                id: next_trade_id,
+                symbol: symbol.clone(),
+                maker_order_id: fill.maker_order_id,
+                taker_order_id: fill.taker_order_id,
+                price: fill.price,
+                quantity: fill.quantity,
+                taker_side: fill.taker_side,
+                timestamp: request.timestamp,
+            };
+            next_trade_id = next_trade_id.saturating_add(1);
+            events.push(DomainEvent::TradeExecuted { trade });
         }
 
-        let accepted = request.to_order(self.order_id);
-        // Nothing filled, so the rested quantity is the original quantity.
-        let rested = accepted.clone();
+        if result.remaining_quantity > 0 {
+            if result.rested {
+                events.push(DomainEvent::OrderRested {
+                    symbol,
+                    order: Order {
+                        quantity: result.remaining_quantity,
+                        ..accepted
+                    },
+                });
+            } else {
+                events.push(DomainEvent::OrderCanceled {
+                    symbol,
+                    order_id,
+                    canceled_quantity: result.remaining_quantity,
+                    reason: OrderCancelReason::UnfilledResidual,
+                });
+            }
+        }
 
-        Ok(vec![
-            DomainEvent::OrderAccepted {
-                symbol: self.symbol.to_string(),
-                order: accepted,
-                post_only: request.post_only,
-            },
-            DomainEvent::OrderRested {
-                symbol: self.symbol.to_string(),
-                order: rested,
-            },
-        ])
+        Ok(events)
+    }
+
+    /// Decide a user cancel of an open, resting order.
+    ///
+    /// Unknown, already-closed, wrong-symbol and not-resting orders fail with
+    /// [`EngineError::UnknownOrder`]. Pending-stop cancels (`StopCanceled`) and
+    /// modify belong to later tickets and fail with
+    /// [`EngineError::UnsupportedCommand`].
+    pub fn decide_cancel(&self, order_id: OrderBookId) -> Result<Vec<DomainEvent>, EngineError> {
+        let record = self
+            .engine
+            .ledger
+            .get(order_id)
+            .ok_or(EngineError::UnknownOrder)?;
+
+        if record.symbol != self.symbol {
+            return Err(EngineError::UnknownOrder);
+        }
+        if record.status == OrderStatus::PendingTrigger {
+            return Err(EngineError::UnsupportedCommand);
+        }
+        if !record.is_open() {
+            return Err(EngineError::UnknownOrder);
+        }
+
+        let resting = self
+            .engine
+            .order_books
+            .get(self.symbol)
+            .is_some_and(|book| book.contains_order(order_id));
+        if !resting {
+            return Err(EngineError::UnknownOrder);
+        }
+
+        Ok(vec![DomainEvent::OrderCanceled {
+            symbol: self.symbol.to_string(),
+            order_id,
+            canceled_quantity: record.remaining_quantity,
+            reason: OrderCancelReason::UserCancel,
+        }])
     }
 }
 
@@ -331,17 +423,22 @@ impl MatchingEngine {
 
     /// Pure decision step of the event-sourced path: command in, events out.
     ///
-    /// Reads engine state and allocates order ids in local variables only; it
-    /// never mutates the engine. Ticket 01 supports a non-crossing limit GTC
-    /// submit and rejects every other command shape explicitly.
+    /// Reads engine state and allocates order/trade ids in local variables
+    /// only; it never mutates the engine. Ticket 02 supports normal submits
+    /// (limit, market, IOC, FOK) and user cancels of open orders. Modify, stop
+    /// commands and a command that would trigger a pending stop are rejected
+    /// explicitly for later tickets.
     pub fn decide(&self, command: &EngineCommand) -> Result<Vec<DomainEvent>, EngineError> {
         match command {
             EngineCommand::SubmitOrder { symbol, request } => {
                 DecisionScratch::new(self, symbol).decide_submit(request)
             }
-            EngineCommand::ModifyOrder { .. }
-            | EngineCommand::CancelOrder { .. }
-            | EngineCommand::SubmitStopOrder { .. } => Err(EngineError::UnsupportedCommand),
+            EngineCommand::CancelOrder { symbol, order_id } => {
+                DecisionScratch::new(self, symbol).decide_cancel(*order_id)
+            }
+            EngineCommand::ModifyOrder { .. } | EngineCommand::SubmitStopOrder { .. } => {
+                Err(EngineError::UnsupportedCommand)
+            }
         }
     }
 
@@ -365,6 +462,40 @@ impl MatchingEngine {
                     .entry(symbol.clone())
                     .or_insert_with(OrderBook::new)
                     .rest_order(order.clone());
+            }
+            DomainEvent::TradeExecuted { trade } => {
+                // Reduce the maker's resting quantity, then move both ledger
+                // records and the trade tape. No matching runs here.
+                self.order_books
+                    .get_mut(&trade.symbol)
+                    .expect("trade references a symbol with no book")
+                    .reduce_order(trade.maker_order_id, trade.quantity);
+                self.ledger.apply_fill(trade.maker_order_id, trade.quantity);
+                self.ledger.apply_fill(trade.taker_order_id, trade.quantity);
+                self.trades.push(trade.clone());
+                self.last_trades.insert(
+                    trade.symbol.clone(),
+                    LastTrade {
+                        price: trade.price,
+                        timestamp: trade.timestamp,
+                    },
+                );
+                self.next_trade_id = self.next_trade_id.max(trade.id.saturating_add(1));
+            }
+            DomainEvent::OrderCanceled {
+                symbol,
+                order_id,
+                canceled_quantity,
+                ..
+            } => {
+                // The book holds the order only for a user cancel; an
+                // IOC/market residual was never inserted. Absence is fine.
+                if let Some(book) = self.order_books.get_mut(symbol) {
+                    book.cancel_limit_order(*order_id);
+                }
+                self.ledger
+                    .mark_canceled(*order_id, *canceled_quantity)
+                    .expect("canceled order has no ledger record");
             }
         }
 
@@ -845,8 +976,7 @@ impl MatchingEngine {
     fn record_fills(&mut self, symbol: &str, timestamp: u64, fills: Vec<Fill>) -> Vec<Trade> {
         let mut record_trades = Vec::with_capacity(fills.len());
         fills.iter().for_each(|fill| {
-            self.ledger
-                .apply_maker_fill(fill.maker_order_id, fill.quantity);
+            self.ledger.apply_fill(fill.maker_order_id, fill.quantity);
 
             let trade = Trade {
                 id: self.next_trade_id,

@@ -261,6 +261,37 @@ impl BookSide {
         price_level.add_order(order);
     }
 
+    /// Reduce a resting order by `quantity`, removing it when it reaches zero.
+    ///
+    /// Returns `false` when this side does not own the order. The order keeps
+    /// its FIFO position while partially filled.
+    fn reduce_order(&mut self, order_id: OrderBookId, quantity: u64) -> bool {
+        let Some(&(_, price)) = self.order_map.get(&order_id) else {
+            return false;
+        };
+        let Some(level) = self.price_levels.get_mut(&price) else {
+            return false;
+        };
+        let Some(position) = level.orders.iter().position(|order| order.id == order_id) else {
+            return false;
+        };
+
+        debug_assert!(
+            quantity <= level.orders[position].quantity,
+            "fill {quantity} exceeds resting quantity {} for order {order_id}",
+            level.orders[position].quantity
+        );
+        level.orders[position].quantity -= quantity;
+        level.total_quantity -= quantity;
+
+        if level.orders[position].quantity == 0 {
+            level.orders.remove(position);
+            self.order_map.remove(&order_id);
+            self.remove_level_if_empty(price);
+        }
+        true
+    }
+
     // Remove an order by its ID from the book side
     fn remove_order(&mut self, order_id: OrderBookId) -> Option<Order> {
         let (_, price) = self.order_map.remove(&order_id)?;
@@ -383,6 +414,24 @@ impl OrderBook {
             Side::Ask => &mut self.asks,
         };
         own_side.insert_order(order);
+    }
+
+    /// Reduce a resting order by the traded quantity, removing it at zero.
+    ///
+    /// This is the `TradeExecuted` apply primitive. Replay applies an already
+    /// matched fill and must never call [`OrderBook::submit`] again.
+    pub fn reduce_order(&mut self, order_id: OrderBookId, quantity: u64) {
+        let reduced = self.bids.reduce_order(order_id, quantity)
+            || self.asks.reduce_order(order_id, quantity);
+        debug_assert!(
+            reduced,
+            "trade references maker order {order_id}, which is not resting"
+        );
+    }
+
+    /// Whether `order_id` is currently resting on either side.
+    pub fn contains_order(&self, order_id: OrderBookId) -> bool {
+        self.bids.order_map.contains_key(&order_id) || self.asks.order_map.contains_key(&order_id)
     }
 
     // Submit an order: match it against the opposite side, then rest any

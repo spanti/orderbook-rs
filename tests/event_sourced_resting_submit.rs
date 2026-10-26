@@ -40,6 +40,10 @@ fn order_id(events: &[DomainEvent]) -> OrderBookId {
     match events.first().expect("decision emits at least one event") {
         DomainEvent::OrderAccepted { order, .. } => order.id,
         DomainEvent::OrderRested { order, .. } => order.id,
+        DomainEvent::OrderCanceled { order_id, .. } => *order_id,
+        DomainEvent::TradeExecuted { .. } => {
+            panic!("a decision starts with OrderAccepted, not TradeExecuted")
+        }
     }
 }
 
@@ -367,10 +371,6 @@ fn unsupported_commands_fail_clearly_and_append_nothing() {
         .expect("fresh event log");
 
     let unsupported = [
-        EngineCommand::CancelOrder {
-            symbol: BTC.to_string(),
-            order_id: 1,
-        },
         EngineCommand::ModifyOrder {
             symbol: BTC.to_string(),
             order_id: 1,
@@ -408,19 +408,30 @@ fn unsupported_commands_fail_clearly_and_append_nothing() {
         assert_eq!(engine.applied_seq(), 0);
     }
 
-    // A crossing limit submit needs TradeExecuted, which ticket 01 does not
-    // implement yet, so it is explicitly unsupported too.
+    // An unknown cancel is a clear client rejection and appends nothing.
+    let error = engine
+        .execute(EngineCommand::CancelOrder {
+            symbol: BTC.to_string(),
+            order_id: 1,
+        })
+        .expect_err("the order does not exist");
+    assert_eq!(
+        error,
+        DurableError::DecisionRejected(EngineError::UnknownOrder)
+    );
+    assert_eq!(engine.applied_seq(), 0);
+
+    // Ticket 02 makes crossing submits supported: accepted + one trade.
     engine
         .execute(submit(BTC, limit(Side::Ask, 100, 5, 1)))
         .unwrap();
-    let crossing = submit(BTC, limit(Side::Bid, 100, 1, 2));
-    let error = engine
-        .execute(crossing)
-        .expect_err("crossing submit is outside the tracer");
+    engine
+        .execute(submit(BTC, limit(Side::Bid, 100, 1, 2)))
+        .unwrap();
     assert_eq!(
-        error,
-        DurableError::DecisionRejected(EngineError::UnsupportedCommand)
+        engine.history_from(1).unwrap().len(),
+        4,
+        "rest accepted+rested, then crossing accepted+trade"
     );
-    assert_eq!(engine.history_from(1).unwrap().len(), 2);
-    assert_eq!(engine.applied_seq(), 2);
+    assert_eq!(engine.applied_seq(), 4);
 }
