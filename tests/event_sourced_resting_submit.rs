@@ -41,8 +41,11 @@ fn order_id(events: &[DomainEvent]) -> OrderBookId {
         DomainEvent::OrderAccepted { order, .. } => order.id,
         DomainEvent::OrderRested { order, .. } => order.id,
         DomainEvent::OrderCanceled { order_id, .. } => *order_id,
+        DomainEvent::StopPlaced { stop, .. } => stop.id,
+        DomainEvent::StopTriggered { order, .. } => order.id,
+        DomainEvent::StopCanceled { order_id, .. } => *order_id,
         DomainEvent::TradeExecuted { .. } => {
-            panic!("a decision starts with OrderAccepted, not TradeExecuted")
+            panic!("a decision starts with OrderAccepted or StopPlaced, not TradeExecuted")
         }
     }
 }
@@ -370,27 +373,15 @@ fn unsupported_commands_fail_clearly_and_append_nothing() {
     )
         .expect("fresh event log");
 
-    let unsupported = [
-        EngineCommand::ModifyOrder {
-            symbol: BTC.to_string(),
-            order_id: 1,
-            request: ModifyRequest {
-                price: 100,
-                quantity: 1,
-                timestamp: 1,
-            },
+    let unsupported = [EngineCommand::ModifyOrder {
+        symbol: BTC.to_string(),
+        order_id: 1,
+        request: ModifyRequest {
+            price: 100,
+            quantity: 1,
+            timestamp: 1,
         },
-        EngineCommand::SubmitStopOrder {
-            symbol: BTC.to_string(),
-            request: StopOrderRequest {
-                side: Side::Ask,
-                stop_price: 110,
-                order_type: StopKind::Market,
-                quantity: 1,
-                timestamp: 1,
-            },
-        },
-    ];
+    }];
 
     for command in unsupported {
         let error = engine
@@ -434,4 +425,20 @@ fn unsupported_commands_fail_clearly_and_append_nothing() {
         "rest accepted+rested, then crossing accepted+trade"
     );
     assert_eq!(engine.applied_seq(), 4);
+
+    // Ticket 03 makes stop submissions supported: exactly one StopPlaced.
+    engine
+        .execute(EngineCommand::SubmitStopOrder {
+            symbol: BTC.to_string(),
+            request: StopOrderRequest {
+                side: Side::Bid,
+                stop_price: 110,
+                order_type: StopKind::Market,
+                quantity: 1,
+                timestamp: 3,
+            },
+        })
+        .expect("stop submission is supported from ticket 03");
+    assert_eq!(engine.history_from(5).unwrap().len(), 1);
+    assert_eq!(engine.applied_seq(), 5);
 }

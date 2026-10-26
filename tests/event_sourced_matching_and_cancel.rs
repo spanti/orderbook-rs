@@ -808,11 +808,11 @@ impl Mint {
 }
 
 // --------------------------------------------------------------------------
-// Ticket boundary: pending stop triggers belong to ticket 03
+// Pending stop triggers (ticket 03)
 // --------------------------------------------------------------------------
 
 #[test]
-fn a_command_that_would_trigger_a_pending_stop_is_rejected_without_appending() {
+fn a_command_that_would_trigger_a_pending_stop_emits_the_trigger() {
     let mut engine = MatchingEngine::new(EngineConfig::default());
     // Establish a last trade price of 100 on the old path.
     let _ = engine.execute(submit(BTC, limit(Side::Ask, 100, 1, 1)));
@@ -831,16 +831,23 @@ fn a_command_that_would_trigger_a_pending_stop_is_rejected_without_appending() {
     // Rest a bid that the next ask can trade against at 106.
     let _ = engine.execute(submit(BTC, limit(Side::Bid, 106, 1, 4)));
 
-    let before = engine.capture_snapshot();
-    let error = engine
+    let events = engine
         .decide(&submit(BTC, limit(Side::Ask, 106, 1, 5)))
-        .expect_err("triggering a pending stop is ticket 03's scope");
-    assert_eq!(error, EngineError::UnsupportedCommand);
-    assert_eq!(
-        engine.capture_snapshot(),
-        before,
-        "rejecting must not mutate the engine"
+        .expect("a triggering submit is supported by ticket 03");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, DomainEvent::StopTriggered { .. })),
+        "the cascade is part of the command's event stream"
     );
+    assert!(matches!(
+        events.last(),
+        Some(DomainEvent::OrderCanceled { .. })
+    ));
+
+    apply_all(&mut engine, &events);
+    assert!(engine.stop_order(3).is_none());
+    assert_eq!(engine.last_trade_price(BTC), Some(106));
 }
 
 #[test]
@@ -869,7 +876,7 @@ fn a_command_that_does_not_trigger_a_pending_stop_is_still_decided() {
 }
 
 #[test]
-fn pending_stop_cancel_is_unsupported_in_ticket_02() {
+fn pending_stop_cancel_emits_stop_canceled() {
     let mut engine = MatchingEngine::new(EngineConfig::default());
     let _ = engine.execute(EngineCommand::SubmitStopOrder {
         symbol: BTC.to_string(),
@@ -883,8 +890,10 @@ fn pending_stop_cancel_is_unsupported_in_ticket_02() {
     });
 
     assert_eq!(
-        engine.decide(&cancel(BTC, 1)).unwrap_err(),
-        EngineError::UnsupportedCommand,
-        "StopCanceled belongs to ticket 03"
+        engine.decide(&cancel(BTC, 1)).unwrap(),
+        vec![DomainEvent::StopCanceled {
+            symbol: BTC.to_string(),
+            order_id: 1,
+        }]
     );
 }

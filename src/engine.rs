@@ -12,7 +12,8 @@ use crate::stop_book::StopBook;
 use crate::types::{
     BookSnapshot, CommandOutcome, EngineCommand, EngineConfig, EngineError, EngineEvent,
     ExecutionReport, Fill, ModifyRequest, Order, OrderBookId, OrderRecord, OrderRequest,
-    OrderStatus, OrderType, Side, StopKind, StopOrder, StopOrderRequest, TimeInForce, Trade,
+    OrderStatus, OrderType, Side, StopKind, StopOrder, StopOrderRequest, SubmitResult,
+    TimeInForce, Trade,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -98,12 +99,153 @@ impl<'a> DecisionScratch<'a> {
         }
     }
 
+    fn scratch_book(&self) -> OrderBook {
+        match self.engine.order_books.get(self.symbol) {
+            Some(book) => book.clone(),
+            None => OrderBook::new(),
+        }
+    }
+
+    fn scratch_stops(&self) -> StopBook {
+        match self.engine.stop_books.get(self.symbol) {
+            Some(stops) => stops.clone(),
+            None => StopBook::default(),
+        }
+    }
+
+    /// `(price, timestamp)` of this symbol's last trade, if there is one.
+    fn last_trade(&self) -> Option<(u64, u64)> {
+        self.engine
+            .last_trades
+            .get(self.symbol)
+            .map(|last| (last.price, last.timestamp))
+    }
+
+    /// Push a `TradeExecuted` per fill, allocating trade ids locally.
+    ///
+    /// Returns the last fill's `(price, timestamp)`, or `None` when nothing
+    /// filled.
+    fn push_fills(
+        symbol: &str,
+        timestamp: u64,
+        fills: Vec<Fill>,
+        next_trade_id: &mut u64,
+        events: &mut Vec<DomainEvent>,
+    ) -> Option<(u64, u64)> {
+        let mut last = None;
+        for fill in fills {
+            let trade = Trade {
+                id: *next_trade_id,
+                symbol: symbol.to_string(),
+                maker_order_id: fill.maker_order_id,
+                taker_order_id: fill.taker_order_id,
+                price: fill.price,
+                quantity: fill.quantity,
+                taker_side: fill.taker_side,
+                timestamp,
+            };
+            *next_trade_id = next_trade_id.saturating_add(1);
+            last = Some((fill.price, timestamp));
+            events.push(DomainEvent::TradeExecuted { trade });
+        }
+        last
+    }
+
+    /// Emit a `StopTriggered` cascade after the command's own events.
+    ///
+    /// Each triggered stop is converted to a market+IOC or limit+GTC order and
+    /// matched against the scratch book. Events follow the catalog order:
+    /// `StopTriggered`, `TradeExecuted`*, then `OrderRested` or
+    /// `OrderCanceled{UnfilledResidual}`. The loop continues with the resulting
+    /// last price until no pending stop triggers.
+    #[allow(clippy::too_many_arguments)]
+    fn run_stop_cascade(
+        &self,
+        book: &mut OrderBook,
+        stops: &mut StopBook,
+        symbol: &str,
+        mut last_trade: Option<(u64, u64)>,
+        next_trade_id: &mut u64,
+        events: &mut Vec<DomainEvent>,
+    ) {
+        while let Some((last_price, last_timestamp)) = last_trade {
+            let Some(stop_id) = stops.next_triggered(last_price) else {
+                break;
+            };
+            let stop = stops
+                .remove(stop_id)
+                .expect("triggered stop missing from the stop book");
+
+            let converted = match stop.order_type {
+                StopKind::Market => Order {
+                    id: stop.id,
+                    side: stop.side,
+                    price: 0,
+                    quantity: stop.quantity,
+                    timestamp: last_timestamp,
+                    order_type: OrderType::Market,
+                    time_in_force: TimeInForce::IOC,
+                },
+                StopKind::Limit { price } => Order {
+                    id: stop.id,
+                    side: stop.side,
+                    price,
+                    quantity: stop.quantity,
+                    timestamp: last_timestamp,
+                    order_type: OrderType::Limit,
+                    time_in_force: TimeInForce::GTC,
+                },
+            };
+
+            events.push(DomainEvent::StopTriggered {
+                symbol: symbol.to_string(),
+                order: converted.clone(),
+                last_price,
+            });
+
+            let SubmitResult {
+                remaining_quantity,
+                fills,
+                rested,
+            } = book.submit(converted.clone());
+
+            let cascade_last =
+                Self::push_fills(symbol, last_timestamp, fills, next_trade_id, events);
+
+            if remaining_quantity > 0 {
+                if rested {
+                    events.push(DomainEvent::OrderRested {
+                        symbol: symbol.to_string(),
+                        order: Order {
+                            quantity: remaining_quantity,
+                            ..converted
+                        },
+                    });
+                } else {
+                    events.push(DomainEvent::OrderCanceled {
+                        symbol: symbol.to_string(),
+                        order_id: stop.id,
+                        canceled_quantity: remaining_quantity,
+                        reason: OrderCancelReason::UnfilledResidual,
+                    });
+                }
+            }
+
+            // If the converted order did not trade, the last price is unchanged
+            // and the next eligible stop (if any) triggers at the same price.
+            if let Some(new_last) = cascade_last {
+                last_trade = Some(new_last);
+            }
+        }
+    }
+
     /// Decide a fresh submit: policy, matching, then fill/rest/cancel events.
     ///
-    /// Matching runs against a clone of **only** the touched symbol's book.
-    /// The engine's book, ledger, trades, last price and counters are never
-    /// mutated; order and trade ids are allocated in local variables and only
-    /// become state when the events are applied.
+    /// Matching runs against a clone of **only** the touched symbol's book and
+    /// stop book. The engine's book, ledger, trades, last price and counters
+    /// are never mutated; order and trade ids are allocated in local variables
+    /// and only become state when the events are applied. Any pending stops
+    /// the resulting last price triggers become part of the same event stream.
     pub fn decide_submit(&self, request: &OrderRequest) -> Result<Vec<DomainEvent>, EngineError> {
         // Validation order matches the command-sourced path: validate, then
         // post-only crossing, then FOK liquidity.
@@ -111,36 +253,18 @@ impl<'a> DecisionScratch<'a> {
 
         let order_id = self.order_id;
         let accepted = request.to_order(order_id);
+        let symbol = self.symbol.to_string();
 
         // The book this decision runs against: a private copy. `submit` both
         // matches and decides whether the remainder rests.
-        let mut scratch_book = match self.engine.order_books.get(self.symbol) {
-            Some(book) => book.clone(),
-            None => OrderBook::new(),
-        };
-        let result = scratch_book.submit(accepted.clone());
+        let mut scratch_book = self.scratch_book();
+        let SubmitResult {
+            remaining_quantity,
+            fills,
+            rested,
+        } = scratch_book.submit(accepted.clone());
 
-        // Ticket 03 owns stop activation. If this command's resulting last
-        // price would trigger a pending stop, reject the whole decision rather
-        // than emit a stream that omits `StopTriggered`.
-        let prospective_last_price = result.fills.last().map(|fill| fill.price).or_else(|| {
-            self.engine
-                .last_trades
-                .get(self.symbol)
-                .map(|last| last.price)
-        });
-        if prospective_last_price.is_some_and(|last_price| {
-            self.engine
-                .stop_books
-                .get(self.symbol)
-                .and_then(|stops| stops.next_triggered(last_price))
-                .is_some()
-        }) {
-            return Err(EngineError::UnsupportedCommand);
-        }
-
-        let symbol = self.symbol.to_string();
-        let mut events = Vec::with_capacity(1 + result.fills.len() + 1);
+        let mut events = Vec::with_capacity(1 + fills.len() + 1);
         events.push(DomainEvent::OrderAccepted {
             symbol: symbol.clone(),
             order: accepted.clone(),
@@ -150,49 +274,72 @@ impl<'a> DecisionScratch<'a> {
         // Trade ids are allocated locally; `apply(TradeExecuted)` advances the
         // real counter from the events.
         let mut next_trade_id = self.engine.next_trade_id;
-        for fill in result.fills {
-            let trade = Trade {
-                id: next_trade_id,
-                symbol: symbol.clone(),
-                maker_order_id: fill.maker_order_id,
-                taker_order_id: fill.taker_order_id,
-                price: fill.price,
-                quantity: fill.quantity,
-                taker_side: fill.taker_side,
-                timestamp: request.timestamp,
-            };
-            next_trade_id = next_trade_id.saturating_add(1);
-            events.push(DomainEvent::TradeExecuted { trade });
-        }
+        let command_last_trade =
+            Self::push_fills(&symbol, request.timestamp, fills, &mut next_trade_id, &mut events);
 
-        if result.remaining_quantity > 0 {
-            if result.rested {
+        if remaining_quantity > 0 {
+            if rested {
                 events.push(DomainEvent::OrderRested {
-                    symbol,
+                    symbol: symbol.clone(),
                     order: Order {
-                        quantity: result.remaining_quantity,
+                        quantity: remaining_quantity,
                         ..accepted
                     },
                 });
             } else {
                 events.push(DomainEvent::OrderCanceled {
-                    symbol,
+                    symbol: symbol.clone(),
                     order_id,
-                    canceled_quantity: result.remaining_quantity,
+                    canceled_quantity: remaining_quantity,
                     reason: OrderCancelReason::UnfilledResidual,
                 });
             }
         }
 
+        // A trade can reach a pending stop's trigger price. Run the cascade on
+        // the same scratch book/stop book so the decision is self-contained.
+        let last_trade = command_last_trade.or_else(|| self.last_trade());
+        let mut scratch_stops = self.scratch_stops();
+        self.run_stop_cascade(
+            &mut scratch_book,
+            &mut scratch_stops,
+            &symbol,
+            last_trade,
+            &mut next_trade_id,
+            &mut events,
+        );
+
         Ok(events)
     }
 
-    /// Decide a user cancel of an open, resting order.
+    /// Decide a stop submission: validate locally, then emit `StopPlaced`.
     ///
-    /// Unknown, already-closed, wrong-symbol and not-resting orders fail with
-    /// [`EngineError::UnknownOrder`]. Pending-stop cancels (`StopCanceled`) and
-    /// modify belong to later tickets and fail with
-    /// [`EngineError::UnsupportedCommand`].
+    /// The id is allocated in a local variable only; it becomes state when the
+    /// event is applied. Direction and tick validation match the command path.
+    pub fn decide_submit_stop(
+        &self,
+        request: &StopOrderRequest,
+    ) -> Result<Vec<DomainEvent>, EngineError> {
+        self.engine.validate_stop(self.symbol, request)?;
+        let stop = StopOrder {
+            id: self.order_id,
+            side: request.side,
+            stop_price: request.stop_price,
+            order_type: request.order_type,
+            quantity: request.quantity,
+            timestamp: request.timestamp,
+        };
+        Ok(vec![DomainEvent::StopPlaced {
+            symbol: self.symbol.to_string(),
+            stop,
+        }])
+    }
+
+    /// Decide a user cancel of an open order or a pending stop.
+    ///
+    /// An open, resting order emits `OrderCanceled{UserCancel}`; a pending stop
+    /// emits `StopCanceled`. Unknown, already-closed and wrong-symbol orders
+    /// fail with [`EngineError::UnknownOrder`]. Modify belongs to ticket 04.
     pub fn decide_cancel(&self, order_id: OrderBookId) -> Result<Vec<DomainEvent>, EngineError> {
         let record = self
             .engine
@@ -204,7 +351,20 @@ impl<'a> DecisionScratch<'a> {
             return Err(EngineError::UnknownOrder);
         }
         if record.status == OrderStatus::PendingTrigger {
-            return Err(EngineError::UnsupportedCommand);
+            // A pending stop is canceled with `StopCanceled`, not
+            // `OrderCanceled`; it must still be in this symbol's stop book.
+            let present = self
+                .engine
+                .stop_books
+                .get(self.symbol)
+                .is_some_and(|stops| stops.get(order_id).is_some());
+            if !present {
+                return Err(EngineError::UnknownOrder);
+            }
+            return Ok(vec![DomainEvent::StopCanceled {
+                symbol: self.symbol.to_string(),
+                order_id,
+            }]);
         }
         if !record.is_open() {
             return Err(EngineError::UnknownOrder);
@@ -424,21 +584,22 @@ impl MatchingEngine {
     /// Pure decision step of the event-sourced path: command in, events out.
     ///
     /// Reads engine state and allocates order/trade ids in local variables
-    /// only; it never mutates the engine. Ticket 02 supports normal submits
-    /// (limit, market, IOC, FOK) and user cancels of open orders. Modify, stop
-    /// commands and a command that would trigger a pending stop are rejected
-    /// explicitly for later tickets.
+    /// only; it never mutates the engine. It supports normal submits (limit,
+    /// market, IOC, FOK) with their stop-trigger cascade, stop submissions,
+    /// and cancels of open orders or pending stops. Modify is rejected
+    /// explicitly until ticket 04.
     pub fn decide(&self, command: &EngineCommand) -> Result<Vec<DomainEvent>, EngineError> {
         match command {
             EngineCommand::SubmitOrder { symbol, request } => {
                 DecisionScratch::new(self, symbol).decide_submit(request)
             }
+            EngineCommand::SubmitStopOrder { symbol, request } => {
+                DecisionScratch::new(self, symbol).decide_submit_stop(request)
+            }
             EngineCommand::CancelOrder { symbol, order_id } => {
                 DecisionScratch::new(self, symbol).decide_cancel(*order_id)
             }
-            EngineCommand::ModifyOrder { .. } | EngineCommand::SubmitStopOrder { .. } => {
-                Err(EngineError::UnsupportedCommand)
-            }
+            EngineCommand::ModifyOrder { .. } => Err(EngineError::UnsupportedCommand),
         }
     }
 
@@ -496,6 +657,45 @@ impl MatchingEngine {
                 self.ledger
                     .mark_canceled(*order_id, *canceled_quantity)
                     .expect("canceled order has no ledger record");
+            }
+            DomainEvent::StopPlaced { symbol, stop } => {
+                // Register the pending stop and its ledger record. The order
+                // book is untouched until the stop triggers and trades/rests.
+                self.stop_books
+                    .entry(symbol.clone())
+                    .or_default()
+                    .insert(stop.clone());
+                self.ledger
+                    .insert_pending_stop(stop.id, symbol.clone(), stop.quantity);
+                self.next_order_id = self.next_order_id.max(stop.id.saturating_add(1));
+            }
+            DomainEvent::StopTriggered { symbol, order, .. } => {
+                // Remove the pending stop and activate its existing ledger
+                // record. Replay never re-runs matching; the following events
+                // carry the match result.
+                let _removed = self
+                    .stop_books
+                    .get_mut(symbol)
+                    .and_then(|stops| stops.remove(order.id));
+                debug_assert!(_removed.is_some(), "triggered stop is not pending");
+                self.ledger
+                    .activate_stop(order.id)
+                    .expect("triggered stop has no ledger record");
+            }
+            DomainEvent::StopCanceled { symbol, order_id } => {
+                let _removed = self
+                    .stop_books
+                    .get_mut(symbol)
+                    .and_then(|stops| stops.remove(*order_id));
+                debug_assert!(_removed.is_some(), "canceled stop is not pending");
+                let canceled_quantity = self
+                    .ledger
+                    .get(*order_id)
+                    .expect("canceled stop has no ledger record")
+                    .remaining_quantity;
+                self.ledger
+                    .mark_canceled(*order_id, canceled_quantity)
+                    .expect("canceled stop has no ledger record");
             }
         }
 

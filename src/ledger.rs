@@ -91,6 +91,20 @@ impl OrderLedger {
             .expect("pending stop record was just inserted")
     }
 
+    /// Turn a triggered stop's pending record into a working order.
+    ///
+    /// `StopTriggered` performs the activation before any match result is
+    /// known, so the record becomes `New` with its full original quantity and
+    /// no fills. The following trade/rest/residual-cancel events move it on.
+    pub(crate) fn activate_stop(&mut self, order_id: OrderBookId) -> Option<&OrderRecord> {
+        let record = self.records.get_mut(&order_id)?;
+        debug_assert_eq!(record.status, OrderStatus::PendingTrigger);
+        record.status = OrderStatus::New;
+        debug_assert_eq!(record.filled_quantity, 0);
+        debug_assert_eq!(record.remaining_quantity, record.original_quantity);
+        Some(record)
+    }
+
     /// Resume a triggered stop's pending record and record its match result in
     /// one step. Returns `None` if the record is missing.
     pub(crate) fn resume_stop(
@@ -163,6 +177,29 @@ mod tests {
             .resume_stop(order_id, remaining_quantity, rests)
             .expect("pending stop record is present")
             .clone()
+    }
+
+    #[test]
+    fn activate_stop_makes_a_pending_record_a_full_working_order() {
+        let mut ledger = pending_ledger(1, 5);
+
+        let record = ledger
+            .activate_stop(1)
+            .expect("pending stop record is present")
+            .clone();
+
+        assert_eq!(record.status, OrderStatus::New);
+        assert_eq!(record.original_quantity, 5);
+        assert_eq!(record.filled_quantity, 0);
+        assert_eq!(record.remaining_quantity, 5);
+        assert!(record.is_open());
+    }
+
+    #[test]
+    fn activate_stop_returns_none_for_an_unknown_record() {
+        let mut ledger = OrderLedger::default();
+
+        assert!(ledger.activate_stop(42).is_none());
     }
 
     #[test]

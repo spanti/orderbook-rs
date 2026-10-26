@@ -7,9 +7,10 @@
 //! [`crate::durable::EventRecord`], not in the event itself.
 //!
 //! Ticket 02 adds matching and cancel: `TradeExecuted` and `OrderCanceled`.
-//! Tickets 03/04 add stops, modify and rejections.
+//! Ticket 03 adds stops: `StopPlaced`, `StopTriggered` and `StopCanceled`.
+//! Ticket 04 adds modify and rejections.
 
-use crate::types::{Order, OrderBookId, Trade};
+use crate::types::{Order, OrderBookId, StopOrder, Trade};
 
 /// Why an order's remaining quantity left the book.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -61,6 +62,31 @@ pub enum DomainEvent {
         canceled_quantity: u64,
         reason: OrderCancelReason,
     },
+    /// A stop order was accepted and placed in the pending-stop book.
+    ///
+    /// Applying it inserts the stop and creates a `PendingTrigger` ledger
+    /// record; it never touches the order book.
+    StopPlaced { symbol: String, stop: StopOrder },
+    /// A pending stop triggered and was converted into a working order.
+    ///
+    /// `order` is the fully converted order (original quantity, market+IOC or
+    /// limit+GTC) and `last_price` is the trade price that triggered it.
+    /// Applying this event removes the stop and activates the existing ledger
+    /// record; it deliberately does not re-run matching. The following
+    /// `TradeExecuted`*, `OrderRested` or `OrderCanceled` events describe the
+    /// activated order's match result.
+    StopTriggered {
+        symbol: String,
+        order: Order,
+        last_price: u64,
+    },
+    /// A pending stop was canceled before it triggered.
+    ///
+    /// Applying it removes the stop and marks its ledger record canceled.
+    StopCanceled {
+        symbol: String,
+        order_id: OrderBookId,
+    },
 }
 
 impl DomainEvent {
@@ -70,8 +96,13 @@ impl DomainEvent {
     /// returns `None` rather than picking one.
     pub fn order_id(&self) -> Option<OrderBookId> {
         match self {
-            Self::OrderAccepted { order, .. } | Self::OrderRested { order, .. } => Some(order.id),
-            Self::OrderCanceled { order_id, .. } => Some(*order_id),
+            Self::OrderAccepted { order, .. }
+            | Self::OrderRested { order, .. }
+            | Self::StopTriggered { order, .. } => Some(order.id),
+            Self::OrderCanceled { order_id, .. } | Self::StopCanceled { order_id, .. } => {
+                Some(*order_id)
+            }
+            Self::StopPlaced { stop, .. } => Some(stop.id),
             Self::TradeExecuted { .. } => None,
         }
     }
@@ -80,7 +111,7 @@ impl DomainEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{OrderType, Side, TimeInForce};
+    use crate::types::{OrderType, Side, StopKind, TimeInForce};
 
     fn order() -> Order {
         Order {
@@ -91,6 +122,17 @@ mod tests {
             timestamp: 11,
             order_type: OrderType::Limit,
             time_in_force: TimeInForce::GTC,
+        }
+    }
+
+    fn stop() -> StopOrder {
+        StopOrder {
+            id: 9,
+            side: Side::Ask,
+            stop_price: 95,
+            order_type: StopKind::Limit { price: 94 },
+            quantity: 3,
+            timestamp: 12,
         }
     }
 
@@ -135,6 +177,19 @@ mod tests {
                 order_id: 7,
                 canceled_quantity: 3,
                 reason: OrderCancelReason::Modified,
+            },
+            DomainEvent::StopPlaced {
+                symbol: "BTC-USDT".to_string(),
+                stop: stop(),
+            },
+            DomainEvent::StopTriggered {
+                symbol: "BTC-USDT".to_string(),
+                order: order(),
+                last_price: 95,
+            },
+            DomainEvent::StopCanceled {
+                symbol: "BTC-USDT".to_string(),
+                order_id: 7,
             },
         ] {
             let json = serde_json::to_string(&event).expect("event must serialize");
