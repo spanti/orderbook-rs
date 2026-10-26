@@ -1,12 +1,12 @@
 //! The journal thread: group commit and the durability watermark.
 //!
-//! The matching thread hands batches of [`CommandRecord`] to a bounded channel
+//! The matching thread hands batches of [`EventRecord`] to a bounded channel
 //! through [`JournalThreadSink`]. The journal thread owns the
-//! [`CommandLog`], blocks on the first batch, coalesces everything queued
+//! [`EventLog`], blocks on the first batch, coalesces everything queued
 //! behind it up to [`RuntimeConfig::journal_coalesce_max`] records, and calls
-//! [`CommandLog::append_batch`] once per group. Only after that call returns
+//! [`EventLog::append_batch`] once per group. Only after that call returns
 //! does it advance the shared durability watermark and wake the matching
-//! thread, so no caller is ever told a lost command is durable.
+//! thread, so no caller is ever told a lost event is durable.
 //!
 //! Ticket 08 owns the runtime lifecycle that calls [`spawn`].
 
@@ -16,7 +16,7 @@ use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::Instant;
 
-use crate::durable::{CommandLog, CommandRecord, DurableError};
+use crate::durable::{DurableError, EventLog, EventRecord};
 
 use super::RuntimeConfig;
 use super::matching::JournalSink;
@@ -70,14 +70,14 @@ impl Waker for ThreadWaker {
 /// observes the receiver gone or when the journal thread exits, which lets the
 /// matching thread fail closed even after its last successful handoff.
 pub(crate) struct JournalThreadSink {
-    sender: SyncSender<Vec<CommandRecord>>,
+    sender: SyncSender<Vec<EventRecord>>,
     shared: SharedState,
     alive: Arc<AtomicBool>,
     disconnected: bool,
 }
 
 impl JournalSink for JournalThreadSink {
-    fn try_send_batch(&mut self, batch: Vec<CommandRecord>) -> Result<(), Vec<CommandRecord>> {
+    fn try_send_batch(&mut self, batch: Vec<EventRecord>) -> Result<(), Vec<EventRecord>> {
         match self.sender.try_send(batch) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(batch)) => Err(batch),
@@ -108,8 +108,8 @@ impl Drop for ExitSignal {
 }
 
 struct JournalThread<W: Waker> {
-    log: Box<dyn CommandLog>,
-    receiver: Receiver<Vec<CommandRecord>>,
+    log: Box<dyn EventLog>,
+    receiver: Receiver<Vec<EventRecord>>,
     shared: SharedState,
     metrics: Option<Arc<RuntimeMetrics>>,
     coalesce_max: usize,
@@ -122,7 +122,7 @@ impl<W: Waker> JournalThread<W> {
         // Records already received but held back because the next group is
         // already at the coalesce cap. They are appended immediately in the
         // next iteration, so no record waits for a new handoff.
-        let mut carry: Vec<CommandRecord> = Vec::new();
+        let mut carry: Vec<EventRecord> = Vec::new();
 
         loop {
             let mut records = if carry.is_empty() {
@@ -174,7 +174,7 @@ impl<W: Waker> JournalThread<W> {
 
     /// Append one coalesced group. Returns `false` when the log failed and the
     /// journal must exit.
-    fn append(&mut self, records: Vec<CommandRecord>) -> bool {
+    fn append(&mut self, records: Vec<EventRecord>) -> bool {
         let Some(last_sequence) = records.last().map(|record| record.sequence) else {
             // An empty handoff advances nothing; keep waiting for real work.
             return true;
@@ -208,7 +208,7 @@ impl<W: Waker> JournalThread<W> {
 /// runtime (ticket 08) creates the waker first, passes one clone here and
 /// attaches the matching thread's handle to the other.
 pub(crate) fn spawn<W: Waker>(
-    log: Box<dyn CommandLog>,
+    log: Box<dyn EventLog>,
     shared: SharedState,
     config: &RuntimeConfig,
     waker: W,
@@ -240,7 +240,9 @@ pub(crate) fn spawn<W: Waker>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::durable::{CommandCursor, DurableError, FORMAT_VERSION, LogHeader};
+    use crate::durable::{
+        DurableError, EVENT_FORMAT_VERSION, EventCursor, EventLog, EventRecord, LogHeader,
+    };
     use crate::engine::MatchingEngine;
     use crate::runtime::RuntimeError;
     use crate::runtime::SubmitError;
@@ -284,15 +286,20 @@ mod tests {
         }
     }
 
-    fn record(sequence: u64) -> CommandRecord {
-        CommandRecord {
-            format_version: FORMAT_VERSION,
+    fn record(sequence: u64) -> EventRecord {
+        EventRecord {
+            format_version: EVENT_FORMAT_VERSION,
             sequence,
-            command: command(sequence),
+            command_id: sequence,
+            event: crate::event::DomainEvent::OrderRejected {
+                symbol: "BTC-USDT".to_string(),
+                reason: crate::types::EngineError::UnknownOrder,
+                command: command(sequence),
+            },
         }
     }
 
-    fn records(range: RangeInclusive<u64>) -> Vec<CommandRecord> {
+    fn records(range: RangeInclusive<u64>) -> Vec<EventRecord> {
         range.map(record).collect()
     }
 
@@ -323,7 +330,7 @@ mod tests {
     #[derive(Default)]
     struct SpyInner {
         batch_sizes: Vec<usize>,
-        records: Vec<CommandRecord>,
+        records: Vec<EventRecord>,
         gate: Option<Gate>,
         notify: Option<Sender<()>>,
         fail_on_call: Option<usize>,
@@ -331,7 +338,7 @@ mod tests {
         panic_on_call: Option<usize>,
     }
 
-    /// A `CommandLog` that records batch sizes and can block, fail, or panic on
+    /// An `EventLog` that records batch sizes and can block, fail, or panic on
     /// a chosen `append_batch` call.
     #[derive(Clone, Default)]
     struct SpyLog {
@@ -369,12 +376,12 @@ mod tests {
             lock(&self.inner).batch_sizes.clone()
         }
 
-        fn records(&self) -> Vec<CommandRecord> {
+        fn records(&self) -> Vec<EventRecord> {
             lock(&self.inner).records.clone()
         }
     }
 
-    impl CommandLog for SpyLog {
+    impl EventLog for SpyLog {
         fn read_header(&self) -> Result<Option<LogHeader>, DurableError> {
             Ok(None)
         }
@@ -383,11 +390,11 @@ mod tests {
             Ok(())
         }
 
-        fn append(&mut self, record: CommandRecord) -> Result<(), DurableError> {
+        fn append(&mut self, record: EventRecord) -> Result<(), DurableError> {
             self.append_batch(vec![record])
         }
 
-        fn append_batch(&mut self, records: Vec<CommandRecord>) -> Result<(), DurableError> {
+        fn append_batch(&mut self, records: Vec<EventRecord>) -> Result<(), DurableError> {
             let (gate, notify, fail, panic) = {
                 let mut inner = lock(&self.inner);
                 let call = inner.batch_sizes.len();
@@ -420,7 +427,7 @@ mod tests {
             Ok(())
         }
 
-        fn read_from(&self, from: u64) -> Result<Vec<CommandRecord>, DurableError> {
+        fn read_from(&self, from: u64) -> Result<Vec<EventRecord>, DurableError> {
             Ok(lock(&self.inner)
                 .records
                 .iter()
@@ -441,6 +448,13 @@ mod tests {
                 .records
                 .last()
                 .map(|record| record.sequence)
+        }
+
+        fn last_command_id(&self) -> Option<u64> {
+            lock(&self.inner)
+                .records
+                .last()
+                .map(|record| record.command_id)
         }
     }
 
@@ -498,7 +512,12 @@ mod tests {
             NoopSnapshotGate,
             shared.clone(),
             config,
-            CommandCursor::new(0, 0, 1),
+            EventCursor {
+                applied_seq: 0,
+                durable_seq: 0,
+                next_sequence: 1,
+                next_command_id: 1,
+            },
         );
         let matching_handle = thread::spawn(move || {
             waker.attach(thread::current());
@@ -633,7 +652,7 @@ mod tests {
         assert_eq!(shared.durable_seq(), 5);
     }
 
-    fn logged_sequences(records: &[CommandRecord]) -> Vec<u64> {
+    fn logged_sequences(records: &[EventRecord]) -> Vec<u64> {
         records.iter().map(|record| record.sequence).collect()
     }
 
@@ -927,7 +946,7 @@ mod tests {
 
         gate.open();
         ticket.wait_durable_timeout(WAIT).expect("durable");
-        assert_eq!(log.records().len(), 1);
+        assert_eq!(log.records().len(), 2);
 
         shared.close();
         drop(submitter);
@@ -993,8 +1012,8 @@ mod tests {
         assert_eq!(metrics.applied(), 5);
         assert_eq!(
             metrics.batch_records_sum(),
-            5,
-            "each record is counted once, at handoff"
+            10,
+            "each event record is counted once, at handoff"
         );
         assert!(metrics.batch_count() >= 1);
         assert!(metrics.journal_append_count() >= 1);

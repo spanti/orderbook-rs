@@ -6,16 +6,17 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use orderbook_rs::durable::{
-    CommandLog, CommandRecord, DurableError, DurableMatchingEngine, InMemoryCommandLog,
-    InMemorySnapshotStore, LogHeader, SnapshotStore, StoredSnapshot,
+    DurableError, EventLog, EventRecord, EventSnapshot, EventSnapshotStore, EventSourcedEngine,
+    InMemoryEventLog, InMemoryEventSnapshotStore, LogHeader,
 };
 use orderbook_rs::engine::MatchingEngine;
+use orderbook_rs::event::{DomainEvent, OrderCancelReason};
 use orderbook_rs::runtime::{
     CommandReceipt, EngineHandle, EngineRuntime, RuntimeConfig, RuntimeError, RuntimeMetrics,
     SubmitError, Worker,
 };
 use orderbook_rs::types::{
-    CommandOutcome, EngineCommand, EngineConfig, OrderRequest, OrderType, Side, TimeInForce,
+    EngineCommand, EngineConfig, OrderRequest, OrderType, Side, TimeInForce,
 };
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -40,6 +41,19 @@ fn cancel_order(order_id: u64) -> EngineCommand {
         symbol: "BTC-USDT".to_string(),
         order_id,
     }
+}
+
+/// Fold commands through `decide`/`apply`, the same path recovery uses.
+fn fold_commands(commands: &[EngineCommand]) -> MatchingEngine {
+    let mut engine = MatchingEngine::new(EngineConfig::default());
+    let mut sequence = 1u64;
+    for command in commands {
+        for event in engine.decide(command) {
+            engine.apply(&event, sequence);
+            sequence += 1;
+        }
+    }
+    engine
 }
 
 fn runtime_config() -> RuntimeConfig {
@@ -81,13 +95,13 @@ impl Gate {
 /// backpressure and shutdown deadline are observable.
 #[derive(Clone)]
 struct BlockingLog {
-    inner: InMemoryCommandLog,
+    inner: InMemoryEventLog,
     gate: Gate,
     entered: Arc<AtomicBool>,
 }
 
 impl BlockingLog {
-    fn new(inner: InMemoryCommandLog, gate: Gate) -> Self {
+    fn new(inner: InMemoryEventLog, gate: Gate) -> Self {
         Self {
             inner,
             gate,
@@ -100,7 +114,7 @@ impl BlockingLog {
     }
 }
 
-impl CommandLog for BlockingLog {
+impl EventLog for BlockingLog {
     fn read_header(&self) -> Result<Option<LogHeader>, DurableError> {
         self.inner.read_header()
     }
@@ -109,17 +123,17 @@ impl CommandLog for BlockingLog {
         self.inner.write_header(header)
     }
 
-    fn append(&mut self, record: CommandRecord) -> Result<(), DurableError> {
+    fn append(&mut self, record: EventRecord) -> Result<(), DurableError> {
         self.inner.append(record)
     }
 
-    fn append_batch(&mut self, records: Vec<CommandRecord>) -> Result<(), DurableError> {
+    fn append_batch(&mut self, records: Vec<EventRecord>) -> Result<(), DurableError> {
         self.entered.store(true, Ordering::Release);
         self.gate.wait();
         self.inner.append_batch(records)
     }
 
-    fn read_from(&self, from: u64) -> Result<Vec<CommandRecord>, DurableError> {
+    fn read_from(&self, from: u64) -> Result<Vec<EventRecord>, DurableError> {
         self.inner.read_from(from)
     }
 
@@ -130,19 +144,23 @@ impl CommandLog for BlockingLog {
     fn last_sequence(&self) -> Option<u64> {
         self.inner.last_sequence()
     }
+
+    fn last_command_id(&self) -> Option<u64> {
+        self.inner.last_command_id()
+    }
 }
 
-/// A snapshot store handle for tests that do not inspect snapshots.
-fn unused_snapshots() -> Box<dyn SnapshotStore> {
-    Box::new(InMemorySnapshotStore::new())
+/// An event snapshot store handle for tests that do not inspect snapshots.
+fn unused_snapshots() -> Box<dyn EventSnapshotStore> {
+    Box::new(InMemoryEventSnapshotStore::new())
 }
 
-/// A command log that panics on the first append, simulating a journal worker
+/// An event log that panics on the first append, simulating a journal worker
 /// panic rather than an append error.
 #[derive(Clone, Default)]
 struct PanickingLog;
 
-impl CommandLog for PanickingLog {
+impl EventLog for PanickingLog {
     fn read_header(&self) -> Result<Option<LogHeader>, DurableError> {
         Ok(None)
     }
@@ -151,15 +169,15 @@ impl CommandLog for PanickingLog {
         Ok(())
     }
 
-    fn append(&mut self, _record: CommandRecord) -> Result<(), DurableError> {
+    fn append(&mut self, _record: EventRecord) -> Result<(), DurableError> {
         Ok(())
     }
 
-    fn append_batch(&mut self, _records: Vec<CommandRecord>) -> Result<(), DurableError> {
+    fn append_batch(&mut self, _records: Vec<EventRecord>) -> Result<(), DurableError> {
         panic!("journal log panic");
     }
 
-    fn read_from(&self, _from: u64) -> Result<Vec<CommandRecord>, DurableError> {
+    fn read_from(&self, _from: u64) -> Result<Vec<EventRecord>, DurableError> {
         Ok(Vec::new())
     }
 
@@ -168,15 +186,19 @@ impl CommandLog for PanickingLog {
     }
 
     fn last_sequence(&self) -> Option<u64> {
+        None
+    }
+
+    fn last_command_id(&self) -> Option<u64> {
         None
     }
 }
 
-/// A command log whose appends fail with a storage error.
+/// An event log whose appends fail with a storage error.
 #[derive(Clone, Default)]
 struct FailingLog;
 
-impl CommandLog for FailingLog {
+impl EventLog for FailingLog {
     fn read_header(&self) -> Result<Option<LogHeader>, DurableError> {
         Ok(None)
     }
@@ -185,15 +207,15 @@ impl CommandLog for FailingLog {
         Ok(())
     }
 
-    fn append(&mut self, _record: CommandRecord) -> Result<(), DurableError> {
+    fn append(&mut self, _record: EventRecord) -> Result<(), DurableError> {
         Err(DurableError::AppendFailed("disk full".to_string()))
     }
 
-    fn append_batch(&mut self, _records: Vec<CommandRecord>) -> Result<(), DurableError> {
+    fn append_batch(&mut self, _records: Vec<EventRecord>) -> Result<(), DurableError> {
         Err(DurableError::AppendFailed("disk full".to_string()))
     }
 
-    fn read_from(&self, _from: u64) -> Result<Vec<CommandRecord>, DurableError> {
+    fn read_from(&self, _from: u64) -> Result<Vec<EventRecord>, DurableError> {
         Ok(Vec::new())
     }
 
@@ -202,6 +224,10 @@ impl CommandLog for FailingLog {
     }
 
     fn last_sequence(&self) -> Option<u64> {
+        None
+    }
+
+    fn last_command_id(&self) -> Option<u64> {
         None
     }
 }
@@ -210,16 +236,16 @@ impl CommandLog for FailingLog {
 #[derive(Clone, Default)]
 struct FailingSnapshotStore;
 
-impl SnapshotStore for FailingSnapshotStore {
-    fn save(&mut self, _snapshot: StoredSnapshot) -> Result<(), DurableError> {
+impl EventSnapshotStore for FailingSnapshotStore {
+    fn save(&mut self, _snapshot: EventSnapshot) -> Result<(), DurableError> {
         Err(DurableError::Storage("snapshot disk full".to_string()))
     }
 
-    fn load_latest(&self) -> Result<Option<StoredSnapshot>, DurableError> {
+    fn load_latest(&self) -> Result<Option<EventSnapshot>, DurableError> {
         Ok(None)
     }
 
-    fn load_previous(&self) -> Result<Option<StoredSnapshot>, DurableError> {
+    fn load_previous(&self) -> Result<Option<EventSnapshot>, DurableError> {
         Ok(None)
     }
 }
@@ -228,24 +254,24 @@ impl SnapshotStore for FailingSnapshotStore {
 #[derive(Clone, Default)]
 struct PanickingSnapshotStore;
 
-impl SnapshotStore for PanickingSnapshotStore {
-    fn save(&mut self, _snapshot: StoredSnapshot) -> Result<(), DurableError> {
+impl EventSnapshotStore for PanickingSnapshotStore {
+    fn save(&mut self, _snapshot: EventSnapshot) -> Result<(), DurableError> {
         panic!("snapshot store panic");
     }
 
-    fn load_latest(&self) -> Result<Option<StoredSnapshot>, DurableError> {
+    fn load_latest(&self) -> Result<Option<EventSnapshot>, DurableError> {
         Ok(None)
     }
 
-    fn load_previous(&self) -> Result<Option<StoredSnapshot>, DurableError> {
+    fn load_previous(&self) -> Result<Option<EventSnapshot>, DurableError> {
         Ok(None)
     }
 }
 
 #[test]
 fn create_submits_and_acknowledges_applied_and_durable() {
-    let log = InMemoryCommandLog::new();
-    let snapshots = InMemorySnapshotStore::new();
+    let log = InMemoryEventLog::new();
+    let snapshots = InMemoryEventSnapshotStore::new();
 
     let (handle, runtime) = EngineRuntime::create(
         runtime_config(),
@@ -258,12 +284,14 @@ fn create_submits_and_acknowledges_applied_and_durable() {
     let durable: CommandReceipt = handle
         .submit_and_wait(submit_order(1))
         .expect("durable receipt");
-    assert_eq!(durable.command_sequence, 1);
+    assert_eq!(durable.first_event_sequence, 1);
+    assert_eq!(durable.last_event_sequence, 2);
 
     let applied = handle
         .submit_and_wait_applied(submit_order(2))
         .expect("applied receipt");
-    assert_eq!(applied.command_sequence, 2);
+    assert_eq!(applied.first_event_sequence, 3);
+    assert_eq!(applied.last_event_sequence, 4);
     assert!(!handle.is_failed());
 
     runtime.shutdown().expect("shutdown");
@@ -271,8 +299,8 @@ fn create_submits_and_acknowledges_applied_and_durable() {
 
 #[test]
 fn shutdown_drains_writes_a_final_snapshot_and_reopens() {
-    let log = InMemoryCommandLog::new();
-    let snapshots = InMemorySnapshotStore::new();
+    let log = InMemoryEventLog::new();
+    let snapshots = InMemoryEventSnapshotStore::new();
 
     let (handle, runtime) = EngineRuntime::create(
         runtime_config(),
@@ -295,20 +323,18 @@ fn shutdown_drains_writes_a_final_snapshot_and_reopens() {
         .load_latest()
         .expect("snapshot store readable")
         .expect("explicit shutdown writes a final snapshot");
-    assert_eq!(final_snapshot.applied_seq, 4);
+    assert_eq!(final_snapshot.applied_seq, 8);
+    assert_eq!(final_snapshot.last_command_id, 4);
 
-    let mut direct = MatchingEngine::new(EngineConfig::default());
-    for timestamp in 1..=4 {
-        let _ = direct.execute(submit_order(timestamp));
-    }
+    let commands = (1..=4).map(submit_order).collect::<Vec<_>>();
     assert_eq!(
         final_snapshot.snapshot,
-        direct.capture_snapshot(),
-        "the runtime's final decision state matches direct execution"
+        fold_commands(&commands).capture_snapshot(),
+        "the runtime's final decision state matches event folding"
     );
 
-    // Reopening uses the snapshot plus the log tail and continues the global
-    // command sequence.
+    // Reopening uses the snapshot plus the event-log tail and continues the
+    // global event sequence and command id.
     let (reopened, runtime) = EngineRuntime::open(
         runtime_config(),
         Box::new(log.handle()),
@@ -318,23 +344,22 @@ fn shutdown_drains_writes_a_final_snapshot_and_reopens() {
     let receipt = reopened
         .submit_and_wait(submit_order(5))
         .expect("submit after reopen");
-    assert_eq!(receipt.command_sequence, 5);
+    assert_eq!(receipt.first_event_sequence, 9);
+    assert_eq!(receipt.last_event_sequence, 10);
 
     runtime.shutdown().expect("second shutdown");
-    assert_eq!(
-        snapshots
-            .load_latest()
-            .unwrap()
-            .expect("second final snapshot")
-            .applied_seq,
-        5
-    );
+    let stored = snapshots
+        .load_latest()
+        .unwrap()
+        .expect("second final snapshot");
+    assert_eq!(stored.applied_seq, 10);
+    assert_eq!(stored.last_command_id, 5);
 }
 
 #[test]
 fn drop_drains_without_a_final_snapshot_and_reopens() {
-    let log = InMemoryCommandLog::new();
-    let snapshots = InMemorySnapshotStore::new();
+    let log = InMemoryEventLog::new();
+    let snapshots = InMemoryEventSnapshotStore::new();
 
     let (handle, runtime) = EngineRuntime::create(
         runtime_config(),
@@ -357,7 +382,7 @@ fn drop_drains_without_a_final_snapshot_and_reopens() {
         "Drop performs the same stop without writing a snapshot"
     );
 
-    // Every durable command is still in the log, so reopening restores them.
+    // Every durable event is still in the log, so reopening restores them.
     let (reopened, runtime) = EngineRuntime::open(
         runtime_config(),
         Box::new(log.handle()),
@@ -367,11 +392,18 @@ fn drop_drains_without_a_final_snapshot_and_reopens() {
     let receipt = reopened
         .submit_and_wait(cancel_order(2))
         .expect("durable after reopen");
-    assert_eq!(receipt.command_sequence, 4);
+    assert_eq!(receipt.first_event_sequence, 7);
+    assert_eq!(receipt.last_event_sequence, 7);
     assert!(
-        matches!(receipt.outcome, CommandOutcome::Canceled(_)),
+        matches!(
+            receipt.events[0],
+            DomainEvent::OrderCanceled {
+                reason: OrderCancelReason::UserCancel,
+                ..
+            }
+        ),
         "the recovered engine retained the replayed order, got {:?}",
-        receipt.outcome
+        receipt.events
     );
 
     runtime.shutdown().expect("shutdown");
@@ -379,16 +411,15 @@ fn drop_drains_without_a_final_snapshot_and_reopens() {
 
 #[test]
 fn open_recovers_a_log_seeded_by_the_synchronous_facade() {
-    let log = InMemoryCommandLog::new();
-    let snapshots = InMemorySnapshotStore::new();
+    let log = InMemoryEventLog::new();
+    let snapshots = InMemoryEventSnapshotStore::new();
     {
-        let mut durable = DurableMatchingEngine::create(
+        let mut durable = EventSourcedEngine::create(
             EngineConfig::default(),
             Box::new(log.handle()),
-            Box::new(InMemorySnapshotStore::new()),
-            0,
+            Box::new(InMemoryEventSnapshotStore::new()),
         )
-        .expect("seed durable engine");
+        .expect("seed event-sourced engine");
         for timestamp in 1..=3 {
             durable
                 .execute(submit_order(timestamp))
@@ -406,14 +437,17 @@ fn open_recovers_a_log_seeded_by_the_synchronous_facade() {
     let receipt = handle
         .submit_and_wait(cancel_order(1))
         .expect("continue after recovery");
-    assert_eq!(receipt.command_sequence, 4);
-    assert!(matches!(receipt.outcome, CommandOutcome::Canceled(_)));
+    assert_eq!(receipt.first_event_sequence, 7);
+    assert!(matches!(
+        receipt.events[0],
+        DomainEvent::OrderCanceled { order_id: 1, .. }
+    ));
 
     runtime.shutdown().expect("shutdown");
     assert_eq!(
         snapshots.load_latest().unwrap().unwrap().applied_seq,
-        4,
-        "the reopened runtime snapshots from the recovered applied sequence"
+        7,
+        "the reopened runtime snapshots from the recovered applied event sequence"
     );
 }
 
@@ -421,7 +455,7 @@ fn open_recovers_a_log_seeded_by_the_synchronous_facade() {
 fn a_full_ingress_rejects_with_queue_full_and_consumes_no_sequence() {
     let metrics = Arc::new(RuntimeMetrics::new());
     let gate = Gate::default();
-    let log = InMemoryCommandLog::new();
+    let log = InMemoryEventLog::new();
     let blocking = BlockingLog::new(log.handle(), gate.clone());
     let config = RuntimeConfig {
         queue_capacity: 1,
@@ -468,18 +502,19 @@ fn a_full_ingress_rejects_with_queue_full_and_consumes_no_sequence() {
 
     assert_eq!(
         log.last_sequence(),
-        Some(accepted),
-        "the refused command must not reach the log"
+        Some(2 * accepted),
+        "the refused command emitted no events"
     );
 
-    // Reopening consumes the next sequence only after the accepted commands.
+    // Reopening consumes the next event sequence only after the accepted
+    // commands' events.
     let (reopened, runtime) =
         EngineRuntime::open(runtime_config(), Box::new(log.handle()), unused_snapshots())
             .expect("reopen");
     let receipt = reopened
         .submit_and_wait(submit_order(9999))
         .expect("submit after reopen");
-    assert_eq!(receipt.command_sequence, accepted + 1);
+    assert_eq!(receipt.first_event_sequence, 2 * accepted + 1);
     runtime.shutdown().expect("shutdown");
 }
 
@@ -567,7 +602,7 @@ fn a_failing_final_snapshot_maps_to_snapshot_failed() {
     let (handle, runtime) = EngineRuntime::create(
         runtime_config(),
         EngineConfig::default(),
-        Box::new(InMemoryCommandLog::new()),
+        Box::new(InMemoryEventLog::new()),
         Box::new(FailingSnapshotStore),
     )
     .expect("create");
@@ -588,7 +623,7 @@ fn a_panicking_snapshot_worker_maps_to_worker_panicked() {
     let (handle, runtime) = EngineRuntime::create(
         runtime_config(),
         EngineConfig::default(),
-        Box::new(InMemoryCommandLog::new()),
+        Box::new(InMemoryEventLog::new()),
         Box::new(PanickingSnapshotStore),
     )
     .expect("create");
@@ -607,7 +642,7 @@ fn a_panicking_snapshot_worker_maps_to_worker_panicked() {
 #[test]
 fn shutdown_timeout_bounds_the_durability_wait() {
     let gate = Gate::default();
-    let log = InMemoryCommandLog::new();
+    let log = InMemoryEventLog::new();
     let blocking = BlockingLog::new(log.handle(), gate.clone());
     let probe = blocking.clone();
     let config = RuntimeConfig {
@@ -649,12 +684,12 @@ fn shutdown_timeout_bounds_the_durability_wait() {
 }
 
 #[test]
-fn concurrent_producers_get_unique_contiguous_sequences() {
+fn concurrent_producers_get_unique_contiguous_event_ranges() {
     const PRODUCERS: u64 = 4;
     const PER_PRODUCER: u64 = 50;
 
-    let log = InMemoryCommandLog::new();
-    let snapshots = InMemorySnapshotStore::new();
+    let log = InMemoryEventLog::new();
+    let snapshots = InMemoryEventSnapshotStore::new();
     let config = RuntimeConfig {
         queue_capacity: 64,
         ..RuntimeConfig::default()
@@ -671,40 +706,47 @@ fn concurrent_producers_get_unique_contiguous_sequences() {
         .map(|producer| {
             let handle = handle.clone();
             thread::spawn(move || {
-                let mut sequences = Vec::new();
+                let mut receipts = Vec::new();
                 for index in 0..PER_PRODUCER {
                     let timestamp = producer * 1_000 + index + 1;
                     let receipt = handle
                         .submit_and_wait(submit_order(timestamp))
                         .expect("durable submission");
-                    sequences.push(receipt.command_sequence);
+                    receipts.push(receipt);
                 }
-                sequences
+                receipts
             })
         })
         .collect::<Vec<_>>();
 
-    let mut all = Vec::new();
+    let mut all_receipts = Vec::new();
     for worker in workers {
-        let sequences = worker.join().expect("producer thread");
+        let receipts = worker.join().expect("producer thread");
         assert!(
-            sequences.windows(2).all(|pair| pair[0] < pair[1]),
+            receipts
+                .windows(2)
+                .all(|pair| pair[0].last_event_sequence < pair[1].first_event_sequence),
             "each producer observes its own submission order"
         );
-        all.extend(sequences);
+        all_receipts.extend(receipts);
     }
 
-    all.sort_unstable();
-    assert_eq!(
-        all,
-        (1..=PRODUCERS * PER_PRODUCER).collect::<Vec<_>>(),
-        "command sequences are unique and contiguous"
-    );
+    let mut ranges: Vec<(u64, u64)> = all_receipts
+        .iter()
+        .map(|receipt| (receipt.first_event_sequence, receipt.last_event_sequence))
+        .collect();
+    ranges.sort_unstable();
+    let mut expected_first = 1u64;
+    for (first, last) in &ranges {
+        assert_eq!(*first, expected_first, "event ranges are contiguous");
+        expected_first = last + 1;
+    }
+    let total_events = expected_first - 1;
 
     runtime.shutdown().expect("shutdown");
     assert_eq!(
         snapshots.load_latest().unwrap().unwrap().applied_seq,
-        PRODUCERS * PER_PRODUCER
+        total_events
     );
 }
 
@@ -721,7 +763,7 @@ fn an_invalid_affinity_index_fails_startup() {
     match EngineRuntime::create(
         config,
         EngineConfig::default(),
-        Box::new(InMemoryCommandLog::new()),
+        Box::new(InMemoryEventLog::new()),
         unused_snapshots(),
     ) {
         Err(RuntimeError::Startup(detail)) => {
@@ -751,7 +793,7 @@ fn a_valid_affinity_index_binds_and_runs() {
     let (handle, runtime) = EngineRuntime::create(
         config,
         EngineConfig::default(),
-        Box::new(InMemoryCommandLog::new()),
+        Box::new(InMemoryEventLog::new()),
         unused_snapshots(),
     )
     .expect("bind the matching thread to the first available core");
@@ -775,7 +817,7 @@ fn submissions_are_rejected_after_shutdown() {
     let (handle, runtime) = EngineRuntime::create(
         runtime_config(),
         EngineConfig::default(),
-        Box::new(InMemoryCommandLog::new()),
+        Box::new(InMemoryEventLog::new()),
         unused_snapshots(),
     )
     .expect("create");

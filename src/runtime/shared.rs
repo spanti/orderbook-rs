@@ -24,6 +24,7 @@ pub(crate) struct SharedState {
     fatal: Arc<Mutex<Option<DurableError>>>,
     durable_seq: Arc<AtomicU64>,
     applied_seq: Arc<AtomicU64>,
+    applied_command_id: Arc<AtomicU64>,
     /// Deadline after which a closed matching thread stops waiting for the
     /// journal and aborts shutdown with a timeout.
     shutdown_deadline: Arc<Mutex<Option<Instant>>>,
@@ -53,6 +54,7 @@ impl SharedState {
             fatal: Arc::new(Mutex::new(None)),
             durable_seq,
             applied_seq: Arc::new(AtomicU64::new(0)),
+            applied_command_id: Arc::new(AtomicU64::new(0)),
             shutdown_deadline: Arc::new(Mutex::new(None)),
             timed_out: Arc::new(AtomicBool::new(false)),
             ingress_depth: Arc::new(AtomicU64::new(0)),
@@ -95,14 +97,25 @@ impl SharedState {
         self.durable_seq.fetch_max(sequence, Ordering::Release);
     }
 
-    /// The last command sequence the matching thread applied.
+    /// The last event sequence the matching thread applied.
     pub(crate) fn applied_seq(&self) -> u64 {
         self.applied_seq.load(Ordering::Acquire)
     }
 
-    /// Publish the last applied command sequence.
+    /// Publish the last applied event sequence.
     pub(crate) fn publish_applied(&self, sequence: u64) {
         self.applied_seq.store(sequence, Ordering::Release);
+    }
+
+    /// The `command_id` of the last command whose events were applied; `0`
+    /// before any command.
+    pub(crate) fn applied_command_id(&self) -> u64 {
+        self.applied_command_id.load(Ordering::Acquire)
+    }
+
+    /// Publish the `command_id` of the last applied command.
+    pub(crate) fn publish_applied_command_id(&self, command_id: u64) {
+        self.applied_command_id.store(command_id, Ordering::Release);
     }
 
     /// Bound how long a closed matching thread waits for the journal.

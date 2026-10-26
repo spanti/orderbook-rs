@@ -135,9 +135,9 @@ impl fmt::Debug for EventSourcedEngine {
 /// event-log tail.
 ///
 /// Every recovery check lives here so the snapshot boundary, duplicate, gap and
-/// command-id rules cannot drift from the write path. Borrows both stores and
-/// never writes.
-fn recover(
+/// command-id rules cannot drift between the synchronous façade and the
+/// matching runtime. Borrows both stores and never writes.
+pub(crate) fn recover_event(
     log: &dyn EventLog,
     snapshots: &dyn EventSnapshotStore,
 ) -> Result<(MatchingEngine, EventCursor), DurableError> {
@@ -275,7 +275,7 @@ impl EventSourcedEngine {
         log: Box<dyn EventLog>,
         snapshots: Box<dyn EventSnapshotStore>,
     ) -> Result<Self, DurableError> {
-        let (engine, cursor) = recover(log.as_ref(), snapshots.as_ref())?;
+        let (engine, cursor) = recover_event(log.as_ref(), snapshots.as_ref())?;
 
         Ok(Self {
             engine,

@@ -612,7 +612,7 @@ mod tests {
                 .count,
             20
         );
-        assert!(dir.path().join("commands.log").exists());
+        assert!(dir.path().join("events.log").exists());
         assert!(dir.path().join("snapshots").exists());
         assert_ne!(
             report.runtime.as_ref().unwrap().slo.durable.status,

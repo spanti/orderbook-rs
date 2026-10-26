@@ -1,9 +1,9 @@
 //! The snapshot worker: best-effort engine snapshots off the matching thread.
 //!
-//! The matching thread captures an [`StoredSnapshot`] and offers it through
-//! [`SnapshotSink::try_send`]. The worker owns the [`SnapshotStore`], saves jobs
-//! sequentially, records the last failure, and keeps running after failures;
-//! only a disconnected channel stops it after draining.
+//! The matching thread captures an [`EventSnapshot`] and offers it through
+//! [`SnapshotSink::try_send`]. The worker owns the [`EventSnapshotStore`], saves
+//! jobs sequentially, records the last failure, and keeps running after
+//! failures; only a disconnected channel stops it after draining.
 //!
 //! Explicit shutdown uses [`SnapshotSink::capture_final`], which waits for the
 //! worker to finish saving so a failure can surface. Snapshots are never part
@@ -14,7 +14,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use crate::durable::{DurableError, FORMAT_VERSION, SnapshotStore, StoredSnapshot};
+use crate::durable::{DurableError, EVENT_FORMAT_VERSION, EventSnapshot, EventSnapshotStore};
 use crate::engine::MatchingEngine;
 
 use super::sync::lock;
@@ -33,7 +33,7 @@ pub(crate) enum SnapshotSend {
 /// One snapshot job. Final snapshots carry an acknowledgement channel so the
 /// shutdown path can wait for the save result.
 struct SnapshotJob {
-    snapshot: StoredSnapshot,
+    snapshot: EventSnapshot,
     ack: Option<SyncSender<Result<(), DurableError>>>,
 }
 
@@ -51,7 +51,7 @@ pub(crate) struct SnapshotSink {
 impl SnapshotSink {
     /// Offer a snapshot without blocking. A full channel is reported to the
     /// caller so the snapshot can stay due.
-    pub(crate) fn try_send(&self, snapshot: StoredSnapshot) -> SnapshotSend {
+    pub(crate) fn try_send(&self, snapshot: EventSnapshot) -> SnapshotSend {
         match self.sender.try_send(SnapshotJob {
             snapshot,
             ack: None,
@@ -63,7 +63,7 @@ impl SnapshotSink {
     }
 
     /// Send a snapshot and wait until the worker has attempted to save it.
-    pub(crate) fn save_and_wait(&self, snapshot: StoredSnapshot) -> Result<(), DurableError> {
+    pub(crate) fn save_and_wait(&self, snapshot: EventSnapshot) -> Result<(), DurableError> {
         let (ack_sender, ack_receiver) = mpsc::sync_channel(0);
         self.sender
             .send(SnapshotJob {
@@ -93,6 +93,7 @@ impl SnapshotSink {
         engine: &MatchingEngine,
         applied_seq: u64,
         durable_seq: u64,
+        last_command_id: u64,
     ) -> Result<(), DurableError> {
         if applied_seq != durable_seq {
             return Err(DurableError::Storage(format!(
@@ -100,16 +101,17 @@ impl SnapshotSink {
             )));
         }
 
-        self.save_and_wait(StoredSnapshot {
-            format_version: FORMAT_VERSION,
+        self.save_and_wait(EventSnapshot {
+            format_version: EVENT_FORMAT_VERSION,
             applied_seq,
+            last_command_id,
             snapshot: engine.capture_snapshot(),
         })
     }
 }
 
 struct SnapshotWorker {
-    store: Box<dyn SnapshotStore>,
+    store: Box<dyn EventSnapshotStore>,
     receiver: Receiver<SnapshotJob>,
     last_error: Arc<Mutex<Option<DurableError>>>,
 }
@@ -136,7 +138,7 @@ impl SnapshotWorker {
 /// Returns the sink and the worker's join handle. The runtime lifecycle (ticket
 /// 08) drops or joins the sink to disconnect the worker after the final
 /// snapshot.
-pub(crate) fn spawn(store: Box<dyn SnapshotStore>) -> (SnapshotSink, JoinHandle<()>) {
+pub(crate) fn spawn(store: Box<dyn EventSnapshotStore>) -> (SnapshotSink, JoinHandle<()>) {
     let (sender, receiver) = mpsc::sync_channel(1);
     let last_error = Arc::new(Mutex::new(None));
     let sink = SnapshotSink {
@@ -158,17 +160,18 @@ pub(crate) fn spawn(store: Box<dyn SnapshotStore>) -> (SnapshotSink, JoinHandle<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::durable::InMemorySnapshotStore;
+    use crate::durable::InMemoryEventSnapshotStore;
     use crate::snapshot::EngineSnapshot;
     use crate::types::EngineConfig;
     use std::time::{Duration, Instant};
 
     const WAIT: Duration = Duration::from_secs(3);
 
-    fn stored(applied_seq: u64) -> StoredSnapshot {
-        StoredSnapshot {
-            format_version: FORMAT_VERSION,
+    fn stored(applied_seq: u64) -> EventSnapshot {
+        EventSnapshot {
+            format_version: EVENT_FORMAT_VERSION,
             applied_seq,
+            last_command_id: applied_seq,
             snapshot: EngineSnapshot {
                 config: EngineConfig::default(),
                 next_order_id: 1,
@@ -193,7 +196,7 @@ mod tests {
 
     #[test]
     fn worker_saves_jobs_and_drains_on_disconnect() {
-        let store = InMemorySnapshotStore::new();
+        let store = InMemoryEventSnapshotStore::new();
         let (sink, handle) = spawn(Box::new(store.handle()));
 
         assert_eq!(sink.try_send(stored(1)), SnapshotSend::Sent);
@@ -255,8 +258,8 @@ mod tests {
         }
     }
 
-    impl SnapshotStore for ProbeStore {
-        fn save(&mut self, snapshot: StoredSnapshot) -> Result<(), DurableError> {
+    impl EventSnapshotStore for ProbeStore {
+        fn save(&mut self, snapshot: EventSnapshot) -> Result<(), DurableError> {
             let (gate, fail, error) = {
                 let mut inner = lock(&self.inner);
                 let call = inner.calls;
@@ -277,11 +280,11 @@ mod tests {
             Ok(())
         }
 
-        fn load_latest(&self) -> Result<Option<StoredSnapshot>, DurableError> {
+        fn load_latest(&self) -> Result<Option<EventSnapshot>, DurableError> {
             Ok(None)
         }
 
-        fn load_previous(&self) -> Result<Option<StoredSnapshot>, DurableError> {
+        fn load_previous(&self) -> Result<Option<EventSnapshot>, DurableError> {
             Ok(None)
         }
     }
@@ -361,12 +364,12 @@ mod tests {
 
     #[test]
     fn capture_final_refuses_a_sequence_ahead_of_durability() {
-        let store = InMemorySnapshotStore::new();
+        let store = InMemoryEventSnapshotStore::new();
         let (sink, handle) = spawn(Box::new(store.handle()));
         let engine = MatchingEngine::new(EngineConfig::default());
 
         let error = sink
-            .capture_final(&engine, 2, 1)
+            .capture_final(&engine, 2, 1, 1)
             .expect_err("a snapshot must not cover a command the log may not hold");
         assert!(matches!(error, DurableError::Storage(_)));
         assert!(
@@ -374,7 +377,7 @@ mod tests {
             "nothing was handed to the worker"
         );
 
-        sink.capture_final(&engine, 0, 0)
+        sink.capture_final(&engine, 0, 0, 0)
             .expect("an empty engine at sequence zero is snapshotable");
         assert_eq!(store.load_latest().unwrap().unwrap().applied_seq, 0);
 
@@ -389,7 +392,7 @@ mod tests {
         let (sink, handle) = spawn(Box::new(store.handle()));
         let engine = MatchingEngine::new(EngineConfig::default());
 
-        assert_eq!(sink.capture_final(&engine, 0, 0), Err(error));
+        assert_eq!(sink.capture_final(&engine, 0, 0, 0), Err(error));
         assert!(sink.last_error().is_some());
 
         drop(sink);
