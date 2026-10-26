@@ -104,6 +104,24 @@ impl OrderLedger {
     pub(crate) fn len(&self) -> usize {
         self.records.len()
     }
+
+    /// Every record in ascending order-id order, for deterministic snapshots.
+    pub(crate) fn export_records(&self) -> Vec<(OrderBookId, OrderRecord)> {
+        let mut records: Vec<(OrderBookId, OrderRecord)> = self
+            .records
+            .iter()
+            .map(|(&order_id, record)| (order_id, record.clone()))
+            .collect();
+        records.sort_by_key(|(order_id, _)| *order_id);
+        records
+    }
+
+    /// Rebuild the ledger from exported records without touching the book.
+    pub(crate) fn from_records(records: Vec<(OrderBookId, OrderRecord)>) -> Self {
+        Self {
+            records: records.into_iter().collect(),
+        }
+    }
 }
 
 #[cfg(test)]

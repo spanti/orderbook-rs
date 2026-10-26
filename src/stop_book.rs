@@ -87,6 +87,32 @@ impl StopBook {
         };
         ids.filter_map(|id| self.orders.get(&id))
     }
+
+    /// All pending stops sorted by `(stop_price, side_rank, id)`, where a bid
+    /// ranks before an ask at the same stop price. Deterministic snapshot order.
+    pub(crate) fn export_stops(&self) -> Vec<StopOrder> {
+        let mut stops: Vec<StopOrder> = self.orders.values().cloned().collect();
+        stops.sort_by_key(|stop| (stop.stop_price, side_rank(stop.side), stop.id));
+        stops
+    }
+
+    /// Rebuild a stop book from exported stops, reinserting both price indexes
+    /// and the order map without running any trigger logic.
+    pub(crate) fn from_stops(stops: Vec<StopOrder>) -> Self {
+        let mut book = Self::default();
+        for stop in stops {
+            book.insert(stop);
+        }
+        book
+    }
+}
+
+/// Deterministic rank for snapshot ordering: bids before asks.
+fn side_rank(side: Side) -> u8 {
+    match side {
+        Side::Bid => 0,
+        Side::Ask => 1,
+    }
 }
 
 #[cfg(test)]

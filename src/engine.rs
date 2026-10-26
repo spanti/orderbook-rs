@@ -4,6 +4,9 @@ use std::collections::HashMap;
 
 use crate::ledger::OrderLedger;
 use crate::orderbook::OrderBook;
+use crate::snapshot::{
+    BookState, EngineSnapshot, LastTradeState, LedgerEntry, PriceLevelState, StopBookState,
+};
 use crate::stop_book::StopBook;
 use crate::types::{
     BookSnapshot, CommandOutcome, EngineCommand, EngineConfig, EngineError, EngineEvent,
@@ -15,6 +18,13 @@ use crate::types::{
 struct LastTrade {
     price: u64,
     timestamp: u64,
+}
+
+fn price_level_states(levels: Vec<(u64, Vec<Order>)>) -> Vec<PriceLevelState> {
+    levels
+        .into_iter()
+        .map(|(price, orders)| PriceLevelState { price, orders })
+        .collect()
 }
 
 /// Where a taker order's id comes from: a fresh submission allocates one, a
@@ -77,11 +87,138 @@ impl MatchingEngine {
         }
     }
 
+    /// The last event sequence handed out, derived from the sequence counter
+    /// rather than the event history so it survives a restore that drops events.
     pub fn last_sequence(&self) -> u64 {
-        self.events
-            .last()
-            .map(EngineEvent::sequence_id)
-            .unwrap_or(0)
+        self.next_sequence_id.saturating_sub(1)
+    }
+
+    /// Capture the complete decision state as a deterministic snapshot.
+    ///
+    /// Events and the command buffer are derived outputs and are not included.
+    /// Books (including empty ones), ledger records, stop books and last trades
+    /// are emitted in a canonical order so equal state has equal bytes.
+    pub fn capture_snapshot(&self) -> EngineSnapshot {
+        let mut book_symbols: Vec<&String> = self.order_books.keys().collect();
+        book_symbols.sort();
+        let books = book_symbols
+            .into_iter()
+            .map(|symbol| {
+                let (bids, asks) = self.order_books[symbol].export_levels();
+                BookState {
+                    symbol: symbol.clone(),
+                    bids: price_level_states(bids),
+                    asks: price_level_states(asks),
+                }
+            })
+            .collect();
+
+        let ledger = self
+            .ledger
+            .export_records()
+            .into_iter()
+            .map(|(order_id, record)| LedgerEntry { order_id, record })
+            .collect();
+
+        let mut stop_symbols: Vec<&String> = self.stop_books.keys().collect();
+        stop_symbols.sort();
+        let stops = stop_symbols
+            .into_iter()
+            .map(|symbol| StopBookState {
+                symbol: symbol.clone(),
+                stops: self.stop_books[symbol].export_stops(),
+            })
+            .collect();
+
+        let mut last_trades: Vec<LastTradeState> = self
+            .last_trades
+            .iter()
+            .map(|(symbol, last)| LastTradeState {
+                symbol: symbol.clone(),
+                price: last.price,
+                timestamp: last.timestamp,
+            })
+            .collect();
+        last_trades.sort_by(|left, right| left.symbol.cmp(&right.symbol));
+
+        EngineSnapshot {
+            config: self.config,
+            next_order_id: self.next_order_id,
+            next_trade_id: self.next_trade_id,
+            next_event_sequence: self.next_sequence_id,
+            books,
+            ledger,
+            stops,
+            last_trades,
+            trades: self.trades.clone(),
+        }
+    }
+
+    /// Rebuild an engine from a snapshot without running any matching.
+    ///
+    /// Books recompute their price-level totals and order lookup indexes from
+    /// the stored orders; the ledger and both stop indexes are reinserted
+    /// directly. Events and the command buffer start empty.
+    pub fn restore_snapshot(snapshot: EngineSnapshot) -> Self {
+        let order_books = snapshot
+            .books
+            .into_iter()
+            .map(|state| {
+                let bids = state
+                    .bids
+                    .into_iter()
+                    .map(|level| (level.price, level.orders))
+                    .collect();
+                let asks = state
+                    .asks
+                    .into_iter()
+                    .map(|level| (level.price, level.orders))
+                    .collect();
+                (state.symbol, OrderBook::from_levels(bids, asks))
+            })
+            .collect();
+
+        let ledger = OrderLedger::from_records(
+            snapshot
+                .ledger
+                .into_iter()
+                .map(|entry| (entry.order_id, entry.record))
+                .collect(),
+        );
+
+        let stop_books = snapshot
+            .stops
+            .into_iter()
+            .map(|state| (state.symbol, StopBook::from_stops(state.stops)))
+            .collect();
+
+        let last_trades = snapshot
+            .last_trades
+            .into_iter()
+            .map(|last| {
+                (
+                    last.symbol,
+                    LastTrade {
+                        price: last.price,
+                        timestamp: last.timestamp,
+                    },
+                )
+            })
+            .collect();
+
+        Self {
+            order_books,
+            trades: snapshot.trades,
+            next_trade_id: snapshot.next_trade_id,
+            config: snapshot.config,
+            ledger,
+            next_order_id: snapshot.next_order_id,
+            events: Vec::new(),
+            commands: Vec::new(),
+            next_sequence_id: snapshot.next_event_sequence,
+            stop_books,
+            last_trades,
+        }
     }
 
     pub fn snapshot(&self, symbol: &str, depth: usize) -> Option<BookSnapshot> {
