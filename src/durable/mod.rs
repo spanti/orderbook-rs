@@ -140,7 +140,7 @@ impl std::error::Error for DurableError {}
 /// records back in append order, and never invent, reorder or deduplicate
 /// sequences. Sequence bookkeeping stays visible to the durable layer so it can
 /// detect gaps.
-pub trait CommandLog {
+pub trait CommandLog: Send + 'static {
     /// Read the log header, or `None` when the log has no header yet.
     fn read_header(&self) -> Result<Option<LogHeader>, DurableError>;
 
@@ -150,6 +150,24 @@ pub trait CommandLog {
 
     /// Append a record. Rejects a record whose sequence is not the next one.
     fn append(&mut self, record: CommandRecord) -> Result<(), DurableError>;
+
+    /// Append a contiguous batch, making every record durable before returning.
+    ///
+    /// Contract: `Ok(())` means every record in `records` is durable. `Err` may
+    /// leave a prefix of the batch written (a short write or a failed fsync);
+    /// the caller must fail-stop and recover instead of retrying the batch. A
+    /// batch containing a gap is rejected.
+    ///
+    /// The default implementation calls [`Self::append`] once per record. It
+    /// preserves per-record durability and is the correctness fallback; it does
+    /// not group writes or fsyncs. Implementations that can commit a group
+    /// should override it.
+    fn append_batch(&mut self, records: Vec<CommandRecord>) -> Result<(), DurableError> {
+        for record in records {
+            self.append(record)?;
+        }
+        Ok(())
+    }
 
     /// Every record whose **command** sequence is `>= from`, in append order.
     fn read_from(&self, from: u64) -> Result<Vec<CommandRecord>, DurableError>;
@@ -163,7 +181,7 @@ pub trait CommandLog {
 
 /// The latest complete engine snapshots. Only complete, decodable snapshots are
 /// returned; the durable layer validates their format version and config.
-pub trait SnapshotStore {
+pub trait SnapshotStore: Send + 'static {
     /// Store a snapshot. A sequence below the current floor is refused; an
     /// equal sequence is allowed. Implementations keep the two newest.
     fn save(&mut self, snapshot: StoredSnapshot) -> Result<(), DurableError>;

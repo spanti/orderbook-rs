@@ -896,3 +896,46 @@ fn a_swapped_adapter_decorator_needs_no_durable_layer_changes() {
         pure_engine_after(&commands).capture_snapshot()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Batch append and thread safety
+// ---------------------------------------------------------------------------
+
+#[test]
+fn storage_traits_are_send_and_static() {
+    fn assert_send_static<T: Send + 'static>() {}
+
+    assert_send_static::<Box<dyn CommandLog>>();
+    assert_send_static::<Box<dyn SnapshotStore>>();
+    assert_send_static::<InMemoryCommandLog>();
+    assert_send_static::<InMemorySnapshotStore>();
+}
+
+#[test]
+fn the_default_append_batch_matches_per_record_append() {
+    let mut log = CountingLog::new(InMemoryCommandLog::new());
+    let appends = log.appends.clone();
+    log.write_header(LogHeader {
+        format_version: FORMAT_VERSION,
+        config: EngineConfig::default(),
+    })
+    .unwrap();
+
+    let batch = (1..=3)
+        .map(|sequence| CommandRecord {
+            format_version: FORMAT_VERSION,
+            sequence,
+            command: submit(BTC, limit(sequence, Side::Bid, 100 + sequence, sequence)),
+        })
+        .collect::<Vec<_>>();
+
+    log.append_batch(batch.clone()).unwrap();
+
+    assert_eq!(log.read_from(1).unwrap(), batch);
+    assert_eq!(log.last_sequence(), Some(3));
+    assert_eq!(
+        appends.load(Ordering::SeqCst),
+        batch.len(),
+        "the default fallback must call append once per record"
+    );
+}

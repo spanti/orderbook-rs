@@ -166,6 +166,13 @@ fn contract_read_from_past_the_end_is_empty(log: &mut dyn CommandLog) {
     assert!(log.read_from(u64::MAX).unwrap().is_empty());
 }
 
+fn contract_append_batch_requires_a_header(log: &mut dyn CommandLog) {
+    assert_eq!(
+        log.append_batch(vec![record(1), record(2)]),
+        Err(DurableError::MissingHeader)
+    );
+}
+
 fn contract_non_contiguous_append_is_rejected(log: &mut dyn CommandLog) {
     log.write_header(header()).unwrap();
 
@@ -240,6 +247,34 @@ fn both_adapters_reject_non_contiguous_appends() {
     let dir = tempdir().unwrap();
     let mut file = FileCommandLog::open(dir.path().join("commands.log")).unwrap();
     contract_non_contiguous_append_is_rejected(&mut file);
+}
+
+#[test]
+fn both_adapters_require_a_header_before_batch_append() {
+    contract_append_batch_requires_a_header(&mut InMemoryCommandLog::new());
+
+    let dir = tempdir().unwrap();
+    let mut file = FileCommandLog::open(dir.path().join("commands.log")).unwrap();
+    contract_append_batch_requires_a_header(&mut file);
+}
+
+#[test]
+fn both_adapters_append_a_contiguous_batch() {
+    fn append_batch(log: &mut dyn CommandLog) {
+        log.write_header(header()).unwrap();
+        log.append_batch((1..=3).map(record).collect()).unwrap();
+        assert_eq!(
+            log.read_from(1).unwrap(),
+            (1..=3).map(record).collect::<Vec<_>>()
+        );
+        assert_eq!(log.last_sequence(), Some(3));
+    }
+
+    append_batch(&mut InMemoryCommandLog::new());
+
+    let dir = tempdir().unwrap();
+    let mut file = FileCommandLog::open(dir.path().join("commands.log")).unwrap();
+    append_batch(&mut file);
 }
 
 // ---------------------------------------------------------------------------
@@ -370,6 +405,65 @@ fn a_non_utf8_middle_line_is_corruption_not_a_panic() {
         matches!(error, DurableError::CorruptRecord { .. }),
         "non-UTF-8 bytes must be reported as corruption, got {error:?}"
     );
+}
+
+#[test]
+fn a_contiguous_batch_is_durable_and_readable_after_reopen() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("commands.log");
+    let batch = (1..=4).map(record).collect::<Vec<_>>();
+
+    let mut log = FileCommandLog::open(&path).unwrap();
+    log.write_header(header()).unwrap();
+    log.append_batch(batch.clone()).unwrap();
+
+    assert_eq!(log.first_sequence(), Some(1));
+    assert_eq!(log.last_sequence(), Some(4));
+    assert_eq!(log.read_from(1).unwrap(), batch);
+
+    // A crash is a drop and reopen; the batch must be on disk, not just cached.
+    drop(log);
+    let reopened = FileCommandLog::open(&path).unwrap();
+    assert_eq!(reopened.read_from(1).unwrap(), batch);
+}
+
+#[test]
+fn a_non_contiguous_batch_is_rejected_before_anything_is_written() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("commands.log");
+    let mut log = FileCommandLog::open(&path).unwrap();
+    log.write_header(header()).unwrap();
+    log.append(record(1)).unwrap();
+    let bytes_before = fs::metadata(&path).unwrap().len();
+
+    // The batch does not start at the next sequence.
+    assert_eq!(
+        log.append_batch(vec![record(3), record(4)]),
+        Err(DurableError::NonContiguousSequence {
+            expected: 2,
+            found: 3,
+        })
+    );
+    // A gap inside the batch is rejected as well.
+    assert_eq!(
+        log.append_batch(vec![record(2), record(4)]),
+        Err(DurableError::NonContiguousSequence {
+            expected: 3,
+            found: 4,
+        })
+    );
+
+    assert_eq!(
+        fs::metadata(&path).unwrap().len(),
+        bytes_before,
+        "a rejected batch must not write any line"
+    );
+    assert_eq!(log.last_sequence(), Some(1));
+    assert_eq!(log.read_from(1).unwrap(), vec![record(1)]);
+
+    // Rejection leaves the log usable for the next contiguous batch.
+    log.append_batch(vec![record(2), record(3)]).unwrap();
+    assert_eq!(log.last_sequence(), Some(3));
 }
 
 #[test]
