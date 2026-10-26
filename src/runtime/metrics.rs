@@ -154,16 +154,16 @@ impl RuntimeMetrics {
     }
 
     /// One journal append (which may cover many records) that took `elapsed`.
-    pub fn record_journal_append(&self, elapsed: Duration, records: usize) {
+    ///
+    /// Records only append time and the append count. Batch size and batch
+    /// count belong to [`Self::record_journal_batch`], which the matching
+    /// thread calls once at handoff; counting them here as well would
+    /// double-count every coalesced group.
+    pub fn record_journal_append(&self, elapsed: Duration) {
         let nanos = nanos(elapsed);
         add(&self.durability.journal_append_ns_sum, nanos);
         observe_max(&self.durability.journal_append_ns_max, nanos);
         count(&self.durability.journal_append_count);
-        add(
-            &self.durability.batch_records_sum,
-            u64::try_from(records).unwrap_or(u64::MAX),
-        );
-        count(&self.durability.batch_count);
     }
 
     // Readers.
@@ -269,8 +269,10 @@ mod tests {
         metrics.observe_queue_depth(3);
         metrics.observe_queue_depth(9);
         metrics.observe_queue_depth(4);
-        metrics.record_journal_append(Duration::from_micros(20), 10);
-        metrics.record_journal_append(Duration::from_micros(5), 2);
+        metrics.record_journal_batch(10);
+        metrics.record_journal_batch(2);
+        metrics.record_journal_append(Duration::from_micros(20));
+        metrics.record_journal_append(Duration::from_micros(5));
         metrics.record_applied();
         metrics.record_durable();
 
@@ -292,6 +294,33 @@ mod tests {
         assert_eq!(metrics.journal_append_count(), 2);
         assert_eq!(metrics.batch_records_sum(), 12);
         assert_eq!(metrics.batch_count(), 2);
+    }
+
+    #[test]
+    fn journal_append_metrics_do_not_double_count_batches() {
+        let metrics = RuntimeMetrics::new();
+
+        // The matching thread records each handoff once.
+        metrics.record_journal_batch(3);
+        metrics.record_journal_batch(5);
+
+        // The journal thread records only append time and append count.
+        metrics.record_journal_append(Duration::from_micros(10));
+        metrics.record_journal_append(Duration::from_micros(20));
+
+        assert_eq!(metrics.journal_append_count(), 2);
+        assert_eq!(metrics.journal_append_ns_sum(), 30_000);
+        assert_eq!(metrics.journal_append_ns_max(), 20_000);
+        assert_eq!(
+            metrics.batch_records_sum(),
+            8,
+            "batch records are counted at handoff, not again on append"
+        );
+        assert_eq!(
+            metrics.batch_count(),
+            2,
+            "batch count is counted at handoff, not again on append"
+        );
     }
 
     #[test]
