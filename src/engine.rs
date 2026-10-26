@@ -46,7 +46,6 @@ pub struct MatchingEngine {
     ledger: OrderLedger,
     next_order_id: u64,
     events: Vec<EngineEvent>,
-    commands: Vec<EngineCommand>,
     next_sequence_id: u64,
     stop_books: HashMap<String, StopBook>,
     last_trades: HashMap<String, LastTrade>,
@@ -62,7 +61,6 @@ impl Default for MatchingEngine {
             ledger: OrderLedger::default(),
             next_order_id: 1,
             events: Vec::new(),
-            commands: Vec::new(),
             stop_books: HashMap::new(),
             last_trades: HashMap::new(),
             next_sequence_id: 1,
@@ -80,7 +78,6 @@ impl MatchingEngine {
             ledger: OrderLedger::default(),
             next_order_id: 1,
             events: Vec::new(),
-            commands: Vec::new(),
             stop_books: HashMap::new(),
             last_trades: HashMap::new(),
             next_sequence_id: 1,
@@ -95,7 +92,7 @@ impl MatchingEngine {
 
     /// Capture the complete decision state as a deterministic snapshot.
     ///
-    /// Events and the command buffer are derived outputs and are not included.
+    /// Events are derived outputs and are not included.
     /// Books (including empty ones), ledger records, stop books and last trades
     /// are emitted in a canonical order so equal state has equal bytes.
     pub fn capture_snapshot(&self) -> EngineSnapshot {
@@ -158,7 +155,7 @@ impl MatchingEngine {
     ///
     /// Books recompute their price-level totals and order lookup indexes from
     /// the stored orders; the ledger and both stop indexes are reinserted
-    /// directly. Events and the command buffer start empty.
+    /// directly. Events start empty.
     pub fn restore_snapshot(snapshot: EngineSnapshot) -> Self {
         let order_books = snapshot
             .books
@@ -214,7 +211,6 @@ impl MatchingEngine {
             ledger,
             next_order_id: snapshot.next_order_id,
             events: Vec::new(),
-            commands: Vec::new(),
             next_sequence_id: snapshot.next_event_sequence,
             stop_books,
             last_trades,
@@ -232,18 +228,15 @@ impl MatchingEngine {
         })
     }
 
-    /// Apply one command and record it in the command log.
+    /// Apply one command through the engine's only write entry point.
     ///
-    /// The command is applied through a borrowed reference and only then moved
-    /// into the log, so the hot path does not clone the command or its symbol.
-    /// Rejected commands are recorded as well; replay can then reproduce them.
+    /// Durability and replay belong to the durable layer, which appends the
+    /// command before calling this method.
     pub fn execute(&mut self, command: EngineCommand) -> CommandOutcome {
-        let outcome = self.apply(&command);
-        self.commands.push(command);
-        outcome
+        self.apply(&command)
     }
 
-    /// Shared apply path for `execute` and replay. Never touches the log.
+    /// Core apply path used by `execute`. Never performs IO.
     fn apply(&mut self, command: &EngineCommand) -> CommandOutcome {
         let symbol = match command {
             EngineCommand::SubmitOrder { symbol, .. } => symbol,
@@ -713,28 +706,6 @@ impl MatchingEngine {
         Ok(())
     }
 
-    /// 将一条历史命令应用到当前引擎，不写入命令日志。
-    pub fn replay(&mut self, command: EngineCommand) {
-        let _ = self.apply(&command);
-    }
-
-    /// 重放一整段命令日志，不重复写入命令日志。
-    pub fn replay_commands(&mut self, commands: &[EngineCommand]) {
-        for command in commands {
-            self.replay(command.clone());
-        }
-    }
-
-    /// 从命令日志重建引擎：日志只恢复一次，随后逐条应用。
-    pub fn from_commands(config: EngineConfig, commands: &[EngineCommand]) -> Self {
-        let mut engine = Self::new(config);
-        engine.commands = commands.to_vec();
-        for command in commands {
-            engine.replay(command.clone());
-        }
-        engine
-    }
-
     fn record_fills(&mut self, symbol: &str, timestamp: u64, fills: Vec<Fill>) -> Vec<Trade> {
         let mut record_trades = Vec::with_capacity(fills.len());
         fills.iter().for_each(|fill| {
@@ -772,10 +743,6 @@ impl MatchingEngine {
 
     pub fn events(&self) -> &[EngineEvent] {
         &self.events
-    }
-
-    pub fn commands(&self) -> &[EngineCommand] {
-        &self.commands
     }
 
     fn allocate_sequence_id(&mut self) -> u64 {
@@ -818,6 +785,8 @@ impl MatchingEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::durable::DurableMatchingEngine;
+    use crate::durable::memory::{InMemoryCommandLog, InMemorySnapshotStore};
     use crate::types::OrderStatus;
 
     fn limit(timestamp: u64, side: Side, price: u64, quantity: u64) -> OrderRequest {
@@ -872,6 +841,38 @@ mod tests {
         }
     }
 
+    fn submit_command(symbol: &str, request: OrderRequest) -> EngineCommand {
+        EngineCommand::SubmitOrder {
+            symbol: symbol.to_string(),
+            request,
+        }
+    }
+
+    fn cancel_command(symbol: &str, order_id: u64) -> EngineCommand {
+        EngineCommand::CancelOrder {
+            symbol: symbol.to_string(),
+            order_id,
+        }
+    }
+
+    fn modify_command(
+        symbol: &str,
+        order_id: u64,
+        price: u64,
+        quantity: u64,
+        timestamp: u64,
+    ) -> EngineCommand {
+        EngineCommand::ModifyOrder {
+            symbol: symbol.to_string(),
+            order_id,
+            request: ModifyRequest {
+                price,
+                quantity,
+                timestamp,
+            },
+        }
+    }
+
     /// Submit through the public command seam, keeping the old test shape of
     /// `Result<ExecutionReport, EngineError>`.
     fn submit(
@@ -879,10 +880,7 @@ mod tests {
         symbol: &str,
         request: OrderRequest,
     ) -> Result<ExecutionReport, EngineError> {
-        match engine.execute(EngineCommand::SubmitOrder {
-            symbol: symbol.to_string(),
-            request,
-        }) {
+        match engine.execute(submit_command(symbol, request)) {
             CommandOutcome::Accepted(report) => Ok(report),
             CommandOutcome::Rejected(error) => Err(error),
             CommandOutcome::Canceled(_) => panic!("submit produced a cancel outcome"),
@@ -892,10 +890,7 @@ mod tests {
     /// Cancel through the public command seam, keeping the old test shape of
     /// `Option<ExecutionReport>`.
     fn cancel(engine: &mut MatchingEngine, symbol: &str, order_id: u64) -> Option<ExecutionReport> {
-        match engine.execute(EngineCommand::CancelOrder {
-            symbol: symbol.to_string(),
-            order_id,
-        }) {
+        match engine.execute(cancel_command(symbol, order_id)) {
             CommandOutcome::Canceled(report) => Some(report),
             CommandOutcome::Rejected(_) => None,
             CommandOutcome::Accepted(_) => panic!("cancel produced an accepted outcome"),
@@ -912,15 +907,7 @@ mod tests {
         quantity: u64,
         timestamp: u64,
     ) -> Result<ExecutionReport, EngineError> {
-        match engine.execute(EngineCommand::ModifyOrder {
-            symbol: symbol.to_string(),
-            order_id,
-            request: ModifyRequest {
-                price,
-                quantity,
-                timestamp,
-            },
-        }) {
+        match engine.execute(modify_command(symbol, order_id, price, quantity, timestamp)) {
             CommandOutcome::Accepted(report) => Ok(report),
             CommandOutcome::Rejected(error) => Err(error),
             CommandOutcome::Canceled(_) => panic!("modify produced a cancel outcome"),
@@ -934,6 +921,62 @@ mod tests {
             .order_records()
             .map(|(order_id, record)| (order_id, record.clone()))
             .collect()
+    }
+
+    /// Execute every command, ignoring outcomes; individual tests assert the
+    /// outcomes they care about.
+    fn execute_all(engine: &mut MatchingEngine, commands: &[EngineCommand]) {
+        for command in commands {
+            let _ = engine.execute(command.clone());
+        }
+    }
+
+    /// Replay a locally collected command stream through the durable
+    /// append-then-apply path. Events are deliberately not recovered, so
+    /// callers compare decision state rather than event history.
+    fn recover(commands: &[EngineCommand]) -> DurableMatchingEngine {
+        let log = InMemoryCommandLog::new();
+        let snapshots = InMemorySnapshotStore::new();
+        DurableMatchingEngine::from_commands(
+            EngineConfig::default(),
+            commands,
+            Box::new(log.handle()),
+            Box::new(snapshots.handle()),
+            0,
+        )
+        .expect("replaying a valid command stream succeeds")
+    }
+
+    /// Assert that durable replay reproduces the pure engine's decision state,
+    /// then hand the recovered engine back for scenario-specific comparisons.
+    fn assert_recovered(
+        commands: &[EngineCommand],
+        engine: &MatchingEngine,
+    ) -> DurableMatchingEngine {
+        // Events belong to live execution only; recovery does not restore them.
+        let live_events = engine.events();
+        assert!(!live_events.is_empty(), "live execution emits events");
+        assert_eq!(
+            live_events.last().unwrap().sequence_id(),
+            engine.last_sequence(),
+            "live event history matches the engine's last sequence"
+        );
+
+        let expected = engine.capture_snapshot();
+        let recovered = recover(commands);
+        let actual = recovered.engine().capture_snapshot();
+
+        assert_eq!(actual, expected, "durable replay reproduces decision state");
+        assert_eq!(recovered.applied_seq(), commands.len() as u64);
+        assert_eq!(recovered.engine().trades(), engine.trades());
+        assert_eq!(records(recovered.engine()), records(engine));
+        assert_eq!(recovered.engine().order_count(), engine.order_count());
+        // Counters that the old tests read as private fields.
+        assert_eq!(actual.next_order_id, expected.next_order_id);
+        assert_eq!(actual.next_trade_id, expected.next_trade_id);
+        assert_eq!(actual.next_event_sequence, expected.next_event_sequence);
+
+        recovered
     }
 
     #[test]
@@ -1457,15 +1500,32 @@ mod tests {
 
     #[test]
     fn commands_are_recorded_in_order() {
-        let mut engine = MatchingEngine::new(EngineConfig::default());
-        submit(&mut engine, "BTC-USDT", limit(1, Side::Ask, 100, 5)).unwrap();
-        submit(&mut engine, "BTC-USDT", market(2, Side::Bid, 2)).unwrap();
-        cancel(&mut engine, "BTC-USDT", 1).unwrap();
+        let commands = vec![
+            submit_command("BTC-USDT", limit(1, Side::Ask, 100, 5)),
+            submit_command("BTC-USDT", market(2, Side::Bid, 2)),
+            cancel_command("BTC-USDT", 1),
+        ];
 
-        let commands = engine.commands();
-        assert_eq!(commands.len(), 3);
+        let log = InMemoryCommandLog::new();
+        let snapshots = InMemorySnapshotStore::new();
+        let mut durable = DurableMatchingEngine::create(
+            EngineConfig::default(),
+            Box::new(log.handle()),
+            Box::new(snapshots.handle()),
+            0,
+        )
+        .unwrap();
+        for command in &commands {
+            durable.execute(command.clone()).unwrap();
+        }
 
-        match &commands[0] {
+        let history = durable.history_from(1).unwrap();
+        assert_eq!(history.len(), 3);
+        for (record, expected) in history.iter().zip(&commands) {
+            assert_eq!(&record.command, expected);
+        }
+
+        match &history[0].command {
             EngineCommand::SubmitOrder { symbol, request } => {
                 assert_eq!(symbol, "BTC-USDT");
                 assert_eq!(request.order_type, OrderType::Limit);
@@ -1476,7 +1536,7 @@ mod tests {
             _ => panic!("expected SubmitOrder"),
         }
 
-        match &commands[1] {
+        match &history[1].command {
             EngineCommand::SubmitOrder { symbol, request } => {
                 assert_eq!(symbol, "BTC-USDT");
                 assert_eq!(request.order_type, OrderType::Market);
@@ -1486,7 +1546,7 @@ mod tests {
             _ => panic!("expected SubmitOrder"),
         }
 
-        match &commands[2] {
+        match &history[2].command {
             EngineCommand::CancelOrder { symbol, order_id } => {
                 assert_eq!(symbol, "BTC-USDT");
                 assert_eq!(*order_id, 1);
@@ -1498,12 +1558,11 @@ mod tests {
     #[test]
     fn submit_command_returns_accepted_outcome_for_limit_and_market() {
         let mut engine = MatchingEngine::new(EngineConfig::default());
+        let mut commands: Vec<EngineCommand> = Vec::new();
 
-        let limit_outcome = engine.execute(EngineCommand::SubmitOrder {
-            symbol: "BTC-USDT".to_string(),
-            request: limit(1, Side::Ask, 100, 5),
-        });
-        match limit_outcome {
+        let command = submit_command("BTC-USDT", limit(1, Side::Ask, 100, 5));
+        commands.push(command.clone());
+        match engine.execute(command) {
             CommandOutcome::Accepted(report) => {
                 assert_eq!(report.order_id, 1);
                 assert_eq!(report.status, OrderStatus::New);
@@ -1513,11 +1572,9 @@ mod tests {
             other => panic!("expected Accepted, got {other:?}"),
         }
 
-        let market_outcome = engine.execute(EngineCommand::SubmitOrder {
-            symbol: "BTC-USDT".to_string(),
-            request: market(2, Side::Bid, 5),
-        });
-        match market_outcome {
+        let command = submit_command("BTC-USDT", market(2, Side::Bid, 5));
+        commands.push(command.clone());
+        match engine.execute(command) {
             CommandOutcome::Accepted(report) => {
                 assert_eq!(report.order_id, 2);
                 assert_eq!(report.status, OrderStatus::Filled);
@@ -1528,35 +1585,33 @@ mod tests {
         }
 
         assert_eq!(engine.trades().len(), 1);
-        assert_eq!(engine.commands().len(), 2);
+        assert_eq!(commands.len(), 2);
     }
 
     #[test]
     fn cancel_command_returns_canceled_and_failures_map_to_rejected() {
         let mut engine = MatchingEngine::new(EngineConfig::default());
-        let submitted = engine.execute(EngineCommand::SubmitOrder {
-            symbol: "BTC-USDT".to_string(),
-            request: limit(1, Side::Bid, 100, 5),
-        });
+        let mut commands: Vec<EngineCommand> = Vec::new();
+
+        let command = submit_command("BTC-USDT", limit(1, Side::Bid, 100, 5));
+        commands.push(command.clone());
+        let submitted = engine.execute(command);
         assert!(matches!(submitted, CommandOutcome::Accepted(_)));
 
         // 错误 symbol 与未知订单一样映射为 Rejected，且不产生事件
         let events_before = engine.events().len();
-        let wrong_symbol = engine.execute(EngineCommand::CancelOrder {
-            symbol: "ETH-USDT".to_string(),
-            order_id: 1,
-        });
+        let command = cancel_command("ETH-USDT", 1);
+        commands.push(command.clone());
+        let wrong_symbol = engine.execute(command);
         assert_eq!(
             wrong_symbol,
             CommandOutcome::Rejected(EngineError::UnknownOrder)
         );
         assert_eq!(engine.events().len(), events_before);
 
-        let outcome = engine.execute(EngineCommand::CancelOrder {
-            symbol: "BTC-USDT".to_string(),
-            order_id: 1,
-        });
-        match outcome {
+        let command = cancel_command("BTC-USDT", 1);
+        commands.push(command.clone());
+        match engine.execute(command) {
             CommandOutcome::Canceled(report) => {
                 assert_eq!(report.order_id, 1);
                 assert_eq!(report.status, OrderStatus::Canceled);
@@ -1566,136 +1621,106 @@ mod tests {
         }
 
         // 已撤销的订单再次撤销同样被拒绝
-        let already_canceled = engine.execute(EngineCommand::CancelOrder {
-            symbol: "BTC-USDT".to_string(),
-            order_id: 1,
-        });
+        let command = cancel_command("BTC-USDT", 1);
+        commands.push(command.clone());
+        let already_canceled = engine.execute(command);
         assert_eq!(
             already_canceled,
             CommandOutcome::Rejected(EngineError::UnknownOrder)
         );
 
-        // 四次命令全部记录：submit + 三次 cancel
-        assert_eq!(engine.commands().len(), 4);
+        // 四次命令全部写入持久化命令流：submit + 三次 cancel
+        assert_eq!(commands.len(), 4);
 
         // 回放失败的撤单不产生事件，也不改变状态
-        let replayed = MatchingEngine::from_commands(EngineConfig::default(), engine.commands());
-        assert_eq!(replayed.commands(), engine.commands());
-        assert_eq!(replayed.events(), engine.events());
-        assert_eq!(records(&replayed), records(&engine));
-        assert_eq!(replayed.book("BTC-USDT"), engine.book("BTC-USDT"));
+        let recovered = assert_recovered(&commands, &engine);
+        assert_eq!(recovered.engine().book("BTC-USDT"), engine.book("BTC-USDT"));
+        let history = recovered.history_from(1).unwrap();
+        assert_eq!(history.len(), 4);
+        for (record, expected) in history.iter().zip(&commands) {
+            assert_eq!(&record.command, expected);
+        }
     }
 
     #[test]
-    fn replay_reproduces_state_events_and_commands_after_execute() {
+    fn replay_reproduces_state_and_counters_after_execute() {
+        let commands = vec![
+            submit_command("BTC-USDT", limit(1, Side::Ask, 100, 5)),
+            submit_command("BTC-USDT", limit(2, Side::Bid, 100, 3)),
+            cancel_command("BTC-USDT", 1),
+        ];
         let mut engine = MatchingEngine::new(EngineConfig::default());
+        execute_all(&mut engine, &commands);
 
-        engine.execute(EngineCommand::SubmitOrder {
-            symbol: "BTC-USDT".to_string(),
-            request: limit(1, Side::Ask, 100, 5),
-        });
-        engine.execute(EngineCommand::SubmitOrder {
-            symbol: "BTC-USDT".to_string(),
-            request: limit(2, Side::Bid, 100, 3),
-        });
-        engine.execute(EngineCommand::CancelOrder {
-            symbol: "BTC-USDT".to_string(),
-            order_id: 1,
-        });
-
-        let replayed = MatchingEngine::from_commands(EngineConfig::default(), engine.commands());
-
-        assert_eq!(replayed.commands(), engine.commands());
-        assert_eq!(replayed.events(), engine.events());
-        assert_eq!(replayed.trades(), engine.trades());
-        assert_eq!(records(&replayed), records(&engine));
-        assert_eq!(replayed.book("BTC-USDT"), engine.book("BTC-USDT"));
-        assert_eq!(replayed.next_order_id, engine.next_order_id);
-        assert_eq!(replayed.next_trade_id, engine.next_trade_id);
-        assert_eq!(replayed.next_sequence_id, engine.next_sequence_id);
+        let recovered = assert_recovered(&commands, &engine);
+        assert_eq!(recovered.engine().book("BTC-USDT"), engine.book("BTC-USDT"));
     }
 
     #[test]
     fn rejected_order_is_recorded_and_replayed() {
         let mut engine = MatchingEngine::new(EngineConfig::default());
 
-        let outcome = engine.execute(EngineCommand::SubmitOrder {
-            symbol: "BTC-USDT".to_string(),
-            request: limit(1, Side::Bid, 100, 0),
-        });
+        let command = submit_command("BTC-USDT", limit(1, Side::Bid, 100, 0));
+        let commands = vec![command.clone()];
+        let outcome = engine.execute(command);
         assert_eq!(
             outcome,
             CommandOutcome::Rejected(EngineError::QuantityOutOfRange)
         );
 
-        // 拒绝的请求也要进命令日志，回放才能复现拒绝事件
-        assert_eq!(engine.commands().len(), 1);
+        // 拒绝的请求也要进持久化命令流，回放才能复现同一个拒绝
+        assert_eq!(commands.len(), 1);
         assert_eq!(engine.events().len(), 1);
 
-        let replayed = MatchingEngine::from_commands(EngineConfig::default(), engine.commands());
-
-        assert_eq!(replayed.commands(), engine.commands());
-        assert_eq!(replayed.events(), engine.events());
-        assert_eq!(replayed.order_count(), 0);
-        assert_eq!(replayed.next_order_id, 1);
-        assert_eq!(replayed.next_sequence_id, 2);
+        let recovered = assert_recovered(&commands, &engine);
+        let history = recovered.history_from(1).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].command, commands[0]);
+        assert_eq!(recovered.engine().order_count(), 0);
+        let snapshot = recovered.engine().capture_snapshot();
+        assert_eq!(snapshot.next_order_id, 1);
+        assert_eq!(snapshot.next_event_sequence, 2);
     }
 
     #[test]
     fn replay_reproduces_identical_state() {
         let mut engine = MatchingEngine::new(EngineConfig::default());
 
-        // 部分成交
-        submit(&mut engine, "BTC-USDT", limit(1, Side::Ask, 100, 5)).unwrap();
-        submit(&mut engine, "BTC-USDT", limit(2, Side::Bid, 100, 2)).unwrap();
-        // 撤销剩余挂单
-        cancel(&mut engine, "BTC-USDT", 1).unwrap();
-        // 挂单后由市价单部分吃掉
-        submit(&mut engine, "BTC-USDT", limit(3, Side::Bid, 99, 4)).unwrap();
-        submit(&mut engine, "BTC-USDT", market(4, Side::Ask, 1)).unwrap();
-        // 非法订单：产生拒绝事件，不消耗订单 id
-        assert!(submit(&mut engine, "BTC-USDT", limit(5, Side::Bid, 98, 0)).is_err());
-        // 另一个 symbol
-        submit(&mut engine, "ETH-USDT", limit(6, Side::Ask, 200, 1)).unwrap();
-
-        let replayed = MatchingEngine::from_commands(EngineConfig::default(), engine.commands());
-
-        assert_eq!(replayed.commands(), engine.commands());
-        assert_eq!(replayed.trades(), engine.trades());
-        assert_eq!(replayed.events(), engine.events());
-        assert_eq!(records(&replayed), records(&engine));
-        assert_eq!(replayed.book("BTC-USDT"), engine.book("BTC-USDT"));
-        assert_eq!(replayed.book("ETH-USDT"), engine.book("ETH-USDT"));
+        let commands = vec![
+            // 部分成交
+            submit_command("BTC-USDT", limit(1, Side::Ask, 100, 5)),
+            submit_command("BTC-USDT", limit(2, Side::Bid, 100, 2)),
+            // 撤销剩余挂单
+            cancel_command("BTC-USDT", 1),
+            // 挂单后由市价单部分吃掉
+            submit_command("BTC-USDT", limit(3, Side::Bid, 99, 4)),
+            submit_command("BTC-USDT", market(4, Side::Ask, 1)),
+            // 非法订单：产生拒绝事件，不消耗订单 id
+            submit_command("BTC-USDT", limit(5, Side::Bid, 98, 0)),
+            // 另一个 symbol
+            submit_command("ETH-USDT", limit(6, Side::Ask, 200, 1)),
+        ];
+        execute_all(&mut engine, &commands[..5]);
         assert_eq!(
-            replayed.snapshot("BTC-USDT", 10),
+            engine.execute(commands[5].clone()),
+            CommandOutcome::Rejected(EngineError::QuantityOutOfRange)
+        );
+        assert!(matches!(
+            engine.execute(commands[6].clone()),
+            CommandOutcome::Accepted(_)
+        ));
+
+        let recovered = assert_recovered(&commands, &engine);
+        assert_eq!(recovered.engine().book("BTC-USDT"), engine.book("BTC-USDT"));
+        assert_eq!(recovered.engine().book("ETH-USDT"), engine.book("ETH-USDT"));
+        assert_eq!(
+            recovered.engine().snapshot("BTC-USDT", 10),
             engine.snapshot("BTC-USDT", 10)
         );
         assert_eq!(
-            replayed.snapshot("ETH-USDT", 10),
+            recovered.engine().snapshot("ETH-USDT", 10),
             engine.snapshot("ETH-USDT", 10)
         );
-        assert_eq!(replayed.next_order_id, engine.next_order_id);
-        assert_eq!(replayed.next_trade_id, engine.next_trade_id);
-        assert_eq!(replayed.next_sequence_id, engine.next_sequence_id);
-    }
-
-    #[test]
-    fn replay_does_not_record_commands_again() {
-        let mut engine = MatchingEngine::new(EngineConfig::default());
-        submit(&mut engine, "BTC-USDT", limit(1, Side::Ask, 100, 5)).unwrap();
-        submit(&mut engine, "BTC-USDT", limit(2, Side::Bid, 100, 2)).unwrap();
-        cancel(&mut engine, "BTC-USDT", 1).unwrap();
-
-        let mut replayed = MatchingEngine::new(EngineConfig::default());
-        replayed.replay_commands(engine.commands());
-
-        // replay 只执行命令，不重复写入本地命令日志
-        assert!(replayed.commands().is_empty());
-        // 但状态和事件与原始引擎一致
-        assert_eq!(replayed.trades(), engine.trades());
-        assert_eq!(replayed.events(), engine.events());
-        assert_eq!(records(&replayed), records(&engine));
-        assert_eq!(replayed.book("BTC-USDT"), engine.book("BTC-USDT"));
     }
 
     #[test]
@@ -1995,21 +2020,32 @@ mod tests {
     #[test]
     fn post_only_market_order_is_rejected_before_crossing_check() {
         let mut engine = MatchingEngine::new(EngineConfig::default());
-        submit(&mut engine, "BTC-USDT", limit(1, Side::Ask, 100, 5)).unwrap();
+        let mut commands: Vec<EngineCommand> = Vec::new();
 
-        let request = OrderRequest {
-            post_only: true,
-            ..market(2, Side::Bid, 5)
-        };
+        let command = submit_command("BTC-USDT", limit(1, Side::Ask, 100, 5));
+        commands.push(command.clone());
+        assert!(matches!(
+            engine.execute(command),
+            CommandOutcome::Accepted(_)
+        ));
+
+        let command = submit_command(
+            "BTC-USDT",
+            OrderRequest {
+                post_only: true,
+                ..market(2, Side::Bid, 5)
+            },
+        );
+        commands.push(command.clone());
         assert_eq!(
-            submit(&mut engine, "BTC-USDT", request).unwrap_err(),
-            EngineError::InvalidTimeInForce
+            engine.execute(command),
+            CommandOutcome::Rejected(EngineError::InvalidTimeInForce)
         );
 
         // 校验先于 would_cross：即使簿上有可交叉的卖单，也应报 InvalidTimeInForce
         assert!(engine.trades().is_empty());
         assert_eq!(engine.book("BTC-USDT").unwrap().best_ask(), Some(100));
-        assert_eq!(engine.commands().len(), 2);
+        assert_eq!(commands.len(), 2);
         assert_eq!(engine.events().len(), 2);
         match engine.events().last().unwrap() {
             EngineEvent::OrderRejected { reason, .. } => {
@@ -2022,26 +2058,47 @@ mod tests {
     #[test]
     fn replay_reproduces_tif_commands() {
         let mut engine = MatchingEngine::new(EngineConfig::default());
-        submit(&mut engine, "BTC-USDT", limit(1, Side::Ask, 100, 5)).unwrap();
-        submit(&mut engine, "BTC-USDT", ioc_limit(2, Side::Bid, 100, 10)).unwrap();
-        assert!(submit(&mut engine, "BTC-USDT", fok_limit(3, Side::Bid, 101, 10)).is_err());
-        let post_only = submit(
-            &mut engine,
+        let mut commands: Vec<EngineCommand> = Vec::new();
+
+        commands.push(submit_command("BTC-USDT", limit(1, Side::Ask, 100, 5)));
+        assert!(matches!(
+            engine.execute(commands[0].clone()),
+            CommandOutcome::Accepted(_)
+        ));
+        commands.push(submit_command(
+            "BTC-USDT",
+            ioc_limit(2, Side::Bid, 100, 10),
+        ));
+        assert!(matches!(
+            engine.execute(commands[1].clone()),
+            CommandOutcome::Accepted(_)
+        ));
+        commands.push(submit_command(
+            "BTC-USDT",
+            fok_limit(3, Side::Bid, 101, 10),
+        ));
+        assert!(matches!(
+            engine.execute(commands[2].clone()),
+            CommandOutcome::Rejected(_)
+        ));
+        commands.push(submit_command(
             "BTC-USDT",
             post_only_limit(4, Side::Bid, 99, 1),
-        )
-        .unwrap();
-        cancel(&mut engine, "BTC-USDT", post_only.order_id).unwrap();
+        ));
+        let post_only = match engine.execute(commands[3].clone()) {
+            CommandOutcome::Accepted(report) => report,
+            other => panic!("post-only submit failed: {other:?}"),
+        };
+        commands.push(cancel_command("BTC-USDT", post_only.order_id));
+        assert!(matches!(
+            engine.execute(commands[4].clone()),
+            CommandOutcome::Canceled(_)
+        ));
 
-        let replayed = MatchingEngine::from_commands(EngineConfig::default(), engine.commands());
-
-        assert_eq!(replayed.commands(), engine.commands());
-        assert_eq!(replayed.events(), engine.events());
-        assert_eq!(replayed.trades(), engine.trades());
-        assert_eq!(records(&replayed), records(&engine));
-        assert_eq!(replayed.book("BTC-USDT"), engine.book("BTC-USDT"));
+        let recovered = assert_recovered(&commands, &engine);
+        assert_eq!(recovered.engine().book("BTC-USDT"), engine.book("BTC-USDT"));
         assert_eq!(
-            replayed.snapshot("BTC-USDT", 10),
+            recovered.engine().snapshot("BTC-USDT", 10),
             engine.snapshot("BTC-USDT", 10)
         );
     }
@@ -2390,14 +2447,30 @@ mod tests {
 
     #[test]
     fn modify_emits_cancel_then_accept_and_is_logged_once() {
-        let mut engine = MatchingEngine::new(EngineConfig::default());
-        submit(&mut engine, "BTC-USDT", limit(1, Side::Ask, 100, 5)).unwrap();
+        let log = InMemoryCommandLog::new();
+        let snapshots = InMemorySnapshotStore::new();
+        let mut durable = DurableMatchingEngine::create(
+            EngineConfig::default(),
+            Box::new(log.handle()),
+            Box::new(snapshots.handle()),
+            0,
+        )
+        .unwrap();
+        durable
+            .execute(submit_command("BTC-USDT", limit(1, Side::Ask, 100, 5)))
+            .unwrap();
 
-        let events_before = engine.events().len();
-        let modified = modify(&mut engine, "BTC-USDT", 1, 101, 5, 2).unwrap();
+        let events_before = durable.engine().events().len();
+        let modified = match durable
+            .execute(modify_command("BTC-USDT", 1, 101, 5, 2))
+            .unwrap()
+        {
+            CommandOutcome::Accepted(report) => report,
+            other => panic!("modify failed: {other:?}"),
+        };
 
-        assert_eq!(engine.events().len(), events_before + 2);
-        match &engine.events()[events_before] {
+        assert_eq!(durable.engine().events().len(), events_before + 2);
+        match &durable.engine().events()[events_before] {
             EngineEvent::OrderCanceled {
                 sequence_id,
                 report,
@@ -2409,7 +2482,7 @@ mod tests {
             }
             other => panic!("expected OrderCanceled, got {other:?}"),
         }
-        match &engine.events()[events_before + 1] {
+        match &durable.engine().events()[events_before + 1] {
             EngineEvent::OrderAccepted {
                 sequence_id,
                 report,
@@ -2422,8 +2495,9 @@ mod tests {
         }
 
         // One client command is logged; the internal cancel and submit are not.
-        assert_eq!(engine.commands().len(), 2);
-        match &engine.commands()[1] {
+        let history = durable.history_from(1).unwrap();
+        assert_eq!(history.len(), 2);
+        match &history[1].command {
             EngineCommand::ModifyOrder {
                 symbol,
                 order_id,
@@ -2446,21 +2520,16 @@ mod tests {
 
     #[test]
     fn replay_reproduces_modify_commands() {
+        let commands = vec![
+            submit_command("BTC-USDT", limit(1, Side::Ask, 100, 5)),
+            submit_command("BTC-USDT", limit(2, Side::Bid, 99, 2)),
+            modify_command("BTC-USDT", 2, 100, 2, 3),
+            submit_command("BTC-USDT", limit(4, Side::Bid, 98, 1)),
+        ];
         let mut engine = MatchingEngine::new(EngineConfig::default());
-        submit(&mut engine, "BTC-USDT", limit(1, Side::Ask, 100, 5)).unwrap();
-        submit(&mut engine, "BTC-USDT", limit(2, Side::Bid, 99, 2)).unwrap();
-        modify(&mut engine, "BTC-USDT", 2, 100, 2, 3).unwrap();
-        submit(&mut engine, "BTC-USDT", limit(4, Side::Bid, 98, 1)).unwrap();
+        execute_all(&mut engine, &commands);
 
-        let replayed = MatchingEngine::from_commands(EngineConfig::default(), engine.commands());
-
-        assert_eq!(replayed.commands(), engine.commands());
-        assert_eq!(replayed.events(), engine.events());
-        assert_eq!(replayed.trades(), engine.trades());
-        assert_eq!(records(&replayed), records(&engine));
-        assert_eq!(replayed.book("BTC-USDT"), engine.book("BTC-USDT"));
-        assert_eq!(replayed.next_order_id, engine.next_order_id);
-        assert_eq!(replayed.next_trade_id, engine.next_trade_id);
-        assert_eq!(replayed.next_sequence_id, engine.next_sequence_id);
+        let recovered = assert_recovered(&commands, &engine);
+        assert_eq!(recovered.engine().book("BTC-USDT"), engine.book("BTC-USDT"));
     }
 }
