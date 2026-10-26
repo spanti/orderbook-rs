@@ -99,10 +99,12 @@ pub enum DurableError {
     CorruptRecord { detail: String },
     /// The durable engine stopped accepting commands after an append failure.
     EngineFailed,
-    /// The event-sourced decision path refused the command before any append.
+    /// Retained for source compatibility; the event-sourced path no longer
+    /// returns it.
     ///
-    /// Client errors (unsupported command shapes, policy rejections not yet
-    /// event-sourced) do not fail the instance.
+    /// Business rejections are successful, event-producing executes: they
+    /// journal one [`crate::event::DomainEvent::OrderRejected`] and change no
+    /// state. A failed append or recovery still fails the instance.
     DecisionRejected(EngineError),
 }
 

@@ -8,9 +8,9 @@
 //!
 //! Ticket 02 adds matching and cancel: `TradeExecuted` and `OrderCanceled`.
 //! Ticket 03 adds stops: `StopPlaced`, `StopTriggered` and `StopCanceled`.
-//! Ticket 04 adds modify and rejections.
+//! Ticket 04 adds modify (`OrderCanceled{Modified}`) and `OrderRejected`.
 
-use crate::types::{Order, OrderBookId, StopOrder, Trade};
+use crate::types::{EngineCommand, EngineError, Order, OrderBookId, StopOrder, Trade};
 
 /// Why an order's remaining quantity left the book.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -19,9 +19,7 @@ pub enum OrderCancelReason {
     UnfilledResidual,
     /// The client canceled the open order.
     UserCancel,
-    /// The order was canceled as the first half of a modify (ticket 04).
-    ///
-    /// Defined now so the event schema is stable; ticket 02 never emits it.
+    /// The order was canceled as the first half of a modify.
     Modified,
 }
 
@@ -87,6 +85,18 @@ pub enum DomainEvent {
         symbol: String,
         order_id: OrderBookId,
     },
+    /// A command was rejected by business validation.
+    ///
+    /// This is the only event with no state effect: applying it changes
+    /// nothing. It exists so rejected attempts are auditable and replayable
+    /// facts. `command` is the full original command, preserved as audit
+    /// payload; the event allocates no order id. Internal invariant violations
+    /// never become this event; they panic.
+    OrderRejected {
+        symbol: String,
+        reason: EngineError,
+        command: EngineCommand,
+    },
 }
 
 impl DomainEvent {
@@ -103,7 +113,9 @@ impl DomainEvent {
                 Some(*order_id)
             }
             Self::StopPlaced { stop, .. } => Some(stop.id),
-            Self::TradeExecuted { .. } => None,
+            // A rejection is audit-only: even when the rejected command names
+            // an order, the event allocates and changes no order id.
+            Self::TradeExecuted { .. } | Self::OrderRejected { .. } => None,
         }
     }
 }
@@ -111,7 +123,7 @@ impl DomainEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{OrderType, Side, StopKind, TimeInForce};
+    use crate::types::{EngineCommand, EngineError, OrderType, Side, StopKind, TimeInForce};
 
     fn order() -> Order {
         Order {
@@ -190,6 +202,14 @@ mod tests {
             DomainEvent::StopCanceled {
                 symbol: "BTC-USDT".to_string(),
                 order_id: 7,
+            },
+            DomainEvent::OrderRejected {
+                symbol: "BTC-USDT".to_string(),
+                reason: EngineError::UnknownOrder,
+                command: EngineCommand::CancelOrder {
+                    symbol: "BTC-USDT".to_string(),
+                    order_id: 7,
+                },
             },
         ] {
             let json = serde_json::to_string(&event).expect("event must serialize");

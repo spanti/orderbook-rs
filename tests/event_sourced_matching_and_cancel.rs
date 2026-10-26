@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use orderbook_rs::durable::{
-    DurableError, EventSourcedEngine, InMemoryEventLog, InMemoryEventSnapshotStore,
+    EventSourcedEngine, InMemoryEventLog, InMemoryEventSnapshotStore,
 };
 use orderbook_rs::engine::MatchingEngine;
 use orderbook_rs::event::{DomainEvent, OrderCancelReason};
@@ -96,6 +96,20 @@ fn trade(
     }
 }
 
+fn rejected(command: &EngineCommand, reason: EngineError) -> DomainEvent {
+    let symbol = match command {
+        EngineCommand::SubmitOrder { symbol, .. }
+        | EngineCommand::SubmitStopOrder { symbol, .. }
+        | EngineCommand::CancelOrder { symbol, .. }
+        | EngineCommand::ModifyOrder { symbol, .. } => symbol,
+    };
+    DomainEvent::OrderRejected {
+        symbol: symbol.clone(),
+        reason,
+        command: command.clone(),
+    }
+}
+
 /// Apply a decided event list with the next contiguous sequences.
 fn apply_all(engine: &mut MatchingEngine, events: &[DomainEvent]) {
     for event in events {
@@ -106,9 +120,7 @@ fn apply_all(engine: &mut MatchingEngine, events: &[DomainEvent]) {
 
 /// Decide and apply one command through the pure engine seam.
 fn run(engine: &mut MatchingEngine, command: &EngineCommand) -> Vec<DomainEvent> {
-    let events = engine
-        .decide(command)
-        .expect("command is supported by the event-sourced path");
+    let events = engine.decide(command);
     apply_all(engine, &events);
     events
 }
@@ -229,9 +241,7 @@ fn fully_filled_crossing_limit_emits_accepted_and_trade_only() {
     rest(&mut engine, BTC, limit(Side::Ask, 100, 5, 1));
 
     let request = limit(Side::Bid, 100, 5, 2);
-    let events = engine
-        .decide(&submit(BTC, request))
-        .expect("crossing limit submit is supported");
+    let events = engine.decide(&submit(BTC, request));
 
     assert_eq!(
         events.len(),
@@ -261,7 +271,7 @@ fn partially_filled_crossing_limit_rests_its_remainder() {
     rest(&mut engine, BTC, limit(Side::Ask, 100, 3, 1));
 
     let request = limit(Side::Bid, 100, 5, 2);
-    let events = engine.decide(&submit(BTC, request)).unwrap();
+    let events = engine.decide(&submit(BTC, request));
 
     assert_eq!(events.len(), 3);
     assert_eq!(events[0], accepted(2, &request));
@@ -309,7 +319,7 @@ fn crossing_limit_sweeps_levels_in_price_time_priority() {
     rest(&mut engine, BTC, limit(Side::Ask, 101, 2, 3)); // maker 3, worse price
 
     let request = limit(Side::Bid, 101, 8, 4);
-    let events = engine.decide(&submit(BTC, request)).unwrap();
+    let events = engine.decide(&submit(BTC, request));
 
     assert_eq!(events.len(), 5, "accepted + three fills + rest");
     assert_eq!(events[0], accepted(4, &request));
@@ -359,7 +369,7 @@ fn fully_filled_market_order_has_no_trailing_event() {
     rest(&mut engine, BTC, limit(Side::Ask, 100, 2, 1));
 
     let request = market(Side::Bid, 2, 2);
-    let events = engine.decide(&submit(BTC, request)).unwrap();
+    let events = engine.decide(&submit(BTC, request));
 
     assert_eq!(events.len(), 2);
     assert_eq!(events[0], accepted(2, &request));
@@ -377,7 +387,7 @@ fn market_order_with_insufficient_liquidity_cancels_the_residual() {
     rest(&mut engine, BTC, limit(Side::Ask, 100, 2, 1));
 
     let request = market(Side::Bid, 5, 2);
-    let events = engine.decide(&submit(BTC, request)).unwrap();
+    let events = engine.decide(&submit(BTC, request));
 
     assert_eq!(events.len(), 3);
     assert_eq!(events[0], accepted(2, &request));
@@ -411,7 +421,7 @@ fn ioc_limit_without_liquidity_is_accepted_then_canceled() {
     let mut engine = MatchingEngine::new(EngineConfig::default());
 
     let request = ioc_limit(Side::Bid, 100, 5, 1);
-    let events = engine.decide(&submit(BTC, request)).unwrap();
+    let events = engine.decide(&submit(BTC, request));
 
     assert_eq!(
         events,
@@ -442,7 +452,7 @@ fn ioc_limit_partial_fill_discards_only_the_residual() {
     rest(&mut engine, BTC, limit(Side::Ask, 100, 2, 1));
 
     let request = ioc_limit(Side::Bid, 100, 5, 2);
-    let events = engine.decide(&submit(BTC, request)).unwrap();
+    let events = engine.decide(&submit(BTC, request));
 
     assert_eq!(events.len(), 3);
     assert_eq!(events[0], accepted(2, &request));
@@ -481,9 +491,7 @@ fn trade_executed_reduces_the_maker_and_increases_the_taker_ledger() {
     let mut engine = MatchingEngine::new(EngineConfig::default());
     rest(&mut engine, BTC, limit(Side::Ask, 100, 5, 1));
 
-    let events = engine
-        .decide(&submit(BTC, limit(Side::Bid, 100, 3, 2)))
-        .unwrap();
+    let events = engine.decide(&submit(BTC, limit(Side::Bid, 100, 3, 2)));
 
     // Apply OrderAccepted only: the ledger exists, the trade has not applied.
     engine.apply(&events[0], 3);
@@ -517,9 +525,7 @@ fn trade_tape_and_last_price_match_the_trade_executed_events() {
     rest(&mut engine, BTC, limit(Side::Ask, 100, 2, 1));
     rest(&mut engine, BTC, limit(Side::Ask, 101, 3, 2));
 
-    let events = engine
-        .decide(&submit(BTC, limit(Side::Bid, 101, 4, 3)))
-        .unwrap();
+    let events = engine.decide(&submit(BTC, limit(Side::Bid, 101, 4, 3)));
     apply_all(&mut engine, &events);
 
     let traded: Vec<Trade> = events
@@ -554,7 +560,7 @@ fn user_cancel_of_an_open_order_emits_order_canceled_for_the_resting_quantity() 
     let mut engine = MatchingEngine::new(EngineConfig::default());
     rest(&mut engine, BTC, limit(Side::Ask, 100, 5, 1));
 
-    let events = engine.decide(&cancel(BTC, 1)).unwrap();
+    let events = engine.decide(&cancel(BTC, 1));
 
     assert_eq!(
         events,
@@ -581,7 +587,7 @@ fn user_cancel_after_a_partial_fill_carries_the_book_remainder() {
     rest(&mut engine, BTC, limit(Side::Ask, 100, 5, 1));
     run(&mut engine, &submit(BTC, limit(Side::Bid, 100, 2, 2)));
 
-    let events = engine.decide(&cancel(BTC, 1)).unwrap();
+    let events = engine.decide(&cancel(BTC, 1));
 
     assert_eq!(
         events,
@@ -602,11 +608,12 @@ fn user_cancel_after_a_partial_fill_carries_the_book_remainder() {
 }
 
 #[test]
-fn unknown_cancel_is_rejected_without_appending_anything() {
+fn unknown_cancel_is_journaled_as_one_order_rejected() {
     let engine = MatchingEngine::new(EngineConfig::default());
+    let command = cancel(BTC, 42);
     assert_eq!(
-        engine.decide(&cancel(BTC, 42)).unwrap_err(),
-        EngineError::UnknownOrder
+        engine.decide(&command),
+        vec![rejected(&command, EngineError::UnknownOrder)]
     );
 
     let log = InMemoryEventLog::new();
@@ -616,16 +623,14 @@ fn unknown_cancel_is_rejected_without_appending_anything() {
         Box::new(InMemoryEventSnapshotStore::new()),
     )
     .expect("fresh event log");
-    let error = durable
-        .execute(cancel(BTC, 42))
-        .expect_err("unknown cancel must not be appended");
-    assert_eq!(
-        error,
-        DurableError::DecisionRejected(EngineError::UnknownOrder)
-    );
+    let events = durable
+        .execute(command.clone())
+        .expect("a business rejection is an event-producing execute");
+    assert_eq!(events, vec![rejected(&command, EngineError::UnknownOrder)]);
     assert!(!durable.is_failed());
-    assert_eq!(durable.applied_seq(), 0);
-    assert!(durable.history_from(1).unwrap().is_empty());
+    assert_eq!(durable.applied_seq(), 1);
+    assert_eq!(durable.history_from(1).unwrap().len(), 1);
+    assert_eq!(durable.engine().order_count(), 0);
 }
 
 #[test]
@@ -633,11 +638,18 @@ fn cancel_is_scoped_to_the_symbol() {
     let mut engine = MatchingEngine::new(EngineConfig::default());
     rest(&mut engine, BTC, limit(Side::Ask, 100, 5, 1));
 
+    let wrong_symbol = cancel(ETH, 1);
     assert_eq!(
-        engine.decide(&cancel(ETH, 1)).unwrap_err(),
-        EngineError::UnknownOrder
+        engine.decide(&wrong_symbol),
+        vec![rejected(&wrong_symbol, EngineError::UnknownOrder)]
     );
-    assert!(engine.decide(&cancel(BTC, 1)).is_ok());
+    assert!(matches!(
+        engine.decide(&cancel(BTC, 1)).as_slice(),
+        [DomainEvent::OrderCanceled {
+            reason: OrderCancelReason::UserCancel,
+            ..
+        }]
+    ));
 }
 
 // --------------------------------------------------------------------------
@@ -652,8 +664,8 @@ fn decide_is_pure_for_a_crossing_submit() {
     let sequence_before = engine.last_sequence();
 
     let command = submit(BTC, limit(Side::Bid, 100, 3, 2));
-    let first = engine.decide(&command).unwrap();
-    let second = engine.decide(&command).unwrap();
+    let first = engine.decide(&command);
+    let second = engine.decide(&command);
 
     assert_eq!(first, second, "decide allocates ids deterministically");
     assert_eq!(engine.capture_snapshot(), before, "decide mutates nothing");
@@ -683,7 +695,7 @@ fn every_prefix_is_a_valid_engine_state_and_replay_equals_live_execution() {
     let mut live = MatchingEngine::new(EngineConfig::default());
     let mut commands_events = Vec::new();
     for command in &commands {
-        let events = live.decide(command).expect("scenario is supported");
+        let events = live.decide(command);
         for event in &events {
             let sequence = live.last_applied_sequence() + 1;
             live.apply(event, sequence);
@@ -831,9 +843,7 @@ fn a_command_that_would_trigger_a_pending_stop_emits_the_trigger() {
     // Rest a bid that the next ask can trade against at 106.
     let _ = engine.execute(submit(BTC, limit(Side::Bid, 106, 1, 4)));
 
-    let events = engine
-        .decide(&submit(BTC, limit(Side::Ask, 106, 1, 5)))
-        .expect("a triggering submit is supported by ticket 03");
+    let events = engine.decide(&submit(BTC, limit(Side::Ask, 106, 1, 5)));
     assert!(
         events
             .iter()
@@ -868,9 +878,7 @@ fn a_command_that_does_not_trigger_a_pending_stop_is_still_decided() {
     });
     let _ = engine.execute(submit(BTC, limit(Side::Bid, 104, 1, 4)));
 
-    let events = engine
-        .decide(&submit(BTC, limit(Side::Ask, 104, 1, 5)))
-        .expect("the pending stop stays dormant");
+    let events = engine.decide(&submit(BTC, limit(Side::Ask, 104, 1, 5)));
     assert!(matches!(events[0], DomainEvent::OrderAccepted { .. }));
     assert!(matches!(events[1], DomainEvent::TradeExecuted { .. }));
 }
@@ -890,7 +898,7 @@ fn pending_stop_cancel_emits_stop_canceled() {
     });
 
     assert_eq!(
-        engine.decide(&cancel(BTC, 1)).unwrap(),
+        engine.decide(&cancel(BTC, 1)),
         vec![DomainEvent::StopCanceled {
             symbol: BTC.to_string(),
             order_id: 1,

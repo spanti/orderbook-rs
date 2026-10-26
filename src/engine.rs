@@ -78,10 +78,11 @@ impl Default for MatchingEngine {
 
 /// Read-only decision state for the event-sourced path.
 ///
-/// The tracer only decides non-crossing limit submits, so it needs nothing more
-/// than a borrow of the engine plus the touched symbol and the next order id.
-/// It deliberately does **not** clone the engine or any book: the scratch is a
-/// small stack value, which keeps `decide` off the whole-engine-clone path.
+/// A scratch borrows the engine plus the touched symbol and the next order id.
+/// Matching runs on clones of **only** that symbol's book and stop book; the
+/// ledger, trades, last price and counters are read-only. It deliberately does
+/// **not** clone the whole engine, keeping `decide` off the whole-engine-clone
+/// path.
 pub struct DecisionScratch<'a> {
     engine: &'a MatchingEngine,
     symbol: &'a str,
@@ -239,6 +240,58 @@ impl<'a> DecisionScratch<'a> {
         }
     }
 
+    /// Push `OrderAccepted`, the matching `TradeExecuted` events, and the
+    /// trailing rest/residual event for one taker order.
+    ///
+    /// Returns the last fill's `(price, timestamp)`, or `None` when nothing
+    /// filled. The caller supplies the scratch book so modify can reuse the
+    /// same routine after removing the old order.
+    #[allow(clippy::too_many_arguments)]
+    fn push_taker_match(
+        symbol: &str,
+        order: Order,
+        post_only: bool,
+        timestamp: u64,
+        book: &mut OrderBook,
+        next_trade_id: &mut u64,
+        events: &mut Vec<DomainEvent>,
+    ) -> Option<(u64, u64)> {
+        events.push(DomainEvent::OrderAccepted {
+            symbol: symbol.to_string(),
+            order: order.clone(),
+            post_only,
+        });
+
+        let SubmitResult {
+            remaining_quantity,
+            fills,
+            rested,
+        } = book.submit(order.clone());
+
+        let last_trade = Self::push_fills(symbol, timestamp, fills, next_trade_id, events);
+
+        if remaining_quantity > 0 {
+            if rested {
+                events.push(DomainEvent::OrderRested {
+                    symbol: symbol.to_string(),
+                    order: Order {
+                        quantity: remaining_quantity,
+                        ..order
+                    },
+                });
+            } else {
+                events.push(DomainEvent::OrderCanceled {
+                    symbol: symbol.to_string(),
+                    order_id: order.id,
+                    canceled_quantity: remaining_quantity,
+                    reason: OrderCancelReason::UnfilledResidual,
+                });
+            }
+        }
+
+        last_trade
+    }
+
     /// Decide a fresh submit: policy, matching, then fill/rest/cancel events.
     ///
     /// Matching runs against a clone of **only** the touched symbol's book and
@@ -251,53 +304,117 @@ impl<'a> DecisionScratch<'a> {
         // post-only crossing, then FOK liquidity.
         self.engine.check_taker_policy(self.symbol, request)?;
 
-        let order_id = self.order_id;
-        let accepted = request.to_order(order_id);
+        let accepted = request.to_order(self.order_id);
         let symbol = self.symbol.to_string();
 
         // The book this decision runs against: a private copy. `submit` both
         // matches and decides whether the remainder rests.
         let mut scratch_book = self.scratch_book();
-        let SubmitResult {
-            remaining_quantity,
-            fills,
-            rested,
-        } = scratch_book.submit(accepted.clone());
-
-        let mut events = Vec::with_capacity(1 + fills.len() + 1);
-        events.push(DomainEvent::OrderAccepted {
-            symbol: symbol.clone(),
-            order: accepted.clone(),
-            post_only: request.post_only,
-        });
+        let mut events = Vec::new();
 
         // Trade ids are allocated locally; `apply(TradeExecuted)` advances the
         // real counter from the events.
         let mut next_trade_id = self.engine.next_trade_id;
-        let command_last_trade =
-            Self::push_fills(&symbol, request.timestamp, fills, &mut next_trade_id, &mut events);
-
-        if remaining_quantity > 0 {
-            if rested {
-                events.push(DomainEvent::OrderRested {
-                    symbol: symbol.clone(),
-                    order: Order {
-                        quantity: remaining_quantity,
-                        ..accepted
-                    },
-                });
-            } else {
-                events.push(DomainEvent::OrderCanceled {
-                    symbol: symbol.clone(),
-                    order_id,
-                    canceled_quantity: remaining_quantity,
-                    reason: OrderCancelReason::UnfilledResidual,
-                });
-            }
-        }
+        let command_last_trade = Self::push_taker_match(
+            &symbol,
+            accepted,
+            request.post_only,
+            request.timestamp,
+            &mut scratch_book,
+            &mut next_trade_id,
+            &mut events,
+        );
 
         // A trade can reach a pending stop's trigger price. Run the cascade on
         // the same scratch book/stop book so the decision is self-contained.
+        let last_trade = command_last_trade.or_else(|| self.last_trade());
+        let mut scratch_stops = self.scratch_stops();
+        self.run_stop_cascade(
+            &mut scratch_book,
+            &mut scratch_stops,
+            &symbol,
+            last_trade,
+            &mut next_trade_id,
+            &mut events,
+        );
+
+        Ok(events)
+    }
+
+    /// Decide a modify: cancel the old id, accept and match a replacement.
+    ///
+    /// Semantics match the command-sourced path exactly: validation runs
+    /// first, a pending stop is not modifiable, and an unknown or closed order
+    /// is rejected. The replacement is a limit/GTC order on the old side with
+    /// the requested price, quantity and timestamp. It always gets a new id
+    /// and runs against the same scratch book, so the old priority is lost and
+    /// the new order matches as a taker. The stop cascade follows the
+    /// replacement's match result.
+    pub fn decide_modify(
+        &self,
+        order_id: OrderBookId,
+        request: &ModifyRequest,
+    ) -> Result<Vec<DomainEvent>, EngineError> {
+        // 1. The replacement must be a valid limit order, checked before any
+        //    order lookup so validation errors win over unknown/closed ids.
+        self.engine.validate_limit(request.price, request.quantity)?;
+
+        // 2. A pending stop cannot be modified; an unknown, wrong-symbol or
+        //    closed order is unknown.
+        let Some(record) = self.engine.ledger.get(order_id) else {
+            return Err(EngineError::UnknownOrder);
+        };
+        if record.symbol != self.symbol {
+            return Err(EngineError::UnknownOrder);
+        }
+        if record.status == OrderStatus::PendingTrigger {
+            return Err(EngineError::StopOrderNotModifiable);
+        }
+        if !record.is_open() {
+            return Err(EngineError::UnknownOrder);
+        }
+
+        // 3. Cancel the old order on the scratch book. The ledger is not
+        //    mutated here: `apply(OrderCanceled)` does that.
+        let mut scratch_book = self.scratch_book();
+        let Some(old_order) = scratch_book.cancel_limit_order(order_id) else {
+            return Err(EngineError::UnknownOrder);
+        };
+
+        let symbol = self.symbol.to_string();
+        let mut events = Vec::new();
+        events.push(DomainEvent::OrderCanceled {
+            symbol: symbol.clone(),
+            order_id,
+            canceled_quantity: old_order.quantity,
+            reason: OrderCancelReason::Modified,
+        });
+
+        // 4. The replacement keeps the old side and uses the requested
+        //    price/quantity/timestamp. It is a plain limit/GTC order.
+        let replacement = OrderRequest {
+            side: old_order.side,
+            price: request.price,
+            quantity: request.quantity,
+            timestamp: request.timestamp,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            post_only: false,
+        }
+        .to_order(self.order_id);
+
+        let mut next_trade_id = self.engine.next_trade_id;
+        let command_last_trade = Self::push_taker_match(
+            &symbol,
+            replacement,
+            false,
+            request.timestamp,
+            &mut scratch_book,
+            &mut next_trade_id,
+            &mut events,
+        );
+
+        // 5. The replacement's trades can trigger pending stops.
         let last_trade = command_last_trade.or_else(|| self.last_trade());
         let mut scratch_stops = self.scratch_stops();
         self.run_stop_cascade(
@@ -339,7 +456,8 @@ impl<'a> DecisionScratch<'a> {
     ///
     /// An open, resting order emits `OrderCanceled{UserCancel}`; a pending stop
     /// emits `StopCanceled`. Unknown, already-closed and wrong-symbol orders
-    /// fail with [`EngineError::UnknownOrder`]. Modify belongs to ticket 04.
+    /// fail with [`EngineError::UnknownOrder`], which `decide` turns into an
+    /// `OrderRejected` event.
     pub fn decide_cancel(&self, order_id: OrderBookId) -> Result<Vec<DomainEvent>, EngineError> {
         let record = self
             .engine
@@ -584,12 +702,12 @@ impl MatchingEngine {
     /// Pure decision step of the event-sourced path: command in, events out.
     ///
     /// Reads engine state and allocates order/trade ids in local variables
-    /// only; it never mutates the engine. It supports normal submits (limit,
-    /// market, IOC, FOK) with their stop-trigger cascade, stop submissions,
-    /// and cancels of open orders or pending stops. Modify is rejected
-    /// explicitly until ticket 04.
-    pub fn decide(&self, command: &EngineCommand) -> Result<Vec<DomainEvent>, EngineError> {
-        match command {
+    /// only; it never mutates the engine. Every command produces at least one
+    /// event: business rejections produce exactly one
+    /// [`DomainEvent::OrderRejected`] carrying the full command, never an
+    /// `Err`. Internal invariant violations still panic.
+    pub fn decide(&self, command: &EngineCommand) -> Vec<DomainEvent> {
+        let decision = match command {
             EngineCommand::SubmitOrder { symbol, request } => {
                 DecisionScratch::new(self, symbol).decide_submit(request)
             }
@@ -599,7 +717,31 @@ impl MatchingEngine {
             EngineCommand::CancelOrder { symbol, order_id } => {
                 DecisionScratch::new(self, symbol).decide_cancel(*order_id)
             }
-            EngineCommand::ModifyOrder { .. } => Err(EngineError::UnsupportedCommand),
+            EngineCommand::ModifyOrder {
+                symbol,
+                order_id,
+                request,
+            } => DecisionScratch::new(self, symbol).decide_modify(*order_id, request),
+        };
+
+        match decision {
+            Ok(events) => events,
+            Err(reason) => vec![Self::rejected_event(command, reason)],
+        }
+    }
+
+    /// Build the audit event for a business rejection.
+    fn rejected_event(command: &EngineCommand, reason: EngineError) -> DomainEvent {
+        let symbol = match command {
+            EngineCommand::SubmitOrder { symbol, .. }
+            | EngineCommand::SubmitStopOrder { symbol, .. }
+            | EngineCommand::CancelOrder { symbol, .. }
+            | EngineCommand::ModifyOrder { symbol, .. } => symbol,
+        };
+        DomainEvent::OrderRejected {
+            symbol: symbol.clone(),
+            reason,
+            command: command.clone(),
         }
     }
 
@@ -696,6 +838,10 @@ impl MatchingEngine {
                 self.ledger
                     .mark_canceled(*order_id, canceled_quantity)
                     .expect("canceled stop has no ledger record");
+            }
+            DomainEvent::OrderRejected { .. } => {
+                // Audit-only: the only event with no state effect. Replay and
+                // live execution both fold it into nothing.
             }
         }
 
