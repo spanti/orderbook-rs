@@ -364,7 +364,7 @@ impl BenchReport {
             write_slo_row(&mut out, "submit -> durable", runtime.slo.durable);
             writeln!(
                 out,
-                "note: SLO setup requires a Linux release build, --idle spin, a pinned matching core, and FileCommandLog on NVMe for the durable level; queue_full must be 0 for a PASS"
+                "note: SLO setup requires a Linux release build, --idle spin, a pinned matching core, and FileEventLog on NVMe for the durable level; queue_full must be 0 for a PASS"
             )
             .expect("writing to a String cannot fail");
             if self.config.log == LogKind::Memory {

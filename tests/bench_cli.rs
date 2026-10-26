@@ -119,7 +119,7 @@ fn runtime_path_supports_in_flight_and_file_log() {
     assert!(output.status.success(), "stderr: {stderr_text}");
     assert!(text.contains("log=file"));
     assert!(text.contains("in_flight=4"));
-    assert!(dir.join("commands.log").exists());
+    assert!(dir.join("events.log").exists());
     assert!(dir.join("snapshots").exists());
 
     let _ = std::fs::remove_dir_all(&dir);

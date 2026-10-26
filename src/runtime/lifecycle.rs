@@ -17,7 +17,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::durable::{
-    CommandCursor, CommandLog, DurableError, FORMAT_VERSION, LogHeader, SnapshotStore, recover,
+    DurableError, EVENT_FORMAT_VERSION, EventCursor, EventLog, EventSnapshotStore, LogHeader,
+    recover_event,
 };
 use crate::engine::MatchingEngine;
 use crate::types::{EngineCommand, EngineConfig};
@@ -112,11 +113,11 @@ impl EngineRuntime {
     pub fn create(
         config: RuntimeConfig,
         engine_config: EngineConfig,
-        mut log: Box<dyn CommandLog>,
-        snapshots: Box<dyn SnapshotStore>,
+        mut log: Box<dyn EventLog>,
+        snapshots: Box<dyn EventSnapshotStore>,
     ) -> Result<(EngineHandle, Self), RuntimeError> {
         log.write_header(LogHeader {
-            format_version: FORMAT_VERSION,
+            format_version: EVENT_FORMAT_VERSION,
             config: engine_config,
         })
         .map_err(|error| RuntimeError::Startup(error.to_string()))?;
@@ -126,36 +127,33 @@ impl EngineRuntime {
             MatchingEngine::new(engine_config),
             log,
             snapshots,
-            CommandCursor::fresh(),
+            EventCursor::fresh(),
         )
     }
 
     /// Recover from an existing log and snapshot store.
     ///
-    /// Uses the same recovery helper as the synchronous
-    /// [`crate::durable::DurableMatchingEngine`], so both write paths apply the
-    /// header, version, config, gap, snapshot-ahead, and contiguity checks.
-    /// Replayed events are cleared because the runtime never retains derived
-    /// output history.
+    /// Uses the same borrowed recovery helper as the synchronous
+    /// [`crate::durable::EventSourcedEngine`], so both write paths apply the
+    /// header, version, config, gap, snapshot-ahead, and contiguity checks, and
+    /// continue the event sequence and `command_id` from the recovered cursor.
     pub fn open(
         config: RuntimeConfig,
-        log: Box<dyn CommandLog>,
-        snapshots: Box<dyn SnapshotStore>,
+        log: Box<dyn EventLog>,
+        snapshots: Box<dyn EventSnapshotStore>,
     ) -> Result<(EngineHandle, Self), RuntimeError> {
-        let recovered = recover(log.as_ref(), snapshots.as_ref())
+        let (engine, cursor) = recover_event(log.as_ref(), snapshots.as_ref())
             .map_err(|error| RuntimeError::Startup(error.to_string()))?;
-        let mut engine = recovered.engine;
-        engine.clear_events();
 
-        Self::start(config, engine, log, snapshots, recovered.cursor)
+        Self::start(config, engine, log, snapshots, cursor)
     }
 
     fn start(
         config: RuntimeConfig,
         engine: MatchingEngine,
-        log: Box<dyn CommandLog>,
-        snapshots: Box<dyn SnapshotStore>,
-        cursor: CommandCursor,
+        log: Box<dyn EventLog>,
+        snapshots: Box<dyn EventSnapshotStore>,
+        cursor: EventCursor,
     ) -> Result<(EngineHandle, Self), RuntimeError> {
         Self::start_with_gate(
             config,
@@ -175,9 +173,9 @@ impl EngineRuntime {
     fn start_with_gate<G, F>(
         config: RuntimeConfig,
         engine: MatchingEngine,
-        log: Box<dyn CommandLog>,
-        snapshots: Box<dyn SnapshotStore>,
-        cursor: CommandCursor,
+        log: Box<dyn EventLog>,
+        snapshots: Box<dyn EventSnapshotStore>,
+        cursor: EventCursor,
         make_gate: F,
     ) -> Result<(EngineHandle, Self), RuntimeError>
     where
@@ -189,6 +187,7 @@ impl EngineRuntime {
             Arc::new(AtomicU64::new(cursor.durable_seq)),
         );
         shared.publish_applied(cursor.applied_seq);
+        shared.publish_applied_command_id(cursor.next_command_id.saturating_sub(1));
 
         let (ingress_sender, ingress_receiver) = mpsc::sync_channel(config.queue_capacity.max(1));
         let pool = SlotPool::from_config(&config);
@@ -338,7 +337,12 @@ impl EngineRuntime {
             let durable_seq = self.shared.durable_seq();
             if applied_seq == durable_seq {
                 if let Some(sink) = self.snapshot_sink.as_ref()
-                    && let Err(error) = sink.capture_final(engine, applied_seq, durable_seq)
+                    && let Err(error) = sink.capture_final(
+                        engine,
+                        applied_seq,
+                        durable_seq,
+                        self.shared.applied_command_id(),
+                    )
                 {
                     failure = Some(RuntimeError::SnapshotFailed(error));
                 }
@@ -406,13 +410,13 @@ impl Drop for EngineRuntime {
 pub fn start_with_matching_panic_for_test(
     config: RuntimeConfig,
     engine_config: EngineConfig,
-    mut log: Box<dyn CommandLog>,
-    snapshots: Box<dyn SnapshotStore>,
+    mut log: Box<dyn EventLog>,
+    snapshots: Box<dyn EventSnapshotStore>,
     start: Arc<Barrier>,
     panic_after: u64,
 ) -> Result<(EngineHandle, EngineRuntime), RuntimeError> {
     log.write_header(LogHeader {
-        format_version: FORMAT_VERSION,
+        format_version: EVENT_FORMAT_VERSION,
         config: engine_config,
     })
     .map_err(|error| RuntimeError::Startup(error.to_string()))?;
@@ -422,7 +426,7 @@ pub fn start_with_matching_panic_for_test(
         MatchingEngine::new(engine_config),
         log,
         snapshots,
-        CommandCursor::fresh(),
+        EventCursor::fresh(),
         move |_cadence, _sink| PanicAfterBarrierGate {
             start,
             started: false,
@@ -445,6 +449,7 @@ impl SnapshotGate for PanicAfterBarrierGate {
         _engine: &MatchingEngine,
         applied_seq: u64,
         _durable_seq: u64,
+        _last_command_id: u64,
     ) -> GateDecision {
         if !self.started {
             self.start.wait();
@@ -490,7 +495,7 @@ fn bind_matching_core(index: Option<usize>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::durable::InMemorySnapshotStore;
+    use crate::durable::InMemoryEventSnapshotStore;
     use crate::runtime::snapshot_gate::GateDecision;
     use crate::types::{OrderRequest, OrderType, Side, TimeInForce};
     use std::time::Duration;
@@ -509,6 +514,7 @@ mod tests {
             _engine: &MatchingEngine,
             applied_seq: u64,
             _durable_seq: u64,
+            _last_command_id: u64,
         ) -> GateDecision {
             if applied_seq >= self.panic_after {
                 panic!("matching gate panic");
@@ -545,9 +551,9 @@ mod tests {
         let (handle, runtime) = EngineRuntime::start_with_gate(
             config,
             MatchingEngine::new(EngineConfig::default()),
-            Box::new(crate::durable::InMemoryCommandLog::new()),
-            Box::new(InMemorySnapshotStore::new()),
-            CommandCursor::fresh(),
+            Box::new(crate::durable::InMemoryEventLog::new()),
+            Box::new(InMemoryEventSnapshotStore::new()),
+            EventCursor::fresh(),
             |_cadence, _sink| PanickingGate { panic_after: 1 },
         )
         .expect("start with the test gate");
@@ -557,8 +563,8 @@ mod tests {
             ticket
                 .wait_applied_timeout(WAIT)
                 .expect("the command was applied before the panic")
-                .command_sequence,
-            1
+                .last_event_sequence,
+            2
         );
         assert_eq!(
             ticket.wait_durable_timeout(WAIT),

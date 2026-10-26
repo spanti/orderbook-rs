@@ -24,6 +24,7 @@ pub mod file_snapshot;
 pub mod memory;
 mod snapshot_files;
 
+pub(crate) use event_log::recover_event;
 pub use event_log::{EVENT_FORMAT_VERSION, EventCursor, EventLog, EventRecord, EventSourcedEngine};
 pub use event_snapshot::{EventSnapshot, EventSnapshotStore};
 pub use file_event_log::FileEventLog;
@@ -266,11 +267,6 @@ impl CommandCursor {
             durable_seq,
             next_command_sequence,
         }
-    }
-
-    /// The cursor for an empty engine whose log has just been created.
-    pub(crate) fn fresh() -> Self {
-        Self::new(0, 0, 1)
     }
 }
 

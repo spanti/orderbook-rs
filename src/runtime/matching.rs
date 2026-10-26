@@ -1,19 +1,21 @@
-//! The matching thread: an apply-first command pipeline.
+//! The matching thread: an apply-first event pipeline.
 //!
 //! The thread owns [`MatchingEngine`] state, takes one command at a time from
-//! the ingress command queue, publishes an applied receipt, then hands the
-//! command record to the journal as a batch. Durable receipts are completed
+//! the ingress command queue, decides its events, assigns a contiguous event
+//! sequence range and one `command_id`, applies every event, publishes an
+//! applied receipt carrying the events and range, then hands the
+//! [`EventRecord`]s to the journal as a batch. Durable receipts are completed
 //! from the shared durability watermark, never from a guess about the log.
 //!
 //! This module deliberately does not start threads or implement the public
 //! `EngineRuntime` lifecycle: [`MatchingThread::run`] is the loop, and the
-//! journal and snapshot sides are narrow seams for the later tickets.
+//! journal and snapshot sides are narrow seams.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use crate::durable::{CommandCursor, CommandRecord, DurableError, FORMAT_VERSION};
+use crate::durable::{DurableError, EVENT_FORMAT_VERSION, EventCursor, EventRecord};
 use crate::engine::MatchingEngine;
 
 use super::RuntimeConfig;
@@ -35,7 +37,7 @@ pub(crate) trait JournalSink: Send + 'static {
     ///
     /// `Err(batch)` means the batch was not accepted (for example because the
     /// journal batch channel is full); the caller keeps ownership and retries.
-    fn try_send_batch(&mut self, batch: Vec<CommandRecord>) -> Result<(), Vec<CommandRecord>>;
+    fn try_send_batch(&mut self, batch: Vec<EventRecord>) -> Result<(), Vec<EventRecord>>;
 
     /// Whether the journal is gone. A disconnected journal fail-stops.
     fn is_disconnected(&self) -> bool;
@@ -51,7 +53,7 @@ pub(crate) struct NoopJournalSink;
 
 #[cfg(test)]
 impl JournalSink for NoopJournalSink {
-    fn try_send_batch(&mut self, _batch: Vec<CommandRecord>) -> Result<(), Vec<CommandRecord>> {
+    fn try_send_batch(&mut self, _batch: Vec<EventRecord>) -> Result<(), Vec<EventRecord>> {
         Ok(())
     }
 
@@ -65,7 +67,8 @@ impl JournalSink for NoopJournalSink {
 }
 
 struct PendingDurable {
-    sequence: u64,
+    /// Last event sequence of the command. The watermark must reach it.
+    last_event_sequence: u64,
     enqueued_at: Option<Instant>,
     slot: SlotHandle,
 }
@@ -84,9 +87,10 @@ pub(crate) struct MatchingThread<J, G> {
     apply_batch_max: usize,
     journal_flush_interval: Duration,
 
-    next_command_sequence: u64,
+    next_sequence: u64,
+    next_command_id: u64,
     applied_seq: u64,
-    journal_buffer: Vec<CommandRecord>,
+    journal_buffer: Vec<EventRecord>,
     buffer_started_at: Option<Instant>,
     pending_durable: VecDeque<PendingDurable>,
     ingress_empty: bool,
@@ -100,7 +104,7 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
         snapshot_gate: G,
         shared: SharedState,
         config: RuntimeConfig,
-        cursor: CommandCursor,
+        cursor: EventCursor,
     ) -> Self {
         Self {
             engine,
@@ -111,7 +115,8 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
             idle: Idle::new(config.idle),
             apply_batch_max: config.apply_batch_max.max(1),
             journal_flush_interval: config.journal_flush_interval,
-            next_command_sequence: cursor.next_command_sequence,
+            next_sequence: cursor.next_sequence,
+            next_command_id: cursor.next_command_id,
             applied_seq: cursor.applied_seq,
             journal_buffer: Vec::with_capacity(config.apply_batch_max),
             buffer_started_at: None,
@@ -233,7 +238,7 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
     fn drain_durable(&mut self) {
         let durable_seq = self.shared.durable_seq();
         while let Some(front) = self.pending_durable.front() {
-            if front.sequence > durable_seq {
+            if front.last_event_sequence > durable_seq {
                 break;
             }
             let pending = self
@@ -287,8 +292,12 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
     }
 
     fn gate_decision(&mut self) -> GateDecision {
-        self.snapshot_gate
-            .poll(&self.engine, self.applied_seq, self.shared.durable_seq())
+        self.snapshot_gate.poll(
+            &self.engine,
+            self.applied_seq,
+            self.shared.durable_seq(),
+            self.next_command_id.saturating_sub(1),
+        )
     }
 
     fn note_dequeue(&mut self) {
@@ -316,16 +325,51 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
         }
 
         let apply_started = metrics.as_ref().map(|_| Instant::now());
-        let outcome = self.engine.execute_ref(&command);
+        let events = self.engine.decide(&command);
 
-        let sequence = self.next_command_sequence;
-        self.next_command_sequence = sequence.saturating_add(1);
-        self.applied_seq = sequence;
-        self.shared.publish_applied(sequence);
+        // `decide` always emits at least one event (a rejection is an event).
+        // Keep the empty branch defensive: no event means nothing to journal.
+        if events.is_empty() {
+            slot.set_applied(Ok(CommandReceipt {
+                events,
+                first_event_sequence: self.applied_seq,
+                last_event_sequence: self.applied_seq,
+            }));
+            slot.set_durable(Ok(()));
+            return;
+        }
+
+        let command_id = self.next_command_id;
+        let first_event_sequence = self.next_sequence;
+        let records: Vec<EventRecord> = events
+            .iter()
+            .enumerate()
+            .map(|(offset, event)| EventRecord {
+                format_version: EVENT_FORMAT_VERSION,
+                sequence: first_event_sequence.saturating_add(offset as u64),
+                command_id,
+                event: event.clone(),
+            })
+            .collect();
+        let last_event_sequence = records
+            .last()
+            .map(|record| record.sequence)
+            .expect("a non-empty event list produced no records");
+
+        for record in &records {
+            self.engine.apply(&record.event, record.sequence);
+        }
+
+        self.next_sequence = last_event_sequence.saturating_add(1);
+        self.next_command_id = command_id.saturating_add(1);
+        self.applied_seq = last_event_sequence;
+        self.shared.publish_applied(last_event_sequence);
+        self.shared.publish_applied_command_id(command_id);
 
         slot.set_applied(Ok(CommandReceipt {
-            outcome,
-            command_sequence: sequence,
+            events,
+            first_event_sequence,
+            last_event_sequence,
         }));
 
         if let (Some(metrics), Some(apply_started)) = (metrics.as_ref(), apply_started) {
@@ -336,19 +380,12 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
         if self.journal_buffer.is_empty() {
             self.buffer_started_at = Some(Instant::now());
         }
-        self.journal_buffer.push(CommandRecord {
-            format_version: FORMAT_VERSION,
-            sequence,
-            command,
-        });
+        self.journal_buffer.extend(records);
         self.pending_durable.push_back(PendingDurable {
-            sequence,
+            last_event_sequence,
             enqueued_at,
             slot,
         });
-
-        // Events are derived output; the runtime does not retain them.
-        self.engine.clear_events();
     }
 
     /// Reply with `error` at both receipt levels to every envelope still in the
@@ -407,8 +444,10 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
 mod tests {
     use super::*;
     use crate::durable::{
-        CommandCursor, DurableError, InMemorySnapshotStore, SnapshotStore, StoredSnapshot,
+        DurableError, EVENT_FORMAT_VERSION, EventCursor, EventRecord, EventSnapshot,
+        EventSnapshotStore, InMemoryEventSnapshotStore,
     };
+    use crate::event::DomainEvent;
     use crate::runtime::error::SubmitError;
     use crate::runtime::metrics::RuntimeMetrics;
     use crate::runtime::snapshot::{self, SnapshotSend};
@@ -417,8 +456,7 @@ mod tests {
     use crate::runtime::sync::lock;
     use crate::runtime::ticket::{SlotPool, Ticket};
     use crate::types::{
-        CommandOutcome, EngineCommand, EngineConfig, ModifyRequest, OrderRequest, OrderType, Side,
-        TimeInForce,
+        EngineCommand, EngineConfig, ModifyRequest, OrderRequest, OrderType, Side, TimeInForce,
     };
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc::sync_channel;
@@ -475,7 +513,7 @@ mod tests {
     /// durability watermark as a real journal thread would.
     #[derive(Clone, Default)]
     struct TestJournal {
-        batches: Arc<Mutex<Vec<Vec<CommandRecord>>>>,
+        batches: Arc<Mutex<Vec<Vec<EventRecord>>>>,
         watermark: Option<Arc<AtomicU64>>,
         watermark_paused: Arc<AtomicBool>,
         accepted_max: Arc<AtomicU64>,
@@ -522,11 +560,11 @@ mod tests {
             *lock(&self.failure) = Some(error);
         }
 
-        fn batches(&self) -> Vec<Vec<CommandRecord>> {
+        fn batches(&self) -> Vec<Vec<EventRecord>> {
             lock(&self.batches).clone()
         }
 
-        fn records(&self) -> Vec<CommandRecord> {
+        fn records(&self) -> Vec<EventRecord> {
             lock(&self.batches).iter().flatten().cloned().collect()
         }
 
@@ -536,7 +574,7 @@ mod tests {
     }
 
     impl JournalSink for TestJournal {
-        fn try_send_batch(&mut self, batch: Vec<CommandRecord>) -> Result<(), Vec<CommandRecord>> {
+        fn try_send_batch(&mut self, batch: Vec<EventRecord>) -> Result<(), Vec<EventRecord>> {
             if self.blocked.load(Ordering::Acquire) {
                 return Err(batch);
             }
@@ -592,7 +630,7 @@ mod tests {
         }
     }
 
-    /// An inspectable [`SnapshotStore`] that can block, fail, and compare each
+    /// An inspectable [`EventSnapshotStore`] that can block, fail, and compare each
     /// saved sequence with the live durability watermark.
     #[derive(Clone)]
     struct TestSnapshotStore {
@@ -649,8 +687,8 @@ mod tests {
         }
     }
 
-    impl SnapshotStore for TestSnapshotStore {
-        fn save(&mut self, snapshot: StoredSnapshot) -> Result<(), DurableError> {
+    impl EventSnapshotStore for TestSnapshotStore {
+        fn save(&mut self, snapshot: EventSnapshot) -> Result<(), DurableError> {
             self.calls.fetch_add(1, Ordering::AcqRel);
             if let Some(gate) = &self.gate {
                 gate.wait();
@@ -668,11 +706,11 @@ mod tests {
             Ok(())
         }
 
-        fn load_latest(&self) -> Result<Option<StoredSnapshot>, DurableError> {
+        fn load_latest(&self) -> Result<Option<EventSnapshot>, DurableError> {
             Ok(None)
         }
 
-        fn load_previous(&self) -> Result<Option<StoredSnapshot>, DurableError> {
+        fn load_previous(&self) -> Result<Option<EventSnapshot>, DurableError> {
             Ok(None)
         }
     }
@@ -689,6 +727,7 @@ mod tests {
             _engine: &MatchingEngine,
             applied_seq: u64,
             _durable_seq: u64,
+            _last_command_id: u64,
         ) -> GateDecision {
             if applied_seq >= self.pause_after && !self.released.load(Ordering::Acquire) {
                 GateDecision::Pause
@@ -733,7 +772,12 @@ mod tests {
             gate,
             shared.clone(),
             config,
-            CommandCursor::new(0, 0, 1),
+            EventCursor {
+                applied_seq: 0,
+                durable_seq: 0,
+                next_sequence: 1,
+                next_command_id: 1,
+            },
         );
         let handle = thread::spawn(move || matching.run());
         (submitter, tickets, shared, handle)
@@ -769,14 +813,14 @@ mod tests {
 
     #[test]
     fn cadence_zero_disables_automatic_snapshots() {
-        let store = InMemorySnapshotStore::new();
+        let store = InMemoryEventSnapshotStore::new();
         let (sink, worker) = snapshot::spawn(Box::new(store.handle()));
         let mut gate = CadenceSnapshotGate::new(0, sink);
         let engine = executed(5);
 
         for _ in 0..5 {
             assert_eq!(
-                gate.poll(&engine, 5, 5),
+                gate.poll(&engine, 5, 5, 5),
                 GateDecision::Continue,
                 "cadence zero never captures"
             );
@@ -791,12 +835,12 @@ mod tests {
 
     #[test]
     fn cadence_boundary_is_captured_exactly_once() {
-        let store = InMemorySnapshotStore::new();
+        let store = InMemoryEventSnapshotStore::new();
         let (sink, worker) = snapshot::spawn(Box::new(store.handle()));
         let mut gate = CadenceSnapshotGate::new(2, sink);
         let engine = executed(4);
 
-        assert_eq!(gate.poll(&engine, 2, 2), GateDecision::Continue);
+        assert_eq!(gate.poll(&engine, 2, 2, 1), GateDecision::Continue);
         wait_until(|| {
             store
                 .load_latest()
@@ -806,7 +850,7 @@ mod tests {
         assert_eq!(gate.last_snapshot_seq(), 2);
 
         for _ in 0..3 {
-            assert_eq!(gate.poll(&engine, 2, 2), GateDecision::Continue);
+            assert_eq!(gate.poll(&engine, 2, 2, 1), GateDecision::Continue);
         }
         assert_eq!(
             store.load_previous().unwrap(),
@@ -814,7 +858,7 @@ mod tests {
             "the same boundary is not captured again"
         );
 
-        assert_eq!(gate.poll(&engine, 4, 4), GateDecision::Continue);
+        assert_eq!(gate.poll(&engine, 4, 4, 2), GateDecision::Continue);
         wait_until(|| {
             store
                 .load_latest()
@@ -836,13 +880,13 @@ mod tests {
 
     #[test]
     fn gate_pauses_and_refuses_a_snapshot_ahead_of_durability() {
-        let store = InMemorySnapshotStore::new();
+        let store = InMemoryEventSnapshotStore::new();
         let (sink, worker) = snapshot::spawn(Box::new(store.handle()));
         let mut gate = CadenceSnapshotGate::new(2, sink);
         let engine = executed(4);
 
-        assert_eq!(gate.poll(&engine, 4, 0), GateDecision::Pause);
-        assert_eq!(gate.poll(&engine, 4, 3), GateDecision::Pause);
+        assert_eq!(gate.poll(&engine, 4, 0, 2), GateDecision::Pause);
+        assert_eq!(gate.poll(&engine, 4, 3, 2), GateDecision::Pause);
         thread::sleep(Duration::from_millis(20));
         assert!(
             store.load_latest().unwrap().is_none(),
@@ -850,7 +894,7 @@ mod tests {
         );
         assert_eq!(gate.last_snapshot_seq(), 0);
 
-        assert_eq!(gate.poll(&engine, 4, 4), GateDecision::Continue);
+        assert_eq!(gate.poll(&engine, 4, 4, 2), GateDecision::Continue);
         wait_until(|| {
             store
                 .load_latest()
@@ -894,11 +938,11 @@ mod tests {
         );
         drop(submitter);
 
-        wait_until(|| metrics.applied() == 2 && journal.record_count() == 2);
+        wait_until(|| metrics.applied() == 1 && journal.record_count() == 2);
         thread::sleep(Duration::from_millis(50));
         assert_eq!(
             metrics.applied(),
-            2,
+            1,
             "intake pauses at the cadence boundary while durability lags"
         );
         assert_eq!(journal.record_count(), 2);
@@ -914,7 +958,12 @@ mod tests {
                 .expect("applied after resume");
             ticket.wait_durable_timeout(WAIT).expect("durable");
         }
-        wait_until(|| store.saved() == vec![2, 4]);
+        wait_until(|| store.saved().contains(&4));
+        assert!(
+            store.saved().starts_with(&[2, 4]),
+            "the first two cadence boundaries are captured: {:?}",
+            store.saved()
+        );
 
         shared.close();
         handle.join().expect("matching thread");
@@ -1018,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn a_due_snapshot_retries_only_at_the_next_cadence_boundary() {
+    fn a_due_snapshot_retries_at_the_next_durability_boundary() {
         let engine = executed(4);
         let store_gate = StoreGate::default();
         let store = TestSnapshotStore::blocked(store_gate.clone());
@@ -1027,9 +1076,10 @@ mod tests {
         // Fill the single-slot worker channel while the worker is blocked in
         // its first save: one job is in the worker, one waits in the channel.
         let filler = sink.clone();
-        let filler_job = || StoredSnapshot {
-            format_version: FORMAT_VERSION,
+        let filler_job = || EventSnapshot {
+            format_version: EVENT_FORMAT_VERSION,
             applied_seq: 0,
+            last_command_id: 0,
             snapshot: engine.capture_snapshot(),
         };
         assert_eq!(filler.try_send(filler_job()), SnapshotSend::Sent);
@@ -1040,7 +1090,7 @@ mod tests {
         let mut gate = CadenceSnapshotGate::new(2, sink);
 
         // Boundary 2: the worker cannot take the snapshot, so it stays due.
-        assert_eq!(gate.poll(&engine, 2, 2), GateDecision::Continue);
+        assert_eq!(gate.poll(&engine, 2, 2, 1), GateDecision::Continue);
         assert_eq!(gate.last_snapshot_seq(), 0, "nothing was captured");
         assert_eq!(store.calls(), 1, "no save was attempted");
 
@@ -1048,22 +1098,17 @@ mod tests {
         store_gate.open();
         wait_until(|| store.calls() >= 2);
 
-        // Sequence 3 is a durability boundary but not a cadence boundary; a
-        // due snapshot must not be captured off-cadence even though the
-        // worker now has room.
-        assert_eq!(gate.poll(&engine, 3, 3), GateDecision::Continue);
-        assert_eq!(
-            gate.last_snapshot_seq(),
-            0,
-            "an off-cadence retry must not capture"
-        );
-        assert_eq!(store.calls(), 2, "no off-cadence save was attempted");
-        assert!(!store.saved().contains(&3));
+        // With the worker channel open again, the still-due snapshot is
+        // captured at the next boundary where durability has caught up.
+        assert_eq!(gate.poll(&engine, 3, 3, 1), GateDecision::Continue);
+        assert_eq!(gate.last_snapshot_seq(), 3);
+        wait_until(|| store.saved().contains(&3));
 
-        // The pending snapshot is captured at the next cadence boundary.
-        assert_eq!(gate.poll(&engine, 4, 4), GateDecision::Continue);
-        assert_eq!(gate.last_snapshot_seq(), 4);
-        wait_until(|| store.saved().contains(&4));
+        // Fewer than `cadence` events have been applied since that capture, so
+        // sequence 4 is not due.
+        assert_eq!(gate.poll(&engine, 4, 4, 2), GateDecision::Continue);
+        assert_eq!(gate.last_snapshot_seq(), 3);
+        assert!(!store.saved().contains(&4));
 
         drop(filler);
         drop(gate);
@@ -1132,7 +1177,7 @@ mod tests {
     #[test]
     fn final_snapshot_is_present_after_shutdown() {
         let journal = TestJournal::with_watermark();
-        let snapshots = InMemorySnapshotStore::new();
+        let snapshots = InMemoryEventSnapshotStore::new();
         let (sink, worker) = snapshot::spawn(Box::new(snapshots.handle()));
 
         let (submitter, tickets, shared, handle) = spawn_matching(
@@ -1156,14 +1201,21 @@ mod tests {
         shared.close();
         let engine = handle.join().expect("matching thread");
 
-        sink.capture_final(&engine, 3, 3)
+        // Each of the three submitted orders emits `OrderAccepted` and
+        // `OrderRested`, so the applied event boundary is 6.
+        sink.capture_final(&engine, 6, 6, 3)
             .expect("the final snapshot is saved");
         let stored = snapshots.load_latest().unwrap().expect("latest snapshot");
-        assert_eq!(stored.applied_seq, 3);
+        assert_eq!(stored.applied_seq, 6);
+        assert_eq!(stored.last_command_id, 3);
 
         let mut direct = MatchingEngine::new(EngineConfig::default());
+        let mut sequence = 1u64;
         for timestamp in 1..=3 {
-            let _ = direct.execute(simple_command(timestamp));
+            for event in direct.decide(&simple_command(timestamp)) {
+                direct.apply(&event, sequence);
+                sequence += 1;
+            }
         }
         assert_eq!(stored.snapshot, direct.capture_snapshot());
 
@@ -1351,8 +1403,9 @@ mod tests {
         let applied = tickets[0]
             .wait_applied_timeout(WAIT)
             .expect("applied receipt");
-        assert_eq!(applied.command_sequence, 1);
-        assert!(matches!(applied.outcome, CommandOutcome::Accepted(_)));
+        assert_eq!(applied.first_event_sequence, 1);
+        assert_eq!(applied.last_event_sequence, 2);
+        assert_eq!(applied.events.len(), 2, "accepted then rested");
 
         let durable = tickets[0]
             .wait_durable_timeout(WAIT)
@@ -1361,8 +1414,8 @@ mod tests {
 
         shared.close();
         let engine = handle.join().expect("matching thread");
-        assert!(engine.events().is_empty(), "the runtime clears events");
-        assert_eq!(journal.record_count(), 1);
+        assert!(engine.events().is_empty(), "the runtime retains no events");
+        assert_eq!(journal.record_count(), 2);
     }
 
     #[test]
@@ -1370,12 +1423,22 @@ mod tests {
         let commands = mixed_commands();
 
         let mut direct = MatchingEngine::new(EngineConfig::default());
+        let mut next_sequence = 1u64;
         let expected: Vec<CommandReceipt> = commands
             .iter()
-            .enumerate()
-            .map(|(index, command)| CommandReceipt {
-                outcome: direct.execute(command.clone()),
-                command_sequence: index as u64 + 1,
+            .map(|command| {
+                let events = direct.decide(command);
+                let first_event_sequence = next_sequence;
+                for (offset, event) in events.iter().enumerate() {
+                    direct.apply(event, first_event_sequence + offset as u64);
+                }
+                let last_event_sequence = first_event_sequence + events.len() as u64 - 1;
+                next_sequence = last_event_sequence + 1;
+                CommandReceipt {
+                    events,
+                    first_event_sequence,
+                    last_event_sequence,
+                }
             })
             .collect();
 
@@ -1422,17 +1485,39 @@ mod tests {
         );
         assert!(runtime_engine.events().is_empty());
 
+        let expected_events: Vec<DomainEvent> = expected
+            .iter()
+            .flat_map(|receipt| receipt.events.iter().cloned())
+            .collect();
         let logged = journal.records();
-        assert_eq!(logged.len(), commands.len());
-        for (index, (record, command)) in logged.iter().zip(&commands).enumerate() {
-            assert_eq!(record.format_version, FORMAT_VERSION);
+        assert_eq!(logged.len(), expected_events.len());
+        for (index, (record, event)) in logged.iter().zip(&expected_events).enumerate() {
+            assert_eq!(record.format_version, EVENT_FORMAT_VERSION);
             assert_eq!(record.sequence, index as u64 + 1);
-            assert_eq!(&record.command, command);
+            assert_eq!(&record.event, event);
+        }
+        // Every command's events share one `command_id`, in submission order.
+        let mut offset = 0usize;
+        for (index, receipt) in expected.iter().enumerate() {
+            let group = &logged[offset..offset + receipt.events.len()];
+            assert!(
+                group
+                    .iter()
+                    .all(|record| record.command_id == index as u64 + 1),
+                "command {} events must share command_id {}",
+                index,
+                index + 1
+            );
+            offset += receipt.events.len();
         }
 
         assert_eq!(metrics.applied(), commands.len() as u64);
         assert_eq!(metrics.queue_depth_max(), commands.len() as u64);
-        assert_eq!(metrics.batch_records_sum(), commands.len() as u64);
+        assert_eq!(
+            metrics.batch_records_sum(),
+            expected_events.len() as u64,
+            "journal batches are counted in event records"
+        );
     }
 
     #[test]
@@ -1468,22 +1553,36 @@ mod tests {
         assert_eq!(
             receipts
                 .iter()
-                .map(|receipt| receipt.command_sequence)
+                .map(|receipt| (receipt.first_event_sequence, receipt.last_event_sequence))
                 .collect::<Vec<_>>(),
-            vec![1, 2, 3, 4]
+            vec![(1, 2), (3, 4), (5, 5), (6, 7)]
         );
-        assert!(matches!(receipts[0].outcome, CommandOutcome::Accepted(_)));
-        assert!(matches!(receipts[1].outcome, CommandOutcome::Accepted(_)));
-        assert!(matches!(receipts[2].outcome, CommandOutcome::Canceled(_)));
-        assert!(matches!(receipts[3].outcome, CommandOutcome::Accepted(_)));
+        assert!(matches!(
+            receipts[0].events[0],
+            DomainEvent::OrderAccepted { .. }
+        ));
+        assert!(matches!(
+            receipts[1].events[0],
+            DomainEvent::OrderAccepted { .. }
+        ));
+        assert!(matches!(
+            receipts[2].events[0],
+            DomainEvent::OrderCanceled { .. }
+        ));
+        assert!(matches!(
+            receipts[3].events[0],
+            DomainEvent::OrderAccepted { .. }
+        ));
 
         shared.close();
         handle.join().expect("matching thread");
         let logged = journal.records();
-        assert_eq!(logged.len(), commands.len());
-        for (record, command) in logged.iter().zip(&commands) {
-            assert_eq!(&record.command, command);
+        assert_eq!(logged.len(), 7);
+        for (index, record) in logged.iter().enumerate() {
+            assert_eq!(record.sequence, index as u64 + 1);
         }
+        let command_ids: Vec<u64> = logged.iter().map(|record| record.command_id).collect();
+        assert_eq!(command_ids, vec![1, 1, 2, 2, 3, 4, 4]);
     }
 
     #[test]
@@ -1510,10 +1609,11 @@ mod tests {
         );
         drop(submitter);
 
-        wait_until(|| journal.record_count() == 2);
+        wait_until(|| journal.record_count() == 4);
         let batches = journal.batches();
-        assert_eq!(batches.len(), 1);
+        assert_eq!(batches.len(), 2, "each command emits two events");
         assert_eq!(batches[0].len(), 2, "the buffer flushes at apply_batch_max");
+        assert_eq!(batches[1].len(), 2);
 
         for ticket in &tickets {
             ticket.wait_durable_timeout(WAIT).expect("durable");
@@ -1550,7 +1650,7 @@ mod tests {
         drop(submitter);
 
         ticket.wait_durable_timeout(WAIT).expect("durable");
-        wait_until(|| journal.record_count() == 1);
+        wait_until(|| journal.record_count() == 2);
 
         shared.close();
         let engine = handle.join().expect("matching thread");
@@ -1590,9 +1690,9 @@ mod tests {
         wait_until(|| metrics.applied() == 1);
         // The gate pauses intake after the first command; only the buffered
         // record can flush, and only because the flush interval expires.
-        wait_until(|| journal.record_count() == 1);
+        wait_until(|| journal.record_count() == 2);
         assert_eq!(metrics.applied(), 1);
-        assert_eq!(journal.batches()[0].len(), 1);
+        assert_eq!(journal.batches()[0].len(), 2);
 
         released.store(true, Ordering::Release);
         for ticket in &tickets {
@@ -1602,7 +1702,7 @@ mod tests {
 
         shared.close();
         handle.join().expect("matching thread");
-        assert_eq!(journal.record_count(), 3);
+        assert_eq!(journal.record_count(), 6);
     }
 
     #[test]
@@ -1649,7 +1749,7 @@ mod tests {
         shared.close();
         handle.join().expect("matching thread");
         assert_eq!(metrics.applied(), 3);
-        assert_eq!(journal.record_count(), 3);
+        assert_eq!(journal.record_count(), 6);
     }
 
     #[test]
@@ -1765,7 +1865,7 @@ mod tests {
             "durability must not be confirmed before the watermark advances"
         );
 
-        shared.publish_durable(applied.command_sequence);
+        shared.publish_durable(applied.last_event_sequence);
         assert_eq!(
             tickets[0].wait_durable_timeout(WAIT).expect("durable"),
             applied
@@ -1810,7 +1910,7 @@ mod tests {
                 .expect("every drained command is durable");
         }
         assert_eq!(metrics.applied(), 5);
-        assert_eq!(journal.record_count(), 5);
+        assert_eq!(journal.record_count(), 10);
         assert!(engine.events().is_empty());
     }
 }

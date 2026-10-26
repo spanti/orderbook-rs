@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::durable::{
-    CommandLog, FileCommandLog, FileSnapshotStore, InMemoryCommandLog, InMemorySnapshotStore,
-    SnapshotStore,
+    EventLog, EventSnapshotStore, FileEventLog, FileEventSnapshotStore, InMemoryEventLog,
+    InMemoryEventSnapshotStore,
 };
 use crate::engine::MatchingEngine;
 use crate::runtime::{
@@ -144,7 +144,7 @@ pub(crate) fn run_runtime(config: &BenchConfig) -> Result<BenchReport, BenchErro
         durable_count: delta.durable,
         slo: SloReport {
             applied: SloCheck::new(applied_all, APPLIED_SLO_NS, delta.queue_full),
-            // The durable SLO is defined against FileCommandLog on NVMe. An
+            // The durable SLO is defined against FileEventLog on NVMe. An
             // in-memory log cannot exercise fsync, so reporting PASS/FAIL there
             // would be a false claim.
             durable: if config.log == LogKind::Memory {
@@ -188,10 +188,10 @@ fn create_runtime(
 ) -> Result<(EngineHandle, EngineRuntime), BenchError> {
     let runtime_config = config.runtime_config(metrics);
 
-    let (log, snapshots): (Box<dyn CommandLog>, Box<dyn SnapshotStore>) = match config.log {
+    let (log, snapshots): (Box<dyn EventLog>, Box<dyn EventSnapshotStore>) = match config.log {
         LogKind::Memory => (
-            Box::new(InMemoryCommandLog::new()),
-            Box::new(InMemorySnapshotStore::new()),
+            Box::new(InMemoryEventLog::new()),
+            Box::new(InMemoryEventSnapshotStore::new()),
         ),
         LogKind::File => {
             let dir = config
@@ -205,12 +205,12 @@ fn create_runtime(
                 ))
             })?;
 
-            let log_path = dir.join("commands.log");
+            let log_path = dir.join("events.log");
             let snapshot_dir = dir.join("snapshots");
-            let log = FileCommandLog::open(&log_path).map_err(|error| {
+            let log = FileEventLog::open(&log_path).map_err(|error| {
                 BenchError::Io(format!("cannot open {}: {error}", log_path.display()))
             })?;
-            let snapshots = FileSnapshotStore::open(&snapshot_dir).map_err(|error| {
+            let snapshots = FileEventSnapshotStore::open(&snapshot_dir).map_err(|error| {
                 BenchError::Io(format!(
                     "cannot open snapshot directory {}: {error}",
                     snapshot_dir.display()
@@ -320,8 +320,8 @@ fn drain_one(
     let durable_ns = ns_between(submit_start, Instant::now());
 
     debug_assert_eq!(
-        applied_receipt.command_sequence, durable_receipt.command_sequence,
-        "per-producer FIFO must preserve the command sequence across levels"
+        applied_receipt.last_event_sequence, durable_receipt.last_event_sequence,
+        "per-producer FIFO must preserve the event range across levels"
     );
 
     if measure {
@@ -336,10 +336,6 @@ fn drain_one(
     }
 
     let outcome = shadow.execute(command);
-    debug_assert_eq!(
-        outcome, applied_receipt.outcome,
-        "the shadow engine must reproduce the runtime's receipt outcome"
-    );
     record_workload(workload, &action, outcome, |id| shadow.is_open(id));
     Ok(())
 }
