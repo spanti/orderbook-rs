@@ -3,6 +3,7 @@
 pub mod bench;
 pub mod durable;
 pub mod engine;
+pub mod event;
 mod ledger;
 pub mod orderbook;
 pub mod runtime;

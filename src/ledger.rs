@@ -32,6 +32,22 @@ impl OrderLedger {
             .expect("taker record was just inserted")
     }
 
+    /// Insert the record of an accepted order that has not matched yet.
+    ///
+    /// The event-sourced path creates records from `OrderAccepted`, before any
+    /// fill delta exists, so the record starts in `New` with its full quantity.
+    pub(crate) fn insert_new(
+        &mut self,
+        order_id: OrderBookId,
+        symbol: String,
+        original_quantity: u64,
+    ) -> &OrderRecord {
+        self.insert(order_id, OrderRecord::new(symbol, original_quantity));
+        self.records
+            .get(&order_id)
+            .expect("accepted record was just inserted")
+    }
+
     fn insert(&mut self, order_id: OrderBookId, record: OrderRecord) {
         debug_assert!(
             !self.records.contains_key(&order_id),

@@ -36,6 +36,11 @@ pub enum BenchPath {
     Direct,
     /// Submit through the matching runtime's bounded Command Queue.
     Runtime,
+    /// Measure the pure event-sourced `decide` step only.
+    ///
+    /// This is the decision-scratch baseline: command in, events out, with no
+    /// engine clone and no state mutation.
+    Decide,
 }
 
 /// Storage adapters used by the runtime path.
@@ -73,6 +78,7 @@ Options:
 
 Runtime path options:
   --path direct|runtime    Execution path (default: direct)
+  --path decide            Pure event-sourced decide baseline
   --queue-capacity <N>     Ingress Command Queue capacity (default: 1024)
   --journal-batch-capacity <N>
                            Journal batches in flight before backpressure (default: 64)
@@ -468,8 +474,9 @@ fn parse_path(value: &str) -> Result<BenchPath, BenchError> {
     match value {
         "direct" => Ok(BenchPath::Direct),
         "runtime" => Ok(BenchPath::Runtime),
+        "decide" => Ok(BenchPath::Decide),
         _ => Err(BenchError::usage(format!(
-            "invalid value for --path: {value} (expected direct or runtime)"
+            "invalid value for --path: {value} (expected direct, runtime or decide)"
         ))),
     }
 }

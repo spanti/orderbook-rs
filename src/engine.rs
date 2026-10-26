@@ -2,6 +2,7 @@ use colored::Colorize;
 
 use std::collections::HashMap;
 
+use crate::event::DomainEvent;
 use crate::ledger::OrderLedger;
 use crate::orderbook::OrderBook;
 use crate::snapshot::{
@@ -47,6 +48,11 @@ pub struct MatchingEngine {
     next_order_id: u64,
     events: Vec<EngineEvent>,
     next_sequence_id: u64,
+    /// Last event sequence folded through [`MatchingEngine::apply`].
+    ///
+    /// The old command path keeps this in lockstep with `next_sequence_id` so
+    /// `BookSnapshot.sequence` is identical on both paths.
+    last_applied_sequence: u64,
     stop_books: HashMap<String, StopBook>,
     last_trades: HashMap<String, LastTrade>,
 }
@@ -64,7 +70,69 @@ impl Default for MatchingEngine {
             stop_books: HashMap::new(),
             last_trades: HashMap::new(),
             next_sequence_id: 1,
+            last_applied_sequence: 0,
         }
+    }
+}
+
+/// Read-only decision state for the event-sourced path.
+///
+/// The tracer only decides non-crossing limit submits, so it needs nothing more
+/// than a borrow of the engine plus the touched symbol and the next order id.
+/// It deliberately does **not** clone the engine or any book: the scratch is a
+/// small stack value, which keeps `decide` off the whole-engine-clone path.
+pub struct DecisionScratch<'a> {
+    engine: &'a MatchingEngine,
+    symbol: &'a str,
+    order_id: OrderBookId,
+}
+
+impl<'a> DecisionScratch<'a> {
+    pub fn new(engine: &'a MatchingEngine, symbol: &'a str) -> Self {
+        Self {
+            engine,
+            symbol,
+            // Allocation stays local to the decision: no counter is mutated
+            // until an `OrderAccepted` event is applied.
+            order_id: engine.next_order_id,
+        }
+    }
+
+    /// Decide a fresh submit produced by `command`.
+    ///
+    /// Only a non-crossing limit GTC submit is supported by ticket 01. Every
+    /// other command shape fails with [`EngineError::UnsupportedCommand`]
+    /// instead of being silently dropped; later tickets extend the catalog.
+    pub fn decide_submit(&self, request: &OrderRequest) -> Result<Vec<DomainEvent>, EngineError> {
+        self.engine.validate(request)?;
+
+        if request.order_type != OrderType::Limit || request.time_in_force != TimeInForce::GTC {
+            return Err(EngineError::UnsupportedCommand);
+        }
+
+        if self.engine.would_cross(self.symbol, request) {
+            return Err(if request.post_only {
+                EngineError::PostOnlyWouldCross
+            } else {
+                EngineError::UnsupportedCommand
+            });
+        }
+
+        let accepted = request.to_order(self.order_id);
+        // Nothing filled, so the rested quantity is the original quantity.
+        let rested = accepted.clone();
+
+        Ok(vec![
+            DomainEvent::OrderAccepted {
+                symbol: self.symbol.to_string(),
+                order: accepted,
+                post_only: request.post_only,
+            },
+            DomainEvent::OrderRested {
+                symbol: self.symbol.to_string(),
+                order: rested,
+            },
+        ])
     }
 }
 
@@ -81,6 +149,7 @@ impl MatchingEngine {
             stop_books: HashMap::new(),
             last_trades: HashMap::new(),
             next_sequence_id: 1,
+            last_applied_sequence: 0,
         }
     }
 
@@ -92,7 +161,17 @@ impl MatchingEngine {
     /// [`crate::durable::DurableMatchingEngine::applied_seq`]. One command can
     /// emit several events, so an event sequence is not a recovery boundary.
     pub fn last_sequence(&self) -> u64 {
-        self.next_sequence_id.saturating_sub(1)
+        self.next_sequence_id
+            .saturating_sub(1)
+            .max(self.last_applied_sequence)
+    }
+
+    /// Last event sequence folded through [`Self::apply`].
+    ///
+    /// This is the value reported by [`BookSnapshot::sequence`] on the
+    /// event-sourced path.
+    pub fn last_applied_sequence(&self) -> u64 {
+        self.last_applied_sequence
     }
 
     /// Capture the complete decision state as a deterministic snapshot.
@@ -217,6 +296,7 @@ impl MatchingEngine {
             next_order_id: snapshot.next_order_id,
             events: Vec::new(),
             next_sequence_id: snapshot.next_event_sequence,
+            last_applied_sequence: snapshot.next_event_sequence.saturating_sub(1),
             stop_books,
             last_trades,
         }
@@ -246,11 +326,54 @@ impl MatchingEngine {
     /// The runtime uses this to apply without cloning, then moves the same
     /// command into its journal record.
     pub fn execute_ref(&mut self, command: &EngineCommand) -> CommandOutcome {
-        self.apply(command)
+        self.apply_command(command)
     }
 
-    /// Core apply path used by `execute`. Never performs IO.
-    fn apply(&mut self, command: &EngineCommand) -> CommandOutcome {
+    /// Pure decision step of the event-sourced path: command in, events out.
+    ///
+    /// Reads engine state and allocates order ids in local variables only; it
+    /// never mutates the engine. Ticket 01 supports a non-crossing limit GTC
+    /// submit and rejects every other command shape explicitly.
+    pub fn decide(&self, command: &EngineCommand) -> Result<Vec<DomainEvent>, EngineError> {
+        match command {
+            EngineCommand::SubmitOrder { symbol, request } => {
+                DecisionScratch::new(self, symbol).decide_submit(request)
+            }
+            EngineCommand::ModifyOrder { .. }
+            | EngineCommand::CancelOrder { .. }
+            | EngineCommand::SubmitStopOrder { .. } => Err(EngineError::UnsupportedCommand),
+        }
+    }
+
+    /// Fold one domain event into engine state.
+    ///
+    /// This is the event-sourced path's only state write entry. `sequence` is
+    /// the global event sequence assigned by the durable layer; it is recorded
+    /// for [`BookSnapshot::sequence`] and never used to re-run matching.
+    pub fn apply(&mut self, event: &DomainEvent, sequence: u64) {
+        match event {
+            DomainEvent::OrderAccepted { symbol, order, .. } => {
+                // The ledger record is created here; the book stays untouched.
+                self.ledger
+                    .insert_new(order.id, symbol.clone(), order.quantity);
+                self.next_order_id = self.next_order_id.max(order.id.saturating_add(1));
+            }
+            DomainEvent::OrderRested { symbol, order } => {
+                // Direct insert, never `OrderBook::submit`: replay must not
+                // re-run matching.
+                self.order_books
+                    .entry(symbol.clone())
+                    .or_insert_with(OrderBook::new)
+                    .rest_order(order.clone());
+            }
+        }
+
+        self.last_applied_sequence = self.last_applied_sequence.max(sequence);
+        self.next_sequence_id = self.next_sequence_id.max(sequence.saturating_add(1));
+    }
+
+    /// Core command path used by `execute`. Never performs IO.
+    fn apply_command(&mut self, command: &EngineCommand) -> CommandOutcome {
         let symbol = match command {
             EngineCommand::SubmitOrder { symbol, .. } => symbol,
             EngineCommand::SubmitStopOrder { symbol, .. } => symbol,
@@ -770,6 +893,7 @@ impl MatchingEngine {
     fn allocate_sequence_id(&mut self) -> u64 {
         let sequence_id = self.next_sequence_id;
         self.next_sequence_id += 1;
+        self.last_applied_sequence = sequence_id;
         sequence_id
     }
 

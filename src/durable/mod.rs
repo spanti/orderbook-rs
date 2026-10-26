@@ -11,17 +11,19 @@ use std::fmt;
 
 use crate::engine::MatchingEngine;
 use crate::snapshot::EngineSnapshot;
-use crate::types::{CommandOutcome, EngineCommand, EngineConfig};
+use crate::types::{CommandOutcome, EngineCommand, EngineConfig, EngineError};
 
 mod framing;
 
+pub mod event_log;
 pub mod file_log;
 pub mod file_snapshot;
 pub mod memory;
 
+pub use event_log::{EVENT_FORMAT_VERSION, EventCursor, EventLog, EventRecord, EventSourcedEngine};
 pub use file_log::FileCommandLog;
 pub use file_snapshot::FileSnapshotStore;
-pub use memory::{InMemoryCommandLog, InMemorySnapshotStore};
+pub use memory::{InMemoryCommandLog, InMemoryEventLog, InMemorySnapshotStore};
 
 /// Version written into every durable envelope. Incompatible versions are
 /// refused rather than migrated.
@@ -88,6 +90,11 @@ pub enum DurableError {
     CorruptRecord { detail: String },
     /// The durable engine stopped accepting commands after an append failure.
     EngineFailed,
+    /// The event-sourced decision path refused the command before any append.
+    ///
+    /// Client errors (unsupported command shapes, policy rejections not yet
+    /// event-sourced) do not fail the instance.
+    DecisionRejected(EngineError),
 }
 
 impl fmt::Display for DurableError {
@@ -128,6 +135,9 @@ impl fmt::Display for DurableError {
             Self::Storage(detail) => write!(f, "storage failure: {detail}"),
             Self::CorruptRecord { detail } => write!(f, "corrupt record: {detail}"),
             Self::EngineFailed => write!(f, "durable engine is failed and accepts no commands"),
+            Self::DecisionRejected(error) => {
+                write!(f, "command rejected by the event-sourced path: {error:?}")
+            }
         }
     }
 }
