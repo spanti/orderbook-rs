@@ -4,6 +4,8 @@
 //! convert into ordinary market/limit orders. These tests exercise the public
 //! engine API only.
 
+use orderbook_rs::durable::DurableMatchingEngine;
+use orderbook_rs::durable::memory::{InMemoryCommandLog, InMemorySnapshotStore};
 use orderbook_rs::engine::MatchingEngine;
 use orderbook_rs::types::{
     CommandOutcome, EngineCommand, EngineConfig, EngineError, EngineEvent, ExecutionReport,
@@ -48,6 +50,72 @@ fn stop_limit(
         order_type: StopKind::Limit { price },
         quantity,
         timestamp,
+    }
+}
+
+fn submit_command(request: OrderRequest) -> EngineCommand {
+    EngineCommand::SubmitOrder {
+        symbol: SYMBOL.to_string(),
+        request,
+    }
+}
+
+fn submit_stop_command(request: StopOrderRequest) -> EngineCommand {
+    EngineCommand::SubmitStopOrder {
+        symbol: SYMBOL.to_string(),
+        request,
+    }
+}
+
+fn cancel_command(order_id: u64) -> EngineCommand {
+    EngineCommand::CancelOrder {
+        symbol: SYMBOL.to_string(),
+        order_id,
+    }
+}
+
+fn modify_command(order_id: u64, price: u64, quantity: u64, timestamp: u64) -> EngineCommand {
+    EngineCommand::ModifyOrder {
+        symbol: SYMBOL.to_string(),
+        order_id,
+        request: ModifyRequest {
+            price,
+            quantity,
+            timestamp,
+        },
+    }
+}
+
+/// Execute a command while collecting the stream locally, so replay does not
+/// depend on the engine's in-memory command buffer.
+fn execute_recorded(
+    engine: &mut MatchingEngine,
+    commands: &mut Vec<EngineCommand>,
+    command: EngineCommand,
+) -> CommandOutcome {
+    commands.push(command.clone());
+    engine.execute(command)
+}
+
+fn submit_recorded(
+    engine: &mut MatchingEngine,
+    commands: &mut Vec<EngineCommand>,
+    request: OrderRequest,
+) -> ExecutionReport {
+    match execute_recorded(engine, commands, submit_command(request)) {
+        CommandOutcome::Accepted(report) => report,
+        other => panic!("submit failed: {other:?}"),
+    }
+}
+
+fn submit_stop_recorded(
+    engine: &mut MatchingEngine,
+    commands: &mut Vec<EngineCommand>,
+    request: StopOrderRequest,
+) -> ExecutionReport {
+    match execute_recorded(engine, commands, submit_stop_command(request)) {
+        CommandOutcome::Accepted(report) => report,
+        other => panic!("stop submit failed: {other:?}"),
     }
 }
 
@@ -596,45 +664,52 @@ fn triggered_stop_that_rests_is_a_normal_limit_order() {
 #[test]
 fn replay_reproduces_stop_lifecycle() {
     let mut engine = MatchingEngine::new(EngineConfig::default());
-    seed_last_price(&mut engine, 100);
+    // Collect the stream locally rather than reading the engine's buffer.
+    let mut commands: Vec<EngineCommand> = Vec::new();
+
+    // Seed a last trade at 100 and leave the book empty.
+    submit_recorded(&mut engine, &mut commands, limit(Side::Ask, 100, 1, 1));
+    submit_recorded(&mut engine, &mut commands, limit(Side::Bid, 100, 1, 2));
+    assert_eq!(engine.last_trade_price(SYMBOL), Some(100));
+    assert!(engine.book(SYMBOL).unwrap().best_bid().is_none());
+    assert!(engine.book(SYMBOL).unwrap().best_ask().is_none());
 
     // One pending stop that never triggers, so replay compares a non-empty
     // stop store as well.
-    let pending = submit_stop(&mut engine, stop_market(Side::Bid, 105, 1, 3));
+    let pending = submit_stop_recorded(&mut engine, &mut commands, stop_market(Side::Bid, 105, 1, 3));
 
-    let first = submit_stop(&mut engine, stop_market(Side::Ask, 95, 1, 4));
-    let second = submit_stop(&mut engine, stop_market(Side::Ask, 93, 1, 5));
-    let canceled = submit_stop(&mut engine, stop_market(Side::Ask, 99, 1, 6));
+    let first = submit_stop_recorded(&mut engine, &mut commands, stop_market(Side::Ask, 95, 1, 4));
+    let second = submit_stop_recorded(&mut engine, &mut commands, stop_market(Side::Ask, 93, 1, 5));
+    let canceled = submit_stop_recorded(&mut engine, &mut commands, stop_market(Side::Ask, 99, 1, 6));
 
-    engine.execute(EngineCommand::CancelOrder {
-        symbol: SYMBOL.to_string(),
-        order_id: canceled.order_id,
-    });
-    let rejected_modify = engine.execute(EngineCommand::ModifyOrder {
-        symbol: SYMBOL.to_string(),
-        order_id: first.order_id,
-        request: ModifyRequest {
-            price: 94,
-            quantity: 1,
-            timestamp: 7,
-        },
-    });
+    let canceled_command = execute_recorded(
+        &mut engine,
+        &mut commands,
+        cancel_command(canceled.order_id),
+    );
+    assert!(matches!(canceled_command, CommandOutcome::Canceled(_)));
+    let rejected_modify = execute_recorded(
+        &mut engine,
+        &mut commands,
+        modify_command(first.order_id, 94, 1, 7),
+    );
     assert_eq!(
         rejected_modify,
         CommandOutcome::Rejected(EngineError::StopOrderNotModifiable)
     );
-    let rejected_stop = engine.execute(EngineCommand::SubmitStopOrder {
-        symbol: SYMBOL.to_string(),
-        request: stop_market(Side::Bid, 99, 1, 8),
-    });
+    let rejected_stop = execute_recorded(
+        &mut engine,
+        &mut commands,
+        submit_stop_command(stop_market(Side::Bid, 99, 1, 8)),
+    );
     assert_eq!(
         rejected_stop,
         CommandOutcome::Rejected(EngineError::StopPriceWouldTriggerImmediately)
     );
 
-    submit(&mut engine, limit(Side::Bid, 95, 1, 9));
-    submit(&mut engine, limit(Side::Bid, 93, 5, 10));
-    submit(&mut engine, limit(Side::Ask, 95, 1, 11));
+    submit_recorded(&mut engine, &mut commands, limit(Side::Bid, 95, 1, 9));
+    submit_recorded(&mut engine, &mut commands, limit(Side::Bid, 93, 5, 10));
+    submit_recorded(&mut engine, &mut commands, limit(Side::Ask, 95, 1, 11));
 
     assert_eq!(
         triggered(&engine),
@@ -642,25 +717,42 @@ fn replay_reproduces_stop_lifecycle() {
     );
     assert!(engine.stop_order(pending.order_id).is_some());
 
-    let replayed = MatchingEngine::from_commands(EngineConfig::default(), engine.commands());
+    let log = InMemoryCommandLog::new();
+    let snapshots = InMemorySnapshotStore::new();
+    let replayed = DurableMatchingEngine::from_commands(
+        EngineConfig::default(),
+        &commands,
+        Box::new(log.handle()),
+        Box::new(snapshots.handle()),
+        0,
+    )
+    .expect("stop lifecycle replay succeeds");
 
-    assert_eq!(replayed.commands(), engine.commands());
-    assert_eq!(replayed.events(), engine.events());
-    assert_eq!(replayed.trades(), engine.trades());
-    assert_eq!(records(&replayed), records(&engine));
-    assert_eq!(replayed.book(SYMBOL), engine.book(SYMBOL));
+    // Events belong to live execution; recovery deliberately does not restore
+    // them. Everything else must match, including the pending stop store.
+    assert_eq!(replayed.applied_seq(), commands.len() as u64);
     assert_eq!(
-        replayed.last_trade_price(SYMBOL),
+        replayed.engine().capture_snapshot(),
+        engine.capture_snapshot()
+    );
+    assert_eq!(replayed.engine().trades(), engine.trades());
+    assert_eq!(records(replayed.engine()), records(&engine));
+    assert_eq!(replayed.engine().book(SYMBOL), engine.book(SYMBOL));
+    assert_eq!(
+        replayed.engine().last_trade_price(SYMBOL),
         engine.last_trade_price(SYMBOL)
     );
     assert_eq!(
-        replayed.stop_orders(SYMBOL, Side::Bid),
+        replayed.engine().stop_orders(SYMBOL, Side::Bid),
         engine.stop_orders(SYMBOL, Side::Bid)
     );
     assert_eq!(
-        replayed.stop_orders(SYMBOL, Side::Ask),
+        replayed.engine().stop_orders(SYMBOL, Side::Ask),
         engine.stop_orders(SYMBOL, Side::Ask)
     );
-    assert_eq!(replayed.order_count(), engine.order_count());
-    assert_eq!(replayed.snapshot(SYMBOL, 10), engine.snapshot(SYMBOL, 10));
+    assert_eq!(replayed.engine().order_count(), engine.order_count());
+    assert_eq!(
+        replayed.engine().snapshot(SYMBOL, 10),
+        engine.snapshot(SYMBOL, 10)
+    );
 }
