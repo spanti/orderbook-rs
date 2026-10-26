@@ -375,6 +375,10 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
         if let (Some(metrics), Some(apply_started)) = (metrics.as_ref(), apply_started) {
             metrics.record_apply(apply_started.elapsed());
             metrics.record_applied();
+            // Event volume is per command: a resting submit is at least
+            // `OrderAccepted` + `OrderRested`, and a sweep adds one
+            // `TradeExecuted` per fill.
+            metrics.record_events(records.len());
         }
 
         if self.journal_buffer.is_empty() {
@@ -463,7 +467,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
 
-    const WAIT: Duration = Duration::from_secs(3);
+    // Several tests here coordinate two workers and an fsync-free journal.
+    // A loaded Windows CI run can exceed three seconds, so allow ten like the
+    // integration tests instead of failing a correct runtime on scheduling.
+    const WAIT: Duration = Duration::from_secs(10);
 
     fn limit(timestamp: u64, side: Side, price: u64, quantity: u64) -> OrderRequest {
         OrderRequest {
@@ -1513,6 +1520,11 @@ mod tests {
 
         assert_eq!(metrics.applied(), commands.len() as u64);
         assert_eq!(metrics.queue_depth_max(), commands.len() as u64);
+        assert_eq!(
+            metrics.event_records(),
+            expected_events.len() as u64,
+            "event volume is counted in event records"
+        );
         assert_eq!(
             metrics.batch_records_sum(),
             expected_events.len() as u64,
