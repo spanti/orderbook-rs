@@ -407,6 +407,28 @@ impl IngressSubmitter {
     }
 }
 
+/// Test-only probe: run one command through the real ingress submitter and
+/// return the envelope's `enqueued_at`.
+///
+/// `None` proves that metrics-disabled submission performs no clock read. This
+/// is hidden test support, not part of the supported API.
+#[doc(hidden)]
+pub fn enqueued_at_for_test(metrics: Option<Arc<RuntimeMetrics>>) -> Option<Instant> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let submitter = IngressSubmitter::new(sender, SlotPool::new(1), SharedState::new(metrics));
+    let ticket = submitter
+        .submit(EngineCommand::CancelOrder {
+            symbol: "BTC-USDT".to_string(),
+            order_id: 1,
+        })
+        .expect("the probe ingress has room");
+    let envelope = receiver.recv().expect("the probe envelope");
+    let enqueued_at = envelope.enqueued_at;
+    drop(envelope);
+    drop(ticket);
+    enqueued_at
+}
+
 struct PendingDurable {
     sequence: u64,
     enqueued_at: Option<Instant>,

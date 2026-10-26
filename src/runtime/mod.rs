@@ -17,7 +17,11 @@ pub mod ticket;
 pub use envelope::CommandEnvelope;
 pub use error::{RuntimeError, SubmitError};
 pub use idle::{Idle, IdleStrategy};
+#[doc(hidden)]
+pub use lifecycle::start_with_matching_panic_for_test;
 pub use lifecycle::{EngineHandle, EngineRuntime};
+#[doc(hidden)]
+pub use matching::enqueued_at_for_test;
 pub use metrics::RuntimeMetrics;
 pub use ticket::{CommandReceipt, ResponseSlot, SlotHandle, SlotPool, SlotState, Ticket};
 

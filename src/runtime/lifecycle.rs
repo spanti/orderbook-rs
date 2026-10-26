@@ -10,9 +10,9 @@
 //! stop without the final snapshot and ignores errors; both paths are
 //! idempotent, so dropping a runtime that was explicitly shut down is a no-op.
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::mpsc::{self, SyncSender};
+use std::sync::{Arc, Barrier};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -25,7 +25,7 @@ use super::envelope::CommandEnvelope;
 use super::error::{RuntimeError, SubmitError};
 use super::journal::{self, ThreadWaker, Waker};
 use super::matching::{
-    CadenceSnapshotGate, IngressSubmitter, MatchingThread, SharedState, SnapshotGate,
+    CadenceSnapshotGate, GateDecision, IngressSubmitter, MatchingThread, SharedState, SnapshotGate,
 };
 use super::metrics::RuntimeMetrics;
 use super::snapshot::{self, SnapshotSink};
@@ -402,6 +402,73 @@ impl Drop for EngineRuntime {
         // The same stop without a final snapshot; errors and worker panics are
         // deliberately ignored so dropping never panics.
         let _ = self.stop(false);
+    }
+}
+
+/// Test-only constructor whose matching thread panics after applying
+/// `panic_after` commands.
+///
+/// A matching-thread panic is not reachable through valid commands, so
+/// integration tests cannot produce one from the public surface. The gate
+/// waits on `start` before processing anything, which lets a test enqueue its
+/// tickets first; every waiter must then be released with
+/// [`RuntimeError::EngineStopped`].
+///
+/// This is hidden test support, not part of the supported API.
+#[doc(hidden)]
+pub fn start_with_matching_panic_for_test(
+    config: RuntimeConfig,
+    engine_config: EngineConfig,
+    mut log: Box<dyn CommandLog>,
+    snapshots: Box<dyn SnapshotStore>,
+    start: Arc<Barrier>,
+    panic_after: u64,
+) -> Result<(EngineHandle, EngineRuntime), RuntimeError> {
+    log.write_header(LogHeader {
+        format_version: FORMAT_VERSION,
+        config: engine_config,
+    })
+    .map_err(|error| RuntimeError::Startup(error.to_string()))?;
+
+    EngineRuntime::start_with_gate(
+        config,
+        MatchingEngine::new(engine_config),
+        log,
+        snapshots,
+        0,
+        0,
+        1,
+        move |_cadence, _sink| PanicAfterBarrierGate {
+            start,
+            started: false,
+            panic_after,
+        },
+    )
+}
+
+/// A snapshot gate that blocks until `start` is released, then panics the
+/// matching thread once `panic_after` commands have been applied.
+struct PanicAfterBarrierGate {
+    start: Arc<Barrier>,
+    started: bool,
+    panic_after: u64,
+}
+
+impl SnapshotGate for PanicAfterBarrierGate {
+    fn poll(
+        &mut self,
+        _engine: &MatchingEngine,
+        applied_seq: u64,
+        _durable_seq: u64,
+    ) -> GateDecision {
+        if !self.started {
+            self.start.wait();
+            self.started = true;
+        }
+        if applied_seq >= self.panic_after {
+            panic!("matching thread panic (test hook)");
+        }
+        GateDecision::Continue
     }
 }
 
