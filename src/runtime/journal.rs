@@ -19,8 +19,9 @@ use std::time::Instant;
 use crate::durable::{CommandLog, CommandRecord, DurableError};
 
 use super::RuntimeConfig;
-use super::matching::{JournalSink, SharedState};
+use super::matching::JournalSink;
 use super::metrics::RuntimeMetrics;
+use super::shared::SharedState;
 
 /// Something the journal thread can wake after it publishes a watermark
 /// advance.
@@ -118,18 +119,44 @@ struct JournalThread<W: Waker> {
 
 impl<W: Waker> JournalThread<W> {
     fn run(mut self) {
+        // Records already received but held back because the next group is
+        // already at the coalesce cap. They are appended immediately in the
+        // next iteration, so no record waits for a new handoff.
+        let mut carry: Vec<CommandRecord> = Vec::new();
+
         loop {
-            let mut records = match self.receiver.recv() {
-                Ok(batch) => batch,
-                Err(_) => return,
+            let mut records = if carry.is_empty() {
+                match self.receiver.recv() {
+                    Ok(batch) => batch,
+                    Err(_) => return,
+                }
+            } else {
+                std::mem::take(&mut carry)
             };
+
+            // A single handoff may itself exceed the cap; split it before it
+            // reaches `append_batch` so no fsync ever covers more records than
+            // the documented maximum.
+            if records.len() > self.coalesce_max {
+                carry = records.split_off(self.coalesce_max);
+            }
 
             // Everything the matching thread queued while the journal was
             // idle (or busy appending) joins this group, up to the record cap.
+            // A batch that does not fit is split; its remainder is carried
+            // over and appended in order in the next group.
             let mut disconnected = false;
-            while records.len() < self.coalesce_max {
+            while carry.is_empty() && records.len() < self.coalesce_max {
                 match self.receiver.try_recv() {
-                    Ok(batch) => records.extend(batch),
+                    Ok(mut batch) => {
+                        let room = self.coalesce_max - records.len();
+                        if batch.len() <= room {
+                            records.append(&mut batch);
+                        } else {
+                            carry = batch.split_off(room);
+                            records.append(&mut batch);
+                        }
+                    }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         disconnected = true;
@@ -139,7 +166,7 @@ impl<W: Waker> JournalThread<W> {
             }
 
             let appended = self.append(records);
-            if !appended || disconnected {
+            if !appended || (disconnected && carry.is_empty()) {
                 return;
             }
         }
@@ -213,30 +240,26 @@ pub(crate) fn spawn<W: Waker>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::durable::{DurableError, FORMAT_VERSION, LogHeader};
+    use crate::durable::{CommandCursor, DurableError, FORMAT_VERSION, LogHeader};
     use crate::engine::MatchingEngine;
     use crate::runtime::RuntimeError;
     use crate::runtime::SubmitError;
-    use crate::runtime::matching::{
-        IngressSubmitter, MatchingThread, NoopSnapshotGate, SharedState,
-    };
+    use crate::runtime::matching::MatchingThread;
     use crate::runtime::metrics::RuntimeMetrics;
+    use crate::runtime::shared::SharedState;
+    use crate::runtime::snapshot_gate::NoopSnapshotGate;
+    use crate::runtime::submitter::IngressSubmitter;
+    use crate::runtime::sync::lock;
     use crate::runtime::ticket::SlotPool;
     use crate::types::{EngineCommand, EngineConfig, OrderRequest, OrderType, Side, TimeInForce};
     use std::ops::RangeInclusive;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc::{self, Sender, sync_channel};
-    use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
     const WAIT: Duration = Duration::from_secs(3);
-
-    fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-        mutex
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
 
     fn wait_until(mut condition: impl FnMut() -> bool) {
         let deadline = Instant::now() + WAIT;
@@ -457,6 +480,7 @@ mod tests {
         metrics: Option<Arc<RuntimeMetrics>>,
     ) -> (
         IngressSubmitter,
+        SlotPool,
         SharedState,
         JoinHandle<()>,
         JoinHandle<MatchingEngine>,
@@ -465,7 +489,8 @@ mod tests {
         let shared = SharedState::new(metrics);
         let waker = ThreadWaker::new();
         let (sink, journal_handle) = spawn(Box::new(log), shared.clone(), &config, waker.clone());
-        let submitter = IngressSubmitter::new(ingress_sender, SlotPool::new(64), shared.clone());
+        let pool = SlotPool::from_config(&config);
+        let submitter = IngressSubmitter::new(ingress_sender, pool.clone(), shared.clone());
         let matching = MatchingThread::new(
             MatchingEngine::new(EngineConfig::default()),
             ingress_receiver,
@@ -473,14 +498,13 @@ mod tests {
             NoopSnapshotGate,
             shared.clone(),
             config,
-            1,
-            0,
+            CommandCursor::new(0, 0, 1),
         );
         let matching_handle = thread::spawn(move || {
             waker.attach(thread::current());
             matching.run()
         });
-        (submitter, shared, journal_handle, matching_handle)
+        (submitter, pool, shared, journal_handle, matching_handle)
     }
 
     #[test]
@@ -609,6 +633,193 @@ mod tests {
         assert_eq!(shared.durable_seq(), 5);
     }
 
+    fn logged_sequences(records: &[CommandRecord]) -> Vec<u64> {
+        records.iter().map(|record| record.sequence).collect()
+    }
+
+    #[test]
+    fn journal_splits_an_oversized_batch_at_the_coalesce_cap() {
+        let log = SpyLog::default();
+        let shared = SharedState::new(None);
+        let config = RuntimeConfig {
+            journal_coalesce_max: 3,
+            ..config()
+        };
+        let (mut sink, handle) = spawn(
+            Box::new(log.clone()),
+            shared.clone(),
+            &config,
+            CountingWaker::default(),
+        );
+
+        sink.try_send_batch(records(1..=7)).expect("send");
+        drop(sink);
+        handle.join().expect("journal thread");
+
+        assert_eq!(
+            log.batch_sizes(),
+            vec![3, 3, 1],
+            "one oversized handoff must be split so every append stays within the cap"
+        );
+        assert_eq!(shared.durable_seq(), 7);
+        assert_eq!(
+            logged_sequences(&log.records()),
+            (1..=7).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn journal_splits_a_mixed_sequence_of_batches_at_the_coalesce_cap() {
+        let gate = Gate::default();
+        let log = SpyLog::with_gate(gate.clone());
+        let (started_tx, started_rx) = mpsc::channel();
+        log.notify_on_append(started_tx);
+        let shared = SharedState::new(None);
+        let config = RuntimeConfig {
+            journal_coalesce_max: 4,
+            ..config()
+        };
+        let (mut sink, handle) = spawn(
+            Box::new(log.clone()),
+            shared.clone(),
+            &config,
+            CountingWaker::default(),
+        );
+
+        // Hold the first append open so the following handoffs queue up.
+        sink.try_send_batch(records(1..=3)).expect("send A");
+        started_rx.recv_timeout(WAIT).expect("first append started");
+        sink.try_send_batch(records(4..=8)).expect("send B");
+        sink.try_send_batch(records(9..=10)).expect("send C");
+
+        gate.open();
+        wait_until(|| log.records().len() == 10);
+        drop(sink);
+        handle.join().expect("journal thread");
+
+        assert_eq!(
+            log.batch_sizes(),
+            vec![3, 4, 3],
+            "a batch larger than the remaining room is split, and its remainder is kept"
+        );
+        assert_eq!(shared.durable_seq(), 10);
+        assert_eq!(
+            logged_sequences(&log.records()),
+            (1..=10).collect::<Vec<_>>(),
+            "splitting preserves record order"
+        );
+    }
+
+    #[test]
+    fn journal_handles_a_coalesce_cap_smaller_than_one_batch() {
+        let log = SpyLog::default();
+        let shared = SharedState::new(None);
+        let config = RuntimeConfig {
+            journal_coalesce_max: 2,
+            ..config()
+        };
+        let (mut sink, handle) = spawn(
+            Box::new(log.clone()),
+            shared.clone(),
+            &config,
+            CountingWaker::default(),
+        );
+
+        sink.try_send_batch(records(1..=5)).expect("send");
+        drop(sink);
+        handle.join().expect("journal thread");
+
+        assert_eq!(log.batch_sizes(), vec![2, 2, 1]);
+        assert_eq!(shared.durable_seq(), 5);
+        assert_eq!(
+            logged_sequences(&log.records()),
+            (1..=5).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn slot_pool_does_not_exhaust_before_the_ingress_is_full() {
+        let gate = Gate::default();
+        let log = SpyLog::with_gate(gate.clone());
+        let (started_tx, started_rx) = mpsc::channel();
+        log.notify_on_append(started_tx);
+
+        let metrics = Arc::new(RuntimeMetrics::new());
+        let config = RuntimeConfig {
+            queue_capacity: 16,
+            apply_batch_max: 64,
+            journal_batch_capacity: 64,
+            journal_coalesce_max: 1024,
+            journal_flush_interval: Duration::from_secs(10),
+            metrics: Some(Arc::clone(&metrics)),
+            ..config()
+        };
+        let (submitter, pool, shared, journal_handle, matching_handle) =
+            spawn_runtime(log, config, Some(Arc::clone(&metrics)));
+
+        let mut tickets = Vec::new();
+        let mut timestamp = 1u64;
+        let deadline = Instant::now() + WAIT;
+
+        // Feed commands until the matching thread has a full batch and the
+        // journal enters its blocked append.
+        while started_rx.try_recv().is_err() {
+            match submitter.submit(command(timestamp)) {
+                Ok(ticket) => {
+                    tickets.push(ticket);
+                    timestamp += 1;
+                }
+                Err(SubmitError::QueueFull) => thread::sleep(Duration::from_millis(1)),
+                Err(other) => panic!("unexpected submit error: {other:?}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the journal never started its first append"
+            );
+        }
+
+        // Keep offering commands. The journal is blocked, so applying either
+        // stops because the journal channel is full (ingress overload) or
+        // because the response-slot pool is exhausted. Only the first is a
+        // legitimate `QueueFull`: the ingress must fill first.
+        loop {
+            match submitter.submit(command(timestamp)) {
+                Ok(ticket) => {
+                    tickets.push(ticket);
+                    timestamp += 1;
+                }
+                Err(SubmitError::QueueFull) => {
+                    // Probe whether the matching thread has genuinely stalled.
+                    let applied = metrics.applied();
+                    thread::sleep(Duration::from_millis(25));
+                    if metrics.applied() == applied {
+                        break;
+                    }
+                }
+                Err(other) => panic!("unexpected submit error: {other:?}"),
+            }
+            assert!(timestamp < 1_000_000, "the ingress never filled");
+            assert!(
+                Instant::now() < deadline,
+                "the ingress never reached a stalled full state"
+            );
+        }
+
+        assert!(
+            pool.available() > 0,
+            "the response-slot pool was exhausted before the ingress was full \
+             (accepted {})",
+            tickets.len()
+        );
+
+        gate.open();
+        shared.close();
+        drop(submitter);
+        drop(tickets);
+        matching_handle.join().expect("matching thread");
+        journal_handle.join().expect("journal thread");
+    }
+
     #[test]
     fn watermark_advances_only_after_append_batch_returns() {
         let gate = Gate::default();
@@ -701,7 +912,7 @@ mod tests {
             journal_flush_interval: Duration::from_secs(10),
             ..config()
         };
-        let (submitter, shared, journal_handle, matching_handle) =
+        let (submitter, _pool, shared, journal_handle, matching_handle) =
             spawn_runtime(log.clone(), config, None);
 
         let ticket = submitter.submit(command(1)).expect("submit");
@@ -731,7 +942,7 @@ mod tests {
             journal_flush_interval: Duration::from_secs(10),
             ..config()
         };
-        let (submitter, shared, journal_handle, matching_handle) =
+        let (submitter, _pool, shared, journal_handle, matching_handle) =
             spawn_runtime(SpyLog::panicking_on_first(), config, None);
 
         let ticket = submitter.submit(command(1)).expect("submit");
@@ -764,7 +975,7 @@ mod tests {
             metrics: Some(Arc::clone(&metrics)),
             ..config()
         };
-        let (submitter, shared, journal_handle, matching_handle) =
+        let (submitter, _pool, shared, journal_handle, matching_handle) =
             spawn_runtime(SpyLog::default(), config, Some(Arc::clone(&metrics)));
 
         let tickets = (1..=5)

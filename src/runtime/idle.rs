@@ -23,7 +23,7 @@ pub const BACKOFF_PARK: Duration = Duration::from_micros(50);
 
 /// Mutable idle state owned by the matching thread.
 #[derive(Debug, Clone)]
-pub struct Idle {
+pub(crate) struct Idle {
     strategy: IdleStrategy,
     spins: u32,
 }
@@ -31,10 +31,6 @@ pub struct Idle {
 impl Idle {
     pub fn new(strategy: IdleStrategy) -> Self {
         Self { strategy, spins: 0 }
-    }
-
-    pub fn strategy(&self) -> IdleStrategy {
-        self.strategy
     }
 
     /// Call after making progress, so the next wait starts in the spin phase.

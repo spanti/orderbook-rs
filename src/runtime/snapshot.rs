@@ -11,17 +11,13 @@
 //! observability but never fails an already-durable command.
 
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use crate::durable::{DurableError, FORMAT_VERSION, SnapshotStore, StoredSnapshot};
 use crate::engine::MatchingEngine;
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
+use super::sync::lock;
 
 /// Outcome of offering a best-effort snapshot to the worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +44,7 @@ struct SnapshotJob {
 #[derive(Clone)]
 pub(crate) struct SnapshotSink {
     sender: SyncSender<SnapshotJob>,
+    #[cfg_attr(not(test), allow(dead_code))]
     last_error: Arc<Mutex<Option<DurableError>>>,
 }
 
@@ -80,6 +77,7 @@ impl SnapshotSink {
     }
 
     /// The last snapshot save failure observed by the worker, if any.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn last_error(&self) -> Option<DurableError> {
         lock(&self.last_error).clone()
     }

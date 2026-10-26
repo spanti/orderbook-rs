@@ -57,28 +57,77 @@ pub struct SloReport {
     pub durable: SloCheck,
 }
 
+/// Whether an SLO can be judged in this run's setup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SloStatus {
+    /// p99 met the target and the run had no queue-full refusals.
+    Pass,
+    /// p99 missed the target, or the run observed at least one queue-full
+    /// refusal.
+    Fail,
+    /// The measurement cannot judge this SLO in the current setup (for
+    /// example, the durable SLO with an in-memory log).
+    NotApplicable,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SloCheck {
     pub target_ns: u64,
     pub p50: u64,
     pub p99: u64,
     pub p99_9: u64,
-    pub passed: bool,
+    /// Queue-full refusals over the same measured window.
+    pub queue_full: u64,
+    pub status: SloStatus,
 }
 
 impl SloCheck {
-    pub fn new(summary: Summary, target_ns: u64) -> Self {
+    /// Judge one SLO. `queue_full` must be zero for a PASS: a refusal means
+    /// the producer could not sustain the offered rate, so the measured
+    /// latency does not describe the acceptance workload.
+    pub fn new(summary: Summary, target_ns: u64, queue_full: u64) -> Self {
+        let status = if summary.p99 <= target_ns && queue_full == 0 {
+            SloStatus::Pass
+        } else {
+            SloStatus::Fail
+        };
         Self {
             target_ns,
             p50: summary.p50,
             p99: summary.p99,
             p99_9: summary.p99_9,
-            passed: summary.p99 <= target_ns,
+            queue_full,
+            status,
+        }
+    }
+
+    /// Mark the SLO as unjudgeable by this setup while still reporting the
+    /// observed percentiles.
+    pub fn not_applicable(summary: Summary, target_ns: u64, queue_full: u64) -> Self {
+        Self {
+            target_ns,
+            p50: summary.p50,
+            p99: summary.p99,
+            p99_9: summary.p99_9,
+            queue_full,
+            status: SloStatus::NotApplicable,
         }
     }
 
     fn label(&self) -> &'static str {
-        if self.passed { "PASS" } else { "FAIL" }
+        match self.status {
+            SloStatus::Pass => "PASS",
+            SloStatus::Fail => "FAIL",
+            SloStatus::NotApplicable => "NOT APPLICABLE",
+        }
+    }
+
+    fn status_json(&self) -> &'static str {
+        match self.status {
+            SloStatus::Pass => "pass",
+            SloStatus::Fail => "fail",
+            SloStatus::NotApplicable => "not_applicable",
+        }
     }
 }
 
@@ -315,9 +364,16 @@ impl BenchReport {
             write_slo_row(&mut out, "submit -> durable", runtime.slo.durable);
             writeln!(
                 out,
-                "note: SLOs are defined for Linux release runs with --idle spin, a pinned matching core, in-memory applied latency, and FileCommandLog on NVMe for durable latency; the pass/fail line is informational elsewhere"
+                "note: SLO setup requires a Linux release build, --idle spin, a pinned matching core, and FileCommandLog on NVMe for the durable level; queue_full must be 0 for a PASS"
             )
             .expect("writing to a String cannot fail");
+            if self.config.log == LogKind::Memory {
+                writeln!(
+                    out,
+                    "note: the durable SLO is NOT APPLICABLE with --log memory; rerun with --log file on NVMe to judge it"
+                )
+                .expect("writing to a String cannot fail");
+            }
         }
 
         writeln!(
@@ -602,12 +658,13 @@ fn write_metric_row(out: &mut String, label: &str, metric: LatencyMetric) {
 fn write_slo_row(out: &mut String, label: &str, check: SloCheck) {
     writeln!(
         out,
-        "  {:<16} p50={} p99={} p99.9={} target={} ns  {}",
+        "  {:<16} p50={} p99={} p99.9={} target={} ns  queue_full={}  {}",
         label,
         commas(check.p50),
         commas(check.p99),
         commas(check.p99_9),
         commas(check.target_ns),
+        commas(check.queue_full),
         check.label()
     )
     .expect("writing to a String cannot fail");
@@ -692,15 +749,13 @@ fn write_json_metric(out: &mut String, name: &str, metric: LatencyMetric, traili
 fn write_json_slo_fields(out: &mut String, check: SloCheck, indent: &str) {
     writeln!(out, "{indent}\"target_ns\": {},", check.target_ns)
         .expect("writing to a String cannot fail");
+    writeln!(out, "{indent}\"queue_full\": {},", check.queue_full)
+        .expect("writing to a String cannot fail");
     writeln!(out, "{indent}\"p50\": {},", check.p50).expect("writing to a String cannot fail");
     writeln!(out, "{indent}\"p99\": {},", check.p99).expect("writing to a String cannot fail");
     writeln!(out, "{indent}\"p99_9\": {},", check.p99_9).expect("writing to a String cannot fail");
-    writeln!(
-        out,
-        "{indent}\"passed\": {}",
-        if check.passed { "true" } else { "false" }
-    )
-    .expect("writing to a String cannot fail");
+    writeln!(out, "{indent}\"status\": \"{}\"", check.status_json())
+        .expect("writing to a String cannot fail");
 }
 
 fn commas(value: u64) -> String {
@@ -740,6 +795,58 @@ fn depth_count(value: u64, capped: bool) -> String {
         format!(">={}", commas(value))
     } else {
         commas(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bench::stats::Summary;
+
+    fn fast() -> Summary {
+        Summary {
+            count: 100,
+            p50: 1,
+            p99: 2,
+            p99_9: 3,
+            mean: 1,
+            max: 3,
+        }
+    }
+
+    #[test]
+    fn slo_pass_requires_zero_queue_full() {
+        assert_eq!(SloCheck::new(fast(), 10, 0).status, SloStatus::Pass);
+        assert_eq!(
+            SloCheck::new(fast(), 10, 1).status,
+            SloStatus::Fail,
+            "a queue-full refusal invalidates a latency PASS"
+        );
+        assert_eq!(
+            SloCheck::new(fast(), 1, 0).status,
+            SloStatus::Fail,
+            "p99 above the target fails"
+        );
+        assert_eq!(
+            SloCheck::not_applicable(fast(), 10, 0).status,
+            SloStatus::NotApplicable
+        );
+    }
+
+    #[test]
+    fn slo_labels_render_pass_fail_and_not_applicable() {
+        assert_eq!(SloCheck::new(fast(), 10, 0).label(), "PASS");
+        assert_eq!(SloCheck::new(fast(), 10, 1).label(), "FAIL");
+        assert_eq!(
+            SloCheck::not_applicable(fast(), 10, 0).label(),
+            "NOT APPLICABLE"
+        );
+        assert_eq!(SloCheck::new(fast(), 10, 0).status_json(), "pass");
+        assert_eq!(SloCheck::new(fast(), 10, 1).status_json(), "fail");
+        assert_eq!(
+            SloCheck::not_applicable(fast(), 10, 0).status_json(),
+            "not_applicable"
+        );
     }
 }
 

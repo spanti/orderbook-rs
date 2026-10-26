@@ -20,11 +20,11 @@ pub struct CommandEnvelope {
     pub enqueued_at: Option<Instant>,
     pub command: EngineCommand,
     /// The response slot the ticket observes; moved to the worker.
-    pub slot: SlotHandle,
+    pub(crate) slot: SlotHandle,
 }
 
 impl CommandEnvelope {
-    pub fn new(
+    pub(crate) fn new(
         request_id: u64,
         enqueued_at: Option<Instant>,
         command: EngineCommand,

@@ -55,8 +55,12 @@ Command 从提交方到达撮合线程所经过的瞬态通道。命令离开队
 _Avoid_: 队列、buffer、command buffer
 
 **Command Envelope** / 命令信封:
-Command 在 Command Queue 中的载体，同时携带回执凭据。
+Command 在 Command Queue 中的载体，同时携带 Request Id 与回执凭据。
 _Avoid_: request、message
+
+**Request Id** / 请求标识:
+提交方为一次 Command 附加的、用于观测与追踪的标识。它不是幂等键：引擎不据此去重，也不把它纳入恢复状态。
+_Avoid_: request（request 专指命令内携带的参数载体）、client order id
 
 **Ticket** / 回执凭据:
 命令入队后交给提交方的凭据，用于取得该命令的处理结果。

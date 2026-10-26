@@ -19,7 +19,7 @@ use orderbook_rs::durable::{
 use orderbook_rs::engine::MatchingEngine;
 use orderbook_rs::runtime::{
     CommandReceipt, EngineHandle, EngineRuntime, RuntimeConfig, RuntimeError, RuntimeMetrics,
-    SubmitError, Ticket, enqueued_at_for_test, start_with_matching_panic_for_test,
+    SubmitError, Ticket, Worker, enqueued_at_for_test, start_with_matching_panic_for_test,
 };
 use orderbook_rs::types::{
     CommandOutcome, EngineCommand, EngineConfig, EngineError, ModifyRequest, OrderRequest,
@@ -878,7 +878,7 @@ fn journal_panic_fails_every_waiter_and_the_runtime_closed() {
 
     let result = runtime.shutdown();
     assert!(
-        matches!(result, Err(RuntimeError::WorkerPanicked("journal"))),
+        matches!(result, Err(RuntimeError::WorkerPanicked(Worker::Journal))),
         "shutdown must report the journal panic, got {result:?}"
     );
 }
@@ -916,10 +916,16 @@ fn metrics_counts_and_latencies_are_internally_consistent() {
     assert_eq!(metrics.batch_records_sum(), N);
     assert!(metrics.batch_count() >= 1);
     assert!(metrics.journal_append_count() >= 1);
-    // The implementation publishes ingress depth just after `try_send`; a
-    // consumer that dequeues first makes the raw depth gauge briefly wrap, so
-    // only the observed lower bound is a stable contract here.
+    // The ingress depth is incremented before the send and decremented with
+    // saturation after a dequeue, so the gauge is bounded by the ingress
+    // capacity plus the single submitting thread and can never wrap.
+    let queue_capacity = 1024u64;
     assert!(metrics.queue_depth_max() >= 1);
+    assert!(
+        metrics.queue_depth_max() <= queue_capacity + 1,
+        "queue depth {} exceeded the bounded ingress",
+        metrics.queue_depth_max()
+    );
 
     // Each sum accumulates at least one sample, so it bounds that sample's max.
     // u64 durations are non-negative by construction.
@@ -1074,7 +1080,7 @@ fn matching_thread_panic_unblocks_every_waiter_and_is_reported() {
 
     let result = runtime.shutdown();
     assert!(
-        matches!(result, Err(RuntimeError::WorkerPanicked("matching"))),
+        matches!(result, Err(RuntimeError::WorkerPanicked(Worker::Matching))),
         "shutdown must report the matching panic, got {result:?}"
     );
 }

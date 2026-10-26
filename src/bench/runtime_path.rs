@@ -12,7 +12,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::durable::{
     CommandLog, FileCommandLog, FileSnapshotStore, InMemoryCommandLog, InMemorySnapshotStore,
@@ -20,7 +20,7 @@ use crate::durable::{
 };
 use crate::engine::MatchingEngine;
 use crate::runtime::{
-    EngineHandle, EngineRuntime, RuntimeConfig, RuntimeError, RuntimeMetrics, SubmitError, Ticket,
+    EngineHandle, EngineRuntime, RuntimeError, RuntimeMetrics, SubmitError, Ticket,
 };
 use crate::types::{EngineCommand, EngineConfig};
 
@@ -31,15 +31,13 @@ use super::report::{
 };
 use super::run::{
     book_prices, command_from_action, count_depth, duration_ns, intended_time, ns_between, pace,
-    record_workload,
+    record_workload, symbol_list,
 };
 use super::stats::Samples;
-use super::workload::{Action, CommandKind, SYMBOL_PREFIX, Workload};
+use super::workload::{Action, CommandKind, Workload};
 
 pub(crate) fn run_runtime(config: &BenchConfig) -> Result<BenchReport, BenchError> {
-    let symbols: Vec<String> = (0..config.symbols)
-        .map(|index| format!("{SYMBOL_PREFIX}{index}"))
-        .collect();
+    let symbols = symbol_list(config.symbols);
     let metrics = Arc::new(RuntimeMetrics::new());
     let (handle, runtime) = create_runtime(config, metrics.clone())?;
 
@@ -145,8 +143,15 @@ pub(crate) fn run_runtime(config: &BenchConfig) -> Result<BenchReport, BenchErro
         applied_count: delta.applied,
         durable_count: delta.durable,
         slo: SloReport {
-            applied: SloCheck::new(applied_all, APPLIED_SLO_NS),
-            durable: SloCheck::new(durable_all, DURABLE_SLO_NS),
+            applied: SloCheck::new(applied_all, APPLIED_SLO_NS, delta.queue_full),
+            // The durable SLO is defined against FileCommandLog on NVMe. An
+            // in-memory log cannot exercise fsync, so reporting PASS/FAIL there
+            // would be a false claim.
+            durable: if config.log == LogKind::Memory {
+                SloCheck::not_applicable(durable_all, DURABLE_SLO_NS, delta.queue_full)
+            } else {
+                SloCheck::new(durable_all, DURABLE_SLO_NS, delta.queue_full)
+            },
         },
     };
 
@@ -181,18 +186,7 @@ fn create_runtime(
     config: &BenchConfig,
     metrics: Arc<RuntimeMetrics>,
 ) -> Result<(EngineHandle, EngineRuntime), BenchError> {
-    let runtime_config = RuntimeConfig {
-        queue_capacity: config.queue_capacity,
-        journal_batch_capacity: config.journal_batch_capacity,
-        apply_batch_max: config.apply_batch_max,
-        journal_coalesce_max: config.journal_coalesce_max,
-        journal_flush_interval: Duration::from_micros(config.journal_flush_us),
-        snapshot_cadence: config.snapshot_cadence,
-        idle: config.idle,
-        matching_core: config.affinity,
-        metrics: Some(metrics),
-        ..RuntimeConfig::default()
-    };
+    let runtime_config = config.runtime_config(metrics);
 
     let (log, snapshots): (Box<dyn CommandLog>, Box<dyn SnapshotStore>) = match config.log {
         LogKind::Memory => (

@@ -162,6 +162,30 @@ pub fn default_warmup(events: u64) -> u64 {
 }
 
 impl BenchConfig {
+    /// Convert the bench's flat tuning flags into the runtime's tuning type.
+    ///
+    /// This is the single conversion point. The CLI keeps a flat flag surface
+    /// (one flag per tuning value) so the help text, argument parser, and
+    /// report stay stable; only this method maps those values onto
+    /// [`crate::runtime::RuntimeConfig`].
+    pub fn runtime_config(
+        &self,
+        metrics: std::sync::Arc<crate::runtime::RuntimeMetrics>,
+    ) -> crate::runtime::RuntimeConfig {
+        crate::runtime::RuntimeConfig {
+            queue_capacity: self.queue_capacity,
+            journal_batch_capacity: self.journal_batch_capacity,
+            apply_batch_max: self.apply_batch_max,
+            journal_coalesce_max: self.journal_coalesce_max,
+            journal_flush_interval: std::time::Duration::from_micros(self.journal_flush_us),
+            snapshot_cadence: self.snapshot_cadence,
+            idle: self.idle,
+            matching_core: self.affinity,
+            metrics: Some(metrics),
+            ..crate::runtime::RuntimeConfig::default()
+        }
+    }
+
     pub fn validate(&self) -> Result<(), BenchError> {
         if self.events == 0 {
             return Err(BenchError::usage("--events must be greater than 0"));
@@ -670,6 +694,40 @@ mod tests {
         config.apply_batch_max = 64;
         config.journal_coalesce_max = 0;
         assert!(matches!(config.validate(), Err(BenchError::Usage(_))));
+    }
+
+    #[test]
+    fn runtime_config_conversion_maps_every_tuning_field() {
+        let mut config = BenchConfig::default();
+        config.queue_capacity = 2048;
+        config.journal_batch_capacity = 32;
+        config.apply_batch_max = 16;
+        config.journal_coalesce_max = 512;
+        config.journal_flush_us = 55;
+        config.idle = IdleStrategy::Backoff;
+        config.affinity = Some(3);
+        config.snapshot_cadence = 1_000;
+
+        let metrics = std::sync::Arc::new(crate::runtime::RuntimeMetrics::new());
+        let runtime = config.runtime_config(std::sync::Arc::clone(&metrics));
+
+        assert_eq!(runtime.queue_capacity, 2048);
+        assert_eq!(runtime.journal_batch_capacity, 32);
+        assert_eq!(runtime.apply_batch_max, 16);
+        assert_eq!(runtime.journal_coalesce_max, 512);
+        assert_eq!(
+            runtime.journal_flush_interval,
+            std::time::Duration::from_micros(55)
+        );
+        assert_eq!(runtime.idle, IdleStrategy::Backoff);
+        assert_eq!(runtime.matching_core, Some(3));
+        assert_eq!(runtime.snapshot_cadence, 1_000);
+        assert!(
+            runtime
+                .metrics
+                .as_ref()
+                .is_some_and(|sink| std::sync::Arc::ptr_eq(sink, &metrics))
+        );
     }
 
     #[test]

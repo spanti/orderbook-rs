@@ -30,7 +30,7 @@ pub struct CommandReceipt {
 /// record is confirmed in the command log. `stopped` unblocks waiters when a
 /// worker disappears before both results are written.
 #[derive(Debug, Default)]
-pub struct SlotState {
+pub(crate) struct SlotState {
     pub applied: Option<Result<CommandReceipt, RuntimeError>>,
     pub durable: Option<Result<(), RuntimeError>>,
     pub stopped: bool,
@@ -49,7 +49,7 @@ impl SlotState {
 
 /// One pre-allocated response slot: a mutex-protected state plus a condvar.
 #[derive(Debug)]
-pub struct ResponseSlot {
+pub(crate) struct ResponseSlot {
     state: Mutex<SlotState>,
     ready: Condvar,
 }
@@ -64,9 +64,7 @@ impl ResponseSlot {
     }
 
     fn lock(&self) -> MutexGuard<'_, SlotState> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        super::sync::lock(&self.state)
     }
 
     /// Write the applied acknowledgement and wake every waiter.
@@ -80,13 +78,6 @@ impl ResponseSlot {
     pub fn set_durable(&self, result: Result<(), RuntimeError>) {
         let mut state = self.lock();
         state.durable = Some(result);
-        self.ready.notify_all();
-    }
-
-    /// Unblock waiters with [`RuntimeError::EngineStopped`].
-    pub fn stop(&self) {
-        let mut state = self.lock();
-        state.stopped = true;
         self.ready.notify_all();
     }
 
@@ -107,7 +98,7 @@ impl Default for ResponseSlot {
 /// Dropping it before both results are written marks the slot stopped, so a
 /// panicking or aborting worker never leaves a caller waiting forever.
 #[derive(Debug)]
-pub struct SlotHandle {
+pub(crate) struct SlotHandle {
     slot: Arc<ResponseSlot>,
     _lease: Option<Arc<SlotLease>>,
 }
@@ -118,7 +109,8 @@ impl SlotHandle {
     /// Handles created this way do not belong to a pool. Runtime envelopes use
     /// [`SlotPool::checkout`], which keeps the slot reserved until both sides
     /// are dropped.
-    pub fn new(slot: Arc<ResponseSlot>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(slot: Arc<ResponseSlot>) -> Self {
         Self { slot, _lease: None }
     }
 
@@ -137,6 +129,7 @@ impl SlotHandle {
         self.slot.set_durable(result);
     }
 
+    #[cfg(test)]
     pub fn slot(&self) -> &Arc<ResponseSlot> {
         &self.slot
     }
@@ -201,7 +194,7 @@ impl SlotPoolInner {
 /// exhausted pool reports `None`; callers map that to
 /// [`crate::runtime::SubmitError::QueueFull`].
 #[derive(Debug, Clone)]
-pub struct SlotPool {
+pub(crate) struct SlotPool {
     inner: Arc<SlotPoolInner>,
 }
 
@@ -226,18 +219,45 @@ impl SlotPool {
         Self::new(Self::capacity_for(config))
     }
 
-    /// The spec's fixed capacity:
-    /// `queue_capacity + journal_batch_capacity * apply_batch_max + 64`.
+    /// A conservative bound on every command that can be applied but not yet
+    /// durable, plus the ingress queue and slack.
+    ///
+    /// The lead is larger than the journal channel alone:
+    ///
+    /// - ingress queue: `queue_capacity`;
+    /// - journal batch channel: `journal_batch_capacity * apply_batch_max`;
+    /// - the group the journal thread is currently appending:
+    ///   `journal_coalesce_max`;
+    /// - the matching thread's journal buffer: `apply_batch_max`;
+    /// - the journal thread's split remainder: `apply_batch_max` (at most
+    ///   `apply_batch_max - 1`, rounded up);
+    /// - `64` slots of concurrency slack for producers between checkout and a
+    ///   completed `try_send`.
+    ///
+    /// A pool smaller than this could report `QueueFull` while the ingress is
+    /// still accepting commands, which would make the two overload signals
+    /// indistinguishable.
     pub fn capacity_for(config: &RuntimeConfig) -> usize {
-        config.queue_capacity + config.journal_batch_capacity * config.apply_batch_max + 64
+        let queue_capacity = config.queue_capacity.max(1);
+        let apply_batch_max = config.apply_batch_max.max(1);
+        let journal_batch_capacity = config.journal_batch_capacity.max(1);
+        let journal_coalesce_max = config.journal_coalesce_max.max(1);
+
+        queue_capacity
+            .saturating_add(journal_batch_capacity.saturating_mul(apply_batch_max))
+            .saturating_add(journal_coalesce_max)
+            .saturating_add(apply_batch_max.saturating_mul(2))
+            .saturating_add(64)
     }
 
     /// Total number of slots, checked out or free.
+    #[cfg(test)]
     pub fn capacity(&self) -> usize {
         self.inner.slots.len()
     }
 
     /// Number of slots currently free for checkout.
+    #[cfg(test)]
     pub fn available(&self) -> usize {
         self.inner
             .free
@@ -278,7 +298,8 @@ impl Ticket {
     ///
     /// Tickets created this way do not belong to a pool; runtime producers use
     /// [`SlotPool::checkout`].
-    pub fn new(slot: Arc<ResponseSlot>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(slot: Arc<ResponseSlot>) -> Self {
         Self { slot, _lease: None }
     }
 
@@ -600,15 +621,51 @@ mod tests {
         config.queue_capacity = 10;
         config.journal_batch_capacity = 3;
         config.apply_batch_max = 4;
+        config.journal_coalesce_max = 7;
 
-        assert_eq!(SlotPool::capacity_for(&config), 10 + 3 * 4 + 64);
+        // ingress + journal channel + coalesced group + buffer + carry + slack
+        assert_eq!(SlotPool::capacity_for(&config), 10 + 3 * 4 + 7 + 2 * 4 + 64);
 
         let pool = SlotPool::from_config(&config);
-        assert_eq!(pool.capacity(), 86);
-        assert_eq!(pool.available(), 86);
+        assert_eq!(pool.capacity(), 10 + 12 + 7 + 8 + 64);
+        assert_eq!(pool.available(), pool.capacity());
+
+        // A zero queue capacity still gets a one-slot channel; the pool must
+        // account for the same effective capacity.
+        config.queue_capacity = 0;
+        assert_eq!(SlotPool::capacity_for(&config), 1 + 12 + 7 + 8 + 64);
 
         let defaults = SlotPool::from_config(&crate::runtime::RuntimeConfig::default());
-        assert_eq!(defaults.capacity(), 1024 + 64 * 64 + 64);
+        assert_eq!(defaults.capacity(), 1024 + 64 * 64 + 1024 + 2 * 64 + 64);
+    }
+
+    #[test]
+    fn pool_covers_the_full_applied_but_not_durable_lead() {
+        let config = crate::runtime::RuntimeConfig::default();
+        let pool = SlotPool::from_config(&config);
+
+        // The worst case the runtime can reach without the ingress being full:
+        // the journal channel, the coalesced group being appended, the
+        // matching buffer, and the split remainder.
+        let worst_case = config.queue_capacity
+            + config.journal_batch_capacity * config.apply_batch_max
+            + config.journal_coalesce_max
+            + 2 * config.apply_batch_max;
+
+        let held = (0..worst_case)
+            .map(|_| {
+                pool.checkout()
+                    .expect("the pool covers the worst-case lead")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            pool.available(),
+            64,
+            "only the documented concurrency slack remains"
+        );
+        drop(held);
+        assert_eq!(pool.available(), pool.capacity());
     }
 
     #[test]
