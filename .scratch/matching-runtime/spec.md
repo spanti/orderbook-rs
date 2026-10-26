@@ -105,7 +105,7 @@ Use the glossary terms: Command Queue, Command Envelope, Ticket, Matching Thread
 - **Snapshot Worker** owns the `SnapshotStore`. It receives `StoredSnapshot` jobs and saves them.
 - **Producers** only hold `EngineHandle` clones.
 - Ingress: `std::sync::mpsc::sync_channel(queue_capacity)` of `CommandEnvelope`; producers use `try_send`. `queue_capacity` default 1024.
-- Journal input: `sync_channel(journal_batch_capacity)` of `Vec<CommandRecord>`; `journal_batch_capacity` default 64 batches. The maximum number of records that may be applied but not yet handed to the journal is `journal_batch_capacity * apply_batch_max`; `apply_batch_max` default 64.
+- Journal input: `sync_channel(journal_batch_capacity)` of `Vec<CommandRecord>`; `journal_batch_capacity` default 64 batches. The maximum number of records that may be applied but not yet handed to the journal is `journal_batch_capacity * apply_batch_max` in the channel plus up to `apply_batch_max` in the matching thread's buffer; `apply_batch_max` default 64.
 - Snapshot jobs: `sync_channel(1)`; a full channel keeps the snapshot due and retries at a later durability boundary rather than blocking or growing. Automatic snapshots are best effort and never stall matching.
 - Shared state: `Arc<AtomicBool>` closed, `Arc<AtomicBool>` failed, `Arc<Mutex<Option<DurableError>>>` fatal error, `Arc<AtomicU64>` applied sequence, `Arc<AtomicU64>` durable watermark, a shutdown deadline plus timed-out flag (bounded shutdown), an ingress-depth counter used only for metrics, `Arc<RuntimeMetrics>` optional, and the response-slot pool.
 
@@ -159,13 +159,15 @@ pub struct CommandReceipt {
 
 pub enum SubmitError { QueueFull, Shutdown, EngineFailed(DurableError) }
 
+pub enum Worker { Matching, Journal, Snapshot }
+
 pub enum RuntimeError {
     EngineFailed(DurableError),
     QueueFull,
     Shutdown,
     EngineStopped,
     Timeout,
-    WorkerPanicked(&'static str),
+    WorkerPanicked(Worker),
     SnapshotFailed(DurableError),
     Startup(String),
 }
@@ -188,7 +190,7 @@ impl From<SubmitError> for RuntimeError {
 
 ### Response slots
 
-- At startup, pre-allocate `queue_capacity + journal_batch_capacity * apply_batch_max + 64` response slots. Each slot has a `Mutex<SlotState>` + `Condvar`; no per-command allocation is performed by the runtime.
+- At startup, pre-allocate `queue_capacity + journal_batch_capacity * apply_batch_max + journal_coalesce_max + 2 * apply_batch_max + 64` response slots. The terms cover the ingress queue, the journal channel, the group the journal thread is appending, the matching journal buffer, the journal split remainder, and 64 slots of producer concurrency slack. The pool therefore cannot exhaust before the ingress queue is genuinely full. Each slot has a `Mutex<SlotState>` + `Condvar`; no per-command allocation is performed by the runtime.
 - `SlotState` holds `applied: Option<Result<CommandReceipt, RuntimeError>>`, `durable: Option<Result<(), RuntimeError>>`, and `stopped: bool`.
 - The producer checks out a slot from a free list; if none is available, `try_submit` returns `QueueFull` and increments the QueueFull metric.
 - The worker writes the applied result and notifies; later it marks durability and notifies. `wait_durable` returns the stored applied receipt when durability succeeds.
@@ -221,7 +223,7 @@ impl From<SubmitError> for RuntimeError {
 
 ### Journal Thread and group commit
 
-- Receive one `Vec<CommandRecord>` (blocking `recv`), then drain further batches with `try_recv` until `journal_coalesce_max` records or the channel is momentarily empty.
+- Receive one `Vec<CommandRecord>` (blocking `recv`), then drain further batches with `try_recv` until `journal_coalesce_max` records or the channel is momentarily empty. A handoff that would push the group over the cap is split at the cap; its remainder is carried in the journal thread and appended in order in the next group, so every `append_batch`/fsync covers at most `journal_coalesce_max` records.
 - Call `CommandLog::append_batch(records)`. On success, store the highest sequence into the durability watermark with `Release` and `unpark` the matching thread. On failure, store the error, set failed, `unpark` the matching thread, and exit.
 - Record journal append duration and append count in metrics. Batch size and batch count are recorded once by the matching thread at handoff, so coalesced groups are not double-counted.
 - `CommandLog` gains `append_batch` and the supertraits `Send + 'static`:
@@ -244,15 +246,15 @@ pub trait CommandLog: Send + 'static {
 - `applied_seq` is the last command applied; `durable_seq` is the last command confirmed durable. Always `durable_seq <= applied_seq`.
 - The matching thread never confirms `wait_durable` before `durable_seq >= receipt.command_sequence`.
 - On journal failure, every pending-durable command receives `Err(EngineFailed(...))`; every queued-but-not-applied envelope receives `Err(EngineFailed(...))` for both levels. New submissions return `SubmitError::EngineFailed`.
-- On matching-thread panic, the response-slot handles drop and mark slots `stopped`; all waiters return `EngineStopped`. `shutdown`/join reports `WorkerPanicked("matching")`.
-- On journal-thread panic, the matching thread observes a disconnected journal channel or the failed flag and fail-stops; `shutdown` reports `WorkerPanicked("journal")`.
-- On snapshot-worker panic, automatic snapshots stop; durable commands are unaffected and `shutdown` reports `WorkerPanicked("snapshot")`.
+- On matching-thread panic, the response-slot handles drop and mark slots `stopped`; all waiters return `EngineStopped`. `shutdown`/join reports `WorkerPanicked(Worker::Matching)`.
+- On journal-thread panic, the matching thread observes a disconnected journal channel or the failed flag and fail-stops; `shutdown` reports `WorkerPanicked(Worker::Journal)`.
+- On snapshot-worker panic, automatic snapshots stop; durable commands are unaffected and `shutdown` reports `WorkerPanicked(Worker::Snapshot)`.
 
 ### Snapshot gate and Snapshot Worker
 
 - Automatic snapshots run when `snapshot_cadence > 0`, `applied_seq > 0`, `applied_seq % snapshot_cadence == 0`, and `applied_seq == durable_seq`.
 - If the cadence boundary is reached while `applied_seq > durable_seq`, set `snapshot_due` and stop draining new commands until `durable_seq == applied_seq`; then capture and resume. This is a deliberate, infrequent pause: without it, a continuously loaded engine could starve snapshots forever because applied always leads durable.
-- Capture `engine.capture_snapshot()` on the matching thread, build `StoredSnapshot { format_version, applied_seq, snapshot }`, and `try_send` it to the snapshot worker. If the worker's channel is full, keep the snapshot due and retry at a later durability boundary without pausing intake; snapshots are best effort and never stall matching.
+- Capture `engine.capture_snapshot()` on the matching thread, build `StoredSnapshot { format_version, applied_seq, snapshot }`, and `try_send` it to the snapshot worker. If the worker's channel is full, keep the snapshot due and retry at the next cadence boundary without pausing intake; an automatic snapshot is never captured off-cadence. Snapshots are best effort and never stall matching.
 - Track `last_snapshot_seq` so a boundary is not captured repeatedly.
 - The snapshot worker calls `SnapshotStore::save`. Failures are stored in a shared `last_snapshot_error` and never fail an already-durable command.
 - Explicit `shutdown` waits for `durable_seq == applied_seq` (bounded by `shutdown_timeout`), captures a final snapshot regardless of cadence, and waits for the worker to save it. A final snapshot failure is returned as `SnapshotFailed`.
@@ -260,7 +262,7 @@ pub trait CommandLog: Send + 'static {
 
 ### Recovery and the synchronous façade
 
-- Extract the existing `DurableMatchingEngine::open` logic into a shared helper returning `(MatchingEngine, EngineConfig, applied_seq, durable_seq, next_command_sequence)`. `DurableMatchingEngine::open` delegates to it and keeps append-before-apply.
+- Extract the existing `DurableMatchingEngine::open` logic into a shared helper returning `(MatchingEngine, CommandCursor)` where `CommandCursor` bundles `applied_seq`, `durable_seq`, and `next_command_sequence`. `DurableMatchingEngine::open` delegates to it and keeps append-before-apply; the matching runtime passes the same cursor to startup and the matching thread.
 - `EngineRuntime::open` calls the helper, clears replayed events, then moves the engine to the matching thread, the log to the journal thread, and the snapshot store to the snapshot worker.
 - `EngineRuntime::create` writes the log header and starts from an empty engine (`applied_seq = 0`, `durable_seq = 0`, `next_command_sequence = 1`).
 - Recovery keeps every existing check: missing header, unsupported version, config mismatch, recovery gap, snapshot ahead, non-contiguous sequence, corrupt record.

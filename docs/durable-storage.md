@@ -137,18 +137,26 @@ recovery bug.
   (default 1024). `try_submit` rejects with `SubmitError::QueueFull` instead of
   growing without bound; the command is not applied and consumes no sequence.
 - The response-slot pool is pre-allocated with
-  `queue_capacity + journal_batch_capacity * apply_batch_max + 64` slots.
-  Exhausting it is also reported as `QueueFull`, so the hot path never allocates
-  a response channel.
+  `queue_capacity + journal_batch_capacity * apply_batch_max +
+  journal_coalesce_max + 2 * apply_batch_max + 64` slots. The extra terms cover
+  the matching thread's journal buffer and the journal thread's split
+  remainder, not only the journal channel. Exhausting the pool is also reported
+  as `QueueFull`, so the hot path never allocates a response channel. The pool
+  cannot exhaust before the ingress Command Queue is genuinely full, which keeps
+  the two overload signals distinguishable.
 - The journal batch channel holds `journal_batch_capacity` batches (default 64)
   of up to `apply_batch_max` records (default 64). If the journal will not accept
   a flush, the matching thread stops applying; applied state cannot run away from
   the log.
 - The journal coalesces up to `journal_coalesce_max` records (default 1024) per
   `append_batch`/fsync, and `journal_flush_interval` (default 100 µs) bounds how
-  long the first record in a group waits for a flush.
+  long the first record in a group waits for a flush. A handoff larger than the
+  remaining room is split at the cap; its remainder is appended in order in the
+  next group, so no `append_batch`/fsync ever exceeds the cap.
 - The snapshot worker channel holds one job; a full channel is retried, never
-  waited on.
+  waited on. An automatic snapshot is still captured only on a cadence boundary,
+  so a full channel defers it to the next boundary rather than capturing an
+  off-cadence sequence.
 
 ### SLO measurement
 
@@ -160,13 +168,18 @@ clock:
   `--in-flight 1`, `--idle spin`, the matching thread pinned, and
   `queue_full == 0`.
 - `submit -> durable` p99 <= 500 µs at 100k commands/s with `--log file` on
-  NVMe, with the same spin/pinned setup.
+  NVMe, with the same spin/pinned setup and `queue_full == 0`.
 
-The acceptance setup is a Linux release build. The report prints p50/p99/p99.9
-for both levels, the queue-wait, apply-service, durable-wait, and journal-append
-components, the mean batch size, maximum queue depth, `queue_full`, and the fsync
-share (journal append time as a share of durable wait). The PASS/FAIL marker
-compares p99 with the target.
+A PASS requires both `p99 <= target` **and** `queue_full == 0`: a refusal means
+the producer could not sustain the offered rate, so the measured latency does not
+describe the acceptance workload. The required setup is a Linux release build,
+`--idle spin`, a pinned matching core, and `FileCommandLog` on NVMe for the
+durable level. With `--log memory` the durable SLO is marked **NOT APPLICABLE**
+rather than PASS/FAIL, because an in-memory log cannot exercise fsync. The report
+prints p50/p99/p99.9 for both levels, the queue-wait, apply-service, durable-wait,
+and journal-append components, the mean batch size, maximum queue depth,
+`queue_full`, and the fsync share (journal append time as a share of durable
+wait).
 
 **Windows is functional-only.** Its clocks (QPC) typically tick at about 100 ns,
 so sub-tick differences are not meaningful; do not claim the numeric SLOs there.
@@ -178,6 +191,9 @@ These are deliberate gaps relative to an HFT-grade engine; do not describe this
 runtime as HFT-grade until they are closed:
 
 - Ingress is bounded `std::sync::mpsc`, not a custom Disruptor-style ring.
+- The response-slot pool removes per-command channel allocation, but the ingress
+  channel still has bounded internal buffering and synchronization; the command
+  itself may still allocate when constructed by the caller.
 - One journal thread with group commit; no replication and no `io_uring`.
 - Core affinity is opt-in; there is no real-time priority, NUMA control, or
   isolated-core management.

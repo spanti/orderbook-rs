@@ -12,7 +12,7 @@ use orderbook_rs::durable::{
 use orderbook_rs::engine::MatchingEngine;
 use orderbook_rs::runtime::{
     CommandReceipt, EngineHandle, EngineRuntime, RuntimeConfig, RuntimeError, RuntimeMetrics,
-    SubmitError,
+    SubmitError, Worker,
 };
 use orderbook_rs::types::{
     CommandOutcome, EngineCommand, EngineConfig, OrderRequest, OrderType, Side, TimeInForce,
@@ -516,7 +516,7 @@ fn journal_panic_unblocks_waiters_and_fails_closed() {
 
     let result = runtime.shutdown();
     assert!(
-        matches!(result, Err(RuntimeError::WorkerPanicked("journal"))),
+        matches!(result, Err(RuntimeError::WorkerPanicked(Worker::Journal))),
         "shutdown must report the journal panic, got {result:?}"
     );
 }
@@ -599,7 +599,7 @@ fn a_panicking_snapshot_worker_maps_to_worker_panicked() {
 
     let result = runtime.shutdown();
     assert!(
-        matches!(result, Err(RuntimeError::WorkerPanicked("snapshot"))),
+        matches!(result, Err(RuntimeError::WorkerPanicked(Worker::Snapshot))),
         "a snapshot worker panic must surface by name, got {result:?}"
     );
 }

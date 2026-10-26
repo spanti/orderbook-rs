@@ -16,19 +16,22 @@ use std::sync::{Arc, Barrier};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::durable::{CommandLog, DurableError, FORMAT_VERSION, LogHeader, SnapshotStore, recover};
+use crate::durable::{
+    CommandCursor, CommandLog, DurableError, FORMAT_VERSION, LogHeader, SnapshotStore, recover,
+};
 use crate::engine::MatchingEngine;
 use crate::types::{EngineCommand, EngineConfig};
 
 use super::RuntimeConfig;
 use super::envelope::CommandEnvelope;
-use super::error::{RuntimeError, SubmitError};
+use super::error::{RuntimeError, SubmitError, Worker};
 use super::journal::{self, ThreadWaker, Waker};
-use super::matching::{
-    CadenceSnapshotGate, GateDecision, IngressSubmitter, MatchingThread, SharedState, SnapshotGate,
-};
+use super::matching::MatchingThread;
 use super::metrics::RuntimeMetrics;
+use super::shared::SharedState;
 use super::snapshot::{self, SnapshotSink};
+use super::snapshot_gate::{CadenceSnapshotGate, GateDecision, SnapshotGate};
+use super::submitter::IngressSubmitter;
 use super::ticket::{CommandReceipt, SlotPool, Ticket};
 
 /// A cloneable, thread-safe submission handle.
@@ -123,9 +126,7 @@ impl EngineRuntime {
             MatchingEngine::new(engine_config),
             log,
             snapshots,
-            0,
-            0,
-            1,
+            CommandCursor::fresh(),
         )
     }
 
@@ -146,15 +147,7 @@ impl EngineRuntime {
         let mut engine = recovered.engine;
         engine.clear_events();
 
-        Self::start(
-            config,
-            engine,
-            log,
-            snapshots,
-            recovered.applied_seq,
-            recovered.durable_seq,
-            recovered.next_command_sequence,
-        )
+        Self::start(config, engine, log, snapshots, recovered.cursor)
     }
 
     fn start(
@@ -162,18 +155,14 @@ impl EngineRuntime {
         engine: MatchingEngine,
         log: Box<dyn CommandLog>,
         snapshots: Box<dyn SnapshotStore>,
-        applied_seq: u64,
-        durable_seq: u64,
-        next_command_sequence: u64,
+        cursor: CommandCursor,
     ) -> Result<(EngineHandle, Self), RuntimeError> {
         Self::start_with_gate(
             config,
             engine,
             log,
             snapshots,
-            applied_seq,
-            durable_seq,
-            next_command_sequence,
+            cursor,
             CadenceSnapshotGate::new,
         )
     }
@@ -183,24 +172,23 @@ impl EngineRuntime {
     /// The production entry points use [`CadenceSnapshotGate`]; tests inject a
     /// gate that fails on demand so panic propagation can be exercised without
     /// weakening the public API.
-    #[allow(clippy::too_many_arguments)]
     fn start_with_gate<G, F>(
         config: RuntimeConfig,
         engine: MatchingEngine,
         log: Box<dyn CommandLog>,
         snapshots: Box<dyn SnapshotStore>,
-        applied_seq: u64,
-        durable_seq: u64,
-        next_command_sequence: u64,
+        cursor: CommandCursor,
         make_gate: F,
     ) -> Result<(EngineHandle, Self), RuntimeError>
     where
         G: SnapshotGate + 'static,
         F: FnOnce(u64, SnapshotSink) -> G,
     {
-        let durable_seq = Arc::new(AtomicU64::new(durable_seq));
-        let shared = SharedState::with_durable_seq(config.metrics.clone(), durable_seq);
-        shared.publish_applied(applied_seq);
+        let shared = SharedState::with_durable_seq(
+            config.metrics.clone(),
+            Arc::new(AtomicU64::new(cursor.durable_seq)),
+        );
+        shared.publish_applied(cursor.applied_seq);
 
         let (ingress_sender, ingress_receiver) = mpsc::sync_channel(config.queue_capacity.max(1));
         let pool = SlotPool::from_config(&config);
@@ -227,8 +215,7 @@ impl EngineRuntime {
             gate,
             shared.clone(),
             matching_config.clone(),
-            next_command_sequence,
-            applied_seq,
+            cursor,
         );
 
         let matching_handle =
@@ -334,7 +321,7 @@ impl EngineRuntime {
                 // Startup failures are reported by `start_with_gate`; a
                 // runtime that returned successfully always yields an engine.
                 Ok(None) => {}
-                Err(_) => panic_error = Some(RuntimeError::WorkerPanicked("matching")),
+                Err(_) => panic_error = Some(RuntimeError::WorkerPanicked(Worker::Matching)),
             }
         }
 
@@ -372,14 +359,14 @@ impl EngineRuntime {
             && handle.join().is_err()
             && panic_error.is_none()
         {
-            panic_error = Some(RuntimeError::WorkerPanicked("journal"));
+            panic_error = Some(RuntimeError::WorkerPanicked(Worker::Journal));
         }
 
         if let Some(handle) = self.snapshot.take()
             && handle.join().is_err()
             && panic_error.is_none()
         {
-            panic_error = Some(RuntimeError::WorkerPanicked("snapshot"));
+            panic_error = Some(RuntimeError::WorkerPanicked(Worker::Snapshot));
         }
 
         if let Some(error) = panic_error {
@@ -435,9 +422,7 @@ pub fn start_with_matching_panic_for_test(
         MatchingEngine::new(engine_config),
         log,
         snapshots,
-        0,
-        0,
-        1,
+        CommandCursor::fresh(),
         move |_cadence, _sink| PanicAfterBarrierGate {
             start,
             started: false,
@@ -506,7 +491,7 @@ fn bind_matching_core(index: Option<usize>) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::durable::InMemorySnapshotStore;
-    use crate::runtime::matching::GateDecision;
+    use crate::runtime::snapshot_gate::GateDecision;
     use crate::types::{OrderRequest, OrderType, Side, TimeInForce};
     use std::time::Duration;
 
@@ -562,9 +547,7 @@ mod tests {
             MatchingEngine::new(EngineConfig::default()),
             Box::new(crate::durable::InMemoryCommandLog::new()),
             Box::new(InMemorySnapshotStore::new()),
-            0,
-            0,
-            1,
+            CommandCursor::fresh(),
             |_cadence, _sink| PanickingGate { panic_after: 1 },
         )
         .expect("start with the test gate");
@@ -585,7 +568,7 @@ mod tests {
 
         let result = runtime.shutdown();
         assert!(
-            matches!(result, Err(RuntimeError::WorkerPanicked("matching"))),
+            matches!(result, Err(RuntimeError::WorkerPanicked(Worker::Matching))),
             "shutdown must report the matching panic, got {result:?}"
         );
     }

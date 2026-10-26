@@ -26,9 +26,7 @@ pub fn run(config: &BenchConfig) -> Result<BenchReport, BenchError> {
 }
 
 fn run_direct(config: &BenchConfig) -> Result<BenchReport, BenchError> {
-    let symbols: Vec<String> = (0..config.symbols)
-        .map(|index| format!("{SYMBOL_PREFIX}{index}"))
-        .collect();
+    let symbols = symbol_list(config.symbols);
     let mut engine = MatchingEngine::new(EngineConfig::default());
     let mut workload = Workload::new(config);
 
@@ -150,6 +148,13 @@ fn run_direct(config: &BenchConfig) -> Result<BenchReport, BenchError> {
         runtime: None,
         env: EnvInfo::current(),
     })
+}
+
+/// The bench's symbol names, in workload-index order.
+pub(crate) fn symbol_list(count: usize) -> Vec<String> {
+    (0..count)
+        .map(|index| format!("{SYMBOL_PREFIX}{index}"))
+        .collect()
 }
 
 /// Adapt a workload action into the engine's command vocabulary.
@@ -295,6 +300,7 @@ fn scan_side(book: &OrderBook, side: Side) -> (u64, bool) {
 mod tests {
     use super::*;
     use crate::bench::config::{BenchPath, LogKind};
+    use crate::bench::report::SloStatus;
 
     fn tiny_config() -> BenchConfig {
         let mut config = BenchConfig::default();
@@ -488,6 +494,36 @@ mod tests {
         );
         assert!(dir.path().join("commands.log").exists());
         assert!(dir.path().join("snapshots").exists());
+        assert_ne!(
+            report.runtime.as_ref().unwrap().slo.durable.status,
+            SloStatus::NotApplicable,
+            "a file log makes the durable SLO judgeable"
+        );
+    }
+
+    #[test]
+    fn report_marks_the_durable_slo_not_applicable_with_the_memory_log() {
+        let report = run(&tiny_runtime_config()).expect("runtime benchmark run");
+        let runtime = report.runtime.as_ref().expect("runtime report section");
+
+        assert_eq!(
+            runtime.slo.durable.status,
+            SloStatus::NotApplicable,
+            "an in-memory log cannot judge the durable SLO"
+        );
+        assert_eq!(runtime.slo.durable.queue_full, runtime.queue_full);
+
+        let text = report.render_text();
+        assert!(text.contains("NOT APPLICABLE"));
+        assert!(text.contains("Linux release"));
+        assert!(text.contains("--idle spin"));
+        assert!(text.contains("pinned matching core"));
+        assert!(text.contains("NVMe"));
+        assert!(text.contains("queue_full must be 0"));
+
+        let json = report.to_json();
+        assert!(json.contains("\"status\": \"not_applicable\""));
+        assert!(json.contains("\"queue_full\": 0"));
     }
 
     #[test]

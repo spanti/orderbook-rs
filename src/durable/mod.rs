@@ -223,6 +223,36 @@ impl fmt::Debug for DurableMatchingEngine {
     }
 }
 
+/// The three command-sequence values both write paths must agree on.
+///
+/// Recovery, runtime startup, and the matching thread pass this as one value
+/// so the applied, durable, and next sequences cannot drift apart or be
+/// transposed at a call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CommandCursor {
+    /// Last **command** sequence applied to the engine.
+    pub(crate) applied_seq: u64,
+    /// Last **command** sequence known durable.
+    pub(crate) durable_seq: u64,
+    /// Sequence the next applied command will receive.
+    pub(crate) next_command_sequence: u64,
+}
+
+impl CommandCursor {
+    pub(crate) fn new(applied_seq: u64, durable_seq: u64, next_command_sequence: u64) -> Self {
+        Self {
+            applied_seq,
+            durable_seq,
+            next_command_sequence,
+        }
+    }
+
+    /// The cursor for an empty engine whose log has just been created.
+    pub(crate) fn fresh() -> Self {
+        Self::new(0, 0, 1)
+    }
+}
+
 /// Everything recovery restores from one log and snapshot store.
 ///
 /// Both the synchronous [`DurableMatchingEngine`] and the matching runtime
@@ -230,17 +260,7 @@ impl fmt::Debug for DurableMatchingEngine {
 /// recovery checks.
 pub(crate) struct Recovered {
     pub(crate) engine: MatchingEngine,
-    /// Engine config from the log header. The synchronous façade already holds
-    /// one; the matching runtime uses this to start from an empty engine.
-    #[allow(dead_code)]
-    pub(crate) config: EngineConfig,
-    /// Last **command** sequence applied to the engine.
-    pub(crate) applied_seq: u64,
-    /// Last **command** sequence known durable. For this append-before-apply
-    /// path it is the log's tail, or `applied_seq` when the log is empty.
-    #[allow(dead_code)]
-    pub(crate) durable_seq: u64,
-    pub(crate) next_command_sequence: u64,
+    pub(crate) cursor: CommandCursor,
 }
 
 /// Restore engine state from the latest snapshot plus the log tail.
@@ -344,10 +364,7 @@ pub(crate) fn recover(
 
     Ok(Recovered {
         engine,
-        config: header.config,
-        applied_seq,
-        durable_seq,
-        next_command_sequence,
+        cursor: CommandCursor::new(applied_seq, durable_seq, next_command_sequence),
     })
 }
 
@@ -384,19 +401,14 @@ impl DurableMatchingEngine {
         snapshots: Box<dyn SnapshotStore>,
         snapshot_cadence: u64,
     ) -> Result<Self, DurableError> {
-        let Recovered {
-            engine,
-            applied_seq,
-            next_command_sequence,
-            ..
-        } = recover(log.as_ref(), snapshots.as_ref())?;
+        let Recovered { engine, cursor } = recover(log.as_ref(), snapshots.as_ref())?;
 
         Ok(Self {
             engine,
             log,
             snapshots,
-            next_command_sequence,
-            applied_seq,
+            next_command_sequence: cursor.next_command_sequence,
+            applied_seq: cursor.applied_seq,
             snapshot_cadence,
             failed: false,
             last_snapshot_error: None,
@@ -550,10 +562,9 @@ mod tests {
         let log = seeded_log(3);
         let recovered = recover(&log, &InMemorySnapshotStore::new()).unwrap();
 
-        assert_eq!(recovered.config, EngineConfig::default());
-        assert_eq!(recovered.applied_seq, 3);
-        assert_eq!(recovered.durable_seq, 3);
-        assert_eq!(recovered.next_command_sequence, 4);
+        assert_eq!(recovered.cursor.applied_seq, 3);
+        assert_eq!(recovered.cursor.durable_seq, 3);
+        assert_eq!(recovered.cursor.next_command_sequence, 4);
 
         let mut expected = MatchingEngine::new(EngineConfig::default());
         for command in commands(3) {
@@ -577,9 +588,9 @@ mod tests {
         .unwrap();
 
         let recovered = recover(&log, &InMemorySnapshotStore::new()).unwrap();
-        assert_eq!(recovered.applied_seq, 0);
-        assert_eq!(recovered.durable_seq, 0);
-        assert_eq!(recovered.next_command_sequence, 1);
+        assert_eq!(recovered.cursor.applied_seq, 0);
+        assert_eq!(recovered.cursor.durable_seq, 0);
+        assert_eq!(recovered.cursor.next_command_sequence, 1);
     }
 
     #[test]
@@ -605,9 +616,9 @@ mod tests {
         );
 
         let recovered = recover(&log, &snapshots).unwrap();
-        assert_eq!(recovered.applied_seq, 5);
-        assert_eq!(recovered.durable_seq, 5);
-        assert_eq!(recovered.next_command_sequence, 6);
+        assert_eq!(recovered.cursor.applied_seq, 5);
+        assert_eq!(recovered.cursor.durable_seq, 5);
+        assert_eq!(recovered.cursor.next_command_sequence, 6);
     }
 
     #[test]
@@ -633,8 +644,8 @@ mod tests {
         );
 
         let recovered = recover(&log, &snapshots).unwrap();
-        assert_eq!(recovered.applied_seq, 4);
-        assert_eq!(recovered.durable_seq, recovered.applied_seq);
-        assert_eq!(recovered.next_command_sequence, 5);
+        assert_eq!(recovered.cursor.applied_seq, 4);
+        assert_eq!(recovered.cursor.durable_seq, recovered.cursor.applied_seq);
+        assert_eq!(recovered.cursor.next_command_sequence, 5);
     }
 }

@@ -83,6 +83,9 @@
 //! - No per-symbol sharding, timers, GTT, or auction events.
 //! - Ingress is a bounded `std::sync::mpsc::sync_channel`, not a custom
 //!   Disruptor-style ring.
+//! - The response-slot pool removes per-command channel allocation, but the
+//!   ingress channel still has bounded internal buffering and synchronization;
+//!   the command itself may still allocate when constructed by the caller.
 //! - One journal thread with group commit; no replication and no `io_uring`.
 //!   There is no real-time priority or NUMA control, and core affinity is
 //!   opt-in only.
@@ -96,24 +99,28 @@
 
 pub mod envelope;
 pub mod error;
-pub mod idle;
+pub(crate) mod idle;
 pub(crate) mod journal;
 pub(crate) mod lifecycle;
 pub(crate) mod matching;
 pub mod metrics;
+pub(crate) mod shared;
 pub(crate) mod snapshot;
-pub mod ticket;
+pub(crate) mod snapshot_gate;
+pub(crate) mod submitter;
+pub(crate) mod sync;
+pub(crate) mod ticket;
 
 pub use envelope::CommandEnvelope;
-pub use error::{RuntimeError, SubmitError};
-pub use idle::{Idle, IdleStrategy};
+pub use error::{RuntimeError, SubmitError, Worker};
+pub use idle::IdleStrategy;
 #[doc(hidden)]
 pub use lifecycle::start_with_matching_panic_for_test;
 pub use lifecycle::{EngineHandle, EngineRuntime};
-#[doc(hidden)]
-pub use matching::enqueued_at_for_test;
 pub use metrics::RuntimeMetrics;
-pub use ticket::{CommandReceipt, ResponseSlot, SlotHandle, SlotPool, SlotState, Ticket};
+#[doc(hidden)]
+pub use submitter::enqueued_at_for_test;
+pub use ticket::{CommandReceipt, Ticket};
 
 use std::sync::Arc;
 use std::time::Duration;

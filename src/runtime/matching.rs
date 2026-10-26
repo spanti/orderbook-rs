@@ -10,137 +10,19 @@
 //! journal and snapshot sides are narrow seams for the later tickets.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use crate::durable::{CommandRecord, DurableError, FORMAT_VERSION, StoredSnapshot};
+use crate::durable::{CommandCursor, CommandRecord, DurableError, FORMAT_VERSION};
 use crate::engine::MatchingEngine;
 
 use super::RuntimeConfig;
 use super::envelope::CommandEnvelope;
-use super::error::{RuntimeError, SubmitError};
+use super::error::RuntimeError;
 use super::idle::Idle;
-use super::metrics::RuntimeMetrics;
-use super::snapshot::{SnapshotSend, SnapshotSink};
-use super::ticket::{CommandReceipt, SlotHandle, SlotPool, Ticket};
-use crate::types::EngineCommand;
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// State shared by the ingress submitters, the matching thread, the journal
-/// thread and the runtime lifecycle.
-#[derive(Clone)]
-pub(crate) struct SharedState {
-    closed: Arc<AtomicBool>,
-    failed: Arc<AtomicBool>,
-    fatal: Arc<Mutex<Option<DurableError>>>,
-    durable_seq: Arc<AtomicU64>,
-    applied_seq: Arc<AtomicU64>,
-    /// Deadline after which a closed matching thread stops waiting for the
-    /// journal and aborts shutdown with a timeout.
-    shutdown_deadline: Arc<Mutex<Option<Instant>>>,
-    timed_out: Arc<AtomicBool>,
-    /// Envelopes currently in the ingress command queue. Used only to report
-    /// queue-depth metrics; it is not a correctness signal.
-    ingress_depth: Arc<AtomicU64>,
-    metrics: Option<Arc<RuntimeMetrics>>,
-}
-
-impl SharedState {
-    pub(crate) fn new(metrics: Option<Arc<RuntimeMetrics>>) -> Self {
-        Self::with_durable_seq(metrics, Arc::new(AtomicU64::new(0)))
-    }
-
-    /// Build shared state whose watermark is owned elsewhere, as the journal
-    /// thread will own it in ticket 06.
-    pub(crate) fn with_durable_seq(
-        metrics: Option<Arc<RuntimeMetrics>>,
-        durable_seq: Arc<AtomicU64>,
-    ) -> Self {
-        Self {
-            closed: Arc::new(AtomicBool::new(false)),
-            failed: Arc::new(AtomicBool::new(false)),
-            fatal: Arc::new(Mutex::new(None)),
-            durable_seq,
-            applied_seq: Arc::new(AtomicU64::new(0)),
-            shutdown_deadline: Arc::new(Mutex::new(None)),
-            timed_out: Arc::new(AtomicBool::new(false)),
-            ingress_depth: Arc::new(AtomicU64::new(0)),
-            metrics,
-        }
-    }
-
-    pub(crate) fn close(&self) {
-        self.closed.store(true, Ordering::Release);
-    }
-
-    pub(crate) fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Acquire)
-    }
-
-    /// Record the first fatal error and fail the runtime closed.
-    pub(crate) fn fail(&self, error: DurableError) {
-        let mut fatal = lock(&self.fatal);
-        if fatal.is_none() {
-            *fatal = Some(error);
-        }
-        drop(fatal);
-        self.failed.store(true, Ordering::Release);
-    }
-
-    pub(crate) fn is_failed(&self) -> bool {
-        self.failed.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn failure(&self) -> Option<DurableError> {
-        lock(&self.fatal).clone()
-    }
-
-    pub(crate) fn durable_seq(&self) -> u64 {
-        self.durable_seq.load(Ordering::Acquire)
-    }
-
-    /// Advance the durability watermark to at least `sequence`.
-    pub(crate) fn publish_durable(&self, sequence: u64) {
-        self.durable_seq.fetch_max(sequence, Ordering::Release);
-    }
-
-    /// The last command sequence the matching thread applied.
-    pub(crate) fn applied_seq(&self) -> u64 {
-        self.applied_seq.load(Ordering::Acquire)
-    }
-
-    /// Publish the last applied command sequence.
-    pub(crate) fn publish_applied(&self, sequence: u64) {
-        self.applied_seq.store(sequence, Ordering::Release);
-    }
-
-    /// Bound how long a closed matching thread waits for the journal.
-    pub(crate) fn set_shutdown_deadline(&self, deadline: Instant) {
-        *lock(&self.shutdown_deadline) = Some(deadline);
-    }
-
-    /// Whether shutdown's durability deadline has elapsed.
-    pub(crate) fn shutdown_expired(&self) -> bool {
-        lock(&self.shutdown_deadline).is_some_and(|deadline| Instant::now() >= deadline)
-    }
-
-    /// Record that shutdown stopped waiting for durability.
-    pub(crate) fn mark_timed_out(&self) {
-        self.timed_out.store(true, Ordering::Release);
-    }
-
-    /// Whether shutdown aborted because the durability deadline elapsed.
-    pub(crate) fn timed_out(&self) -> bool {
-        self.timed_out.load(Ordering::Acquire)
-    }
-}
+use super::shared::SharedState;
+use super::snapshot_gate::{GateDecision, SnapshotGate};
+use super::ticket::{CommandReceipt, SlotHandle};
 
 /// The journal-side seam.
 ///
@@ -164,8 +46,10 @@ pub(crate) trait JournalSink: Send + 'static {
 
 /// A sink that accepts and drops every batch. For tests and plumbing that do
 /// not need journal behavior.
+#[cfg(test)]
 pub(crate) struct NoopJournalSink;
 
+#[cfg(test)]
 impl JournalSink for NoopJournalSink {
     fn try_send_batch(&mut self, _batch: Vec<CommandRecord>) -> Result<(), Vec<CommandRecord>> {
         Ok(())
@@ -178,255 +62,6 @@ impl JournalSink for NoopJournalSink {
     fn failure(&self) -> Option<DurableError> {
         None
     }
-}
-
-/// Whether the matching thread may keep draining the ingress.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GateDecision {
-    Continue,
-    Pause,
-}
-
-/// Snapshot-gate seam. Ticket 07 fills this in so a snapshot is only captured
-/// when `applied_seq == durable_seq`, pausing intake at a cadence boundary
-/// while durability catches up.
-pub(crate) trait SnapshotGate: Send + 'static {
-    fn poll(&mut self, engine: &MatchingEngine, applied_seq: u64, durable_seq: u64)
-    -> GateDecision;
-}
-
-/// Automatic snapshots at a fixed command-sequence cadence.
-///
-/// The gate captures only when `applied_seq == durable_seq`. At a cadence
-/// boundary with durability lagging, it pauses intake until the watermark
-/// catches up; a full worker channel instead keeps the snapshot due without
-/// pausing, because snapshots are best effort and must never stall matching.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SnapshotPending {
-    /// No snapshot is waiting.
-    None,
-    /// A boundary was reached while durability lagged; intake is paused.
-    Watermark,
-    /// A capture is pending because the worker channel was full; keep
-    /// matching and retry at the next opportunity.
-    Due,
-}
-
-pub(crate) struct CadenceSnapshotGate {
-    sink: SnapshotSink,
-    cadence: u64,
-    pending: SnapshotPending,
-    last_snapshot_seq: u64,
-}
-
-impl CadenceSnapshotGate {
-    pub(crate) fn new(cadence: u64, sink: SnapshotSink) -> Self {
-        Self {
-            sink,
-            cadence,
-            pending: SnapshotPending::None,
-            last_snapshot_seq: 0,
-        }
-    }
-
-    /// The last command sequence this gate handed to the worker.
-    pub(crate) fn last_snapshot_seq(&self) -> u64 {
-        self.last_snapshot_seq
-    }
-
-    fn try_capture(&mut self, engine: &MatchingEngine, applied_seq: u64) -> bool {
-        if applied_seq <= self.last_snapshot_seq {
-            self.pending = SnapshotPending::None;
-            return true;
-        }
-
-        let stored = StoredSnapshot {
-            format_version: FORMAT_VERSION,
-            applied_seq,
-            snapshot: engine.capture_snapshot(),
-        };
-
-        match self.sink.try_send(stored) {
-            SnapshotSend::Sent => {
-                self.last_snapshot_seq = applied_seq;
-                self.pending = SnapshotPending::None;
-                true
-            }
-            SnapshotSend::Full | SnapshotSend::Disconnected => {
-                self.pending = SnapshotPending::Due;
-                false
-            }
-        }
-    }
-}
-
-impl SnapshotGate for CadenceSnapshotGate {
-    fn poll(
-        &mut self,
-        engine: &MatchingEngine,
-        applied_seq: u64,
-        durable_seq: u64,
-    ) -> GateDecision {
-        if self.cadence == 0 {
-            return GateDecision::Continue;
-        }
-
-        match self.pending {
-            SnapshotPending::Watermark => {
-                if applied_seq > durable_seq {
-                    return GateDecision::Pause;
-                }
-                // The watermark caught up; capturing may still find the
-                // worker channel full, in which case matching continues and
-                // the capture stays due.
-                self.try_capture(engine, applied_seq);
-                GateDecision::Continue
-            }
-            SnapshotPending::Due => {
-                // A full worker channel must never stall matching. Capture
-                // only at a durability boundary, and retry on later polls.
-                if applied_seq == durable_seq {
-                    self.try_capture(engine, applied_seq);
-                }
-                GateDecision::Continue
-            }
-            SnapshotPending::None => {
-                let at_boundary = applied_seq > 0 && applied_seq % self.cadence == 0;
-                if !at_boundary || applied_seq <= self.last_snapshot_seq {
-                    return GateDecision::Continue;
-                }
-
-                if applied_seq > durable_seq {
-                    // Deliberate, infrequent pause so continuous load cannot
-                    // starve snapshots forever.
-                    self.pending = SnapshotPending::Watermark;
-                    return GateDecision::Pause;
-                }
-
-                self.try_capture(engine, applied_seq);
-                GateDecision::Continue
-            }
-        }
-    }
-}
-
-/// A gate that never pauses. Correct when snapshots are disabled.
-pub(crate) struct NoopSnapshotGate;
-
-impl SnapshotGate for NoopSnapshotGate {
-    fn poll(
-        &mut self,
-        _engine: &MatchingEngine,
-        _applied_seq: u64,
-        _durable_seq: u64,
-    ) -> GateDecision {
-        GateDecision::Continue
-    }
-}
-
-/// The internal submitter used by [`crate::runtime::EngineHandle`].
-///
-/// It checks out a pre-allocated response slot, builds a
-/// [`CommandEnvelope`], and offers it to the bounded ingress queue without
-/// blocking. Pool exhaustion and a full channel both surface as
-/// [`SubmitError::QueueFull`]; the command is not applied and consumes no
-/// command sequence.
-#[derive(Clone)]
-pub(crate) struct IngressSubmitter {
-    sender: SyncSender<CommandEnvelope>,
-    pool: SlotPool,
-    shared: SharedState,
-    next_request_id: Arc<AtomicU64>,
-}
-
-impl IngressSubmitter {
-    pub(crate) fn new(
-        sender: SyncSender<CommandEnvelope>,
-        pool: SlotPool,
-        shared: SharedState,
-    ) -> Self {
-        Self {
-            sender,
-            pool,
-            shared,
-            next_request_id: Arc::new(AtomicU64::new(1)),
-        }
-    }
-
-    pub(crate) fn submit(&self, command: EngineCommand) -> Result<Ticket, SubmitError> {
-        if let Some(error) = self.shared.failure() {
-            if let Some(metrics) = &self.shared.metrics {
-                metrics.record_engine_failed();
-            }
-            return Err(SubmitError::EngineFailed(error));
-        }
-        if self.shared.is_closed() {
-            if let Some(metrics) = &self.shared.metrics {
-                metrics.record_stopped();
-            }
-            return Err(SubmitError::Shutdown);
-        }
-
-        // No slot means the response pool is exhausted; treat it exactly like
-        // a full ingress queue so producers shed load instead of allocating.
-        let Some((ticket, slot)) = self.pool.checkout() else {
-            if let Some(metrics) = &self.shared.metrics {
-                metrics.record_queue_full();
-            }
-            return Err(SubmitError::QueueFull);
-        };
-
-        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-        let enqueued_at = self.shared.metrics.as_ref().map(|_| Instant::now());
-        let envelope = CommandEnvelope::new(request_id, enqueued_at, command, slot);
-
-        match self.sender.try_send(envelope) {
-            Ok(()) => {
-                self.shared.ingress_depth.fetch_add(1, Ordering::Relaxed);
-                if let Some(metrics) = &self.shared.metrics {
-                    metrics.record_submitted();
-                }
-                Ok(ticket)
-            }
-            Err(TrySendError::Full(_envelope)) => {
-                // Dropping the returned envelope releases its slot handle; the
-                // ticket is dropped on return, so the slot goes back to the
-                // pool. The command was never accepted.
-                if let Some(metrics) = &self.shared.metrics {
-                    metrics.record_queue_full();
-                }
-                Err(SubmitError::QueueFull)
-            }
-            Err(TrySendError::Disconnected(_envelope)) => {
-                if let Some(metrics) = &self.shared.metrics {
-                    metrics.record_stopped();
-                }
-                Err(SubmitError::Shutdown)
-            }
-        }
-    }
-}
-
-/// Test-only probe: run one command through the real ingress submitter and
-/// return the envelope's `enqueued_at`.
-///
-/// `None` proves that metrics-disabled submission performs no clock read. This
-/// is hidden test support, not part of the supported API.
-#[doc(hidden)]
-pub fn enqueued_at_for_test(metrics: Option<Arc<RuntimeMetrics>>) -> Option<Instant> {
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    let submitter = IngressSubmitter::new(sender, SlotPool::new(1), SharedState::new(metrics));
-    let ticket = submitter
-        .submit(EngineCommand::CancelOrder {
-            symbol: "BTC-USDT".to_string(),
-            order_id: 1,
-        })
-        .expect("the probe ingress has room");
-    let envelope = receiver.recv().expect("the probe envelope");
-    let enqueued_at = envelope.enqueued_at;
-    drop(envelope);
-    drop(ticket);
-    enqueued_at
 }
 
 struct PendingDurable {
@@ -465,8 +100,7 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
         snapshot_gate: G,
         shared: SharedState,
         config: RuntimeConfig,
-        next_command_sequence: u64,
-        applied_seq: u64,
+        cursor: CommandCursor,
     ) -> Self {
         Self {
             engine,
@@ -477,8 +111,8 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
             idle: Idle::new(config.idle),
             apply_batch_max: config.apply_batch_max.max(1),
             journal_flush_interval: config.journal_flush_interval,
-            next_command_sequence,
-            applied_seq,
+            next_command_sequence: cursor.next_command_sequence,
+            applied_seq: cursor.applied_seq,
             journal_buffer: Vec::with_capacity(config.apply_batch_max),
             buffer_started_at: None,
             pending_durable: VecDeque::new(),
@@ -515,7 +149,7 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
                             return self.engine;
                         }
                         Ok(envelope) => {
-                            self.shared.ingress_depth.fetch_sub(1, Ordering::Relaxed);
+                            self.shared.note_ingress_dequeued();
                             envelope.slot.set_applied(Err(RuntimeError::EngineStopped));
                             envelope.slot.set_durable(Err(RuntimeError::EngineStopped));
                         }
@@ -658,8 +292,9 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
     }
 
     fn note_dequeue(&mut self) {
-        let previous = self.shared.ingress_depth.fetch_sub(1, Ordering::Relaxed);
-        if let Some(metrics) = &self.shared.metrics {
+        if let Some(previous) = self.shared.note_ingress_dequeued()
+            && let Some(metrics) = &self.shared.metrics
+        {
             metrics.observe_queue_depth(usize::try_from(previous).unwrap_or(usize::MAX));
         }
     }
@@ -716,18 +351,24 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
         self.engine.clear_events();
     }
 
+    /// Reply with `error` at both receipt levels to every envelope still in the
+    /// ingress, and mark the ingress empty.
+    fn drain_ingress(&mut self, error: &RuntimeError) {
+        while let Ok(envelope) = self.ingress.try_recv() {
+            self.shared.note_ingress_dequeued();
+            envelope.slot.set_applied(Err(error.clone()));
+            envelope.slot.set_durable(Err(error.clone()));
+        }
+        self.ingress_empty = true;
+    }
+
     /// Fail every command that cannot become durable and every command still
     /// waiting in the ingress.
     fn fail_stop(&mut self) {
         let error = self.shared.failure().unwrap_or(DurableError::EngineFailed);
         let runtime_error = RuntimeError::EngineFailed(error);
 
-        while let Ok(envelope) = self.ingress.try_recv() {
-            self.shared.ingress_depth.fetch_sub(1, Ordering::Relaxed);
-            envelope.slot.set_applied(Err(runtime_error.clone()));
-            envelope.slot.set_durable(Err(runtime_error.clone()));
-        }
-
+        self.drain_ingress(&runtime_error);
         while let Some(pending) = self.pending_durable.pop_front() {
             pending.slot.set_durable(Err(runtime_error.clone()));
         }
@@ -745,17 +386,11 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
         let stopped = RuntimeError::EngineStopped;
         self.shared.mark_timed_out();
 
-        while let Ok(envelope) = self.ingress.try_recv() {
-            self.shared.ingress_depth.fetch_sub(1, Ordering::Relaxed);
-            envelope.slot.set_applied(Err(stopped.clone()));
-            envelope.slot.set_durable(Err(stopped.clone()));
-        }
-
+        self.drain_ingress(&stopped);
         while let Some(pending) = self.pending_durable.pop_front() {
             pending.slot.set_durable(Err(stopped.clone()));
         }
 
-        self.ingress_empty = true;
         self.journal_buffer.clear();
         self.buffer_started_at = None;
     }
@@ -771,13 +406,23 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::durable::{DurableError, InMemorySnapshotStore, SnapshotStore};
-    use crate::runtime::metrics::RuntimeMetrics;
-    use crate::runtime::snapshot;
-    use crate::types::{
-        CommandOutcome, EngineConfig, ModifyRequest, OrderRequest, OrderType, Side, TimeInForce,
+    use crate::durable::{
+        CommandCursor, DurableError, InMemorySnapshotStore, SnapshotStore, StoredSnapshot,
     };
+    use crate::runtime::error::SubmitError;
+    use crate::runtime::metrics::RuntimeMetrics;
+    use crate::runtime::snapshot::{self, SnapshotSend};
+    use crate::runtime::snapshot_gate::{CadenceSnapshotGate, NoopSnapshotGate};
+    use crate::runtime::submitter::IngressSubmitter;
+    use crate::runtime::sync::lock;
+    use crate::runtime::ticket::{SlotPool, Ticket};
+    use crate::types::{
+        CommandOutcome, EngineCommand, EngineConfig, ModifyRequest, OrderRequest, OrderType, Side,
+        TimeInForce,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc::sync_channel;
+    use std::sync::{Arc, Mutex};
     use std::thread;
 
     const WAIT: Duration = Duration::from_secs(3);
@@ -1088,8 +733,7 @@ mod tests {
             gate,
             shared.clone(),
             config,
-            1,
-            0,
+            CommandCursor::new(0, 0, 1),
         );
         let handle = thread::spawn(move || matching.run());
         (submitter, tickets, shared, handle)
@@ -1374,6 +1018,59 @@ mod tests {
     }
 
     #[test]
+    fn a_due_snapshot_retries_only_at_the_next_cadence_boundary() {
+        let engine = executed(4);
+        let store_gate = StoreGate::default();
+        let store = TestSnapshotStore::blocked(store_gate.clone());
+        let (sink, worker) = snapshot::spawn(Box::new(store.clone()));
+
+        // Fill the single-slot worker channel while the worker is blocked in
+        // its first save: one job is in the worker, one waits in the channel.
+        let filler = sink.clone();
+        let filler_job = || StoredSnapshot {
+            format_version: FORMAT_VERSION,
+            applied_seq: 0,
+            snapshot: engine.capture_snapshot(),
+        };
+        assert_eq!(filler.try_send(filler_job()), SnapshotSend::Sent);
+        wait_until(|| store.calls() >= 1);
+        assert_eq!(filler.try_send(filler_job()), SnapshotSend::Sent);
+        assert_eq!(filler.try_send(filler_job()), SnapshotSend::Full);
+
+        let mut gate = CadenceSnapshotGate::new(2, sink);
+
+        // Boundary 2: the worker cannot take the snapshot, so it stays due.
+        assert_eq!(gate.poll(&engine, 2, 2), GateDecision::Continue);
+        assert_eq!(gate.last_snapshot_seq(), 0, "nothing was captured");
+        assert_eq!(store.calls(), 1, "no save was attempted");
+
+        // Drain the fillers so the worker channel has room again.
+        store_gate.open();
+        wait_until(|| store.calls() >= 2);
+
+        // Sequence 3 is a durability boundary but not a cadence boundary; a
+        // due snapshot must not be captured off-cadence even though the
+        // worker now has room.
+        assert_eq!(gate.poll(&engine, 3, 3), GateDecision::Continue);
+        assert_eq!(
+            gate.last_snapshot_seq(),
+            0,
+            "an off-cadence retry must not capture"
+        );
+        assert_eq!(store.calls(), 2, "no off-cadence save was attempted");
+        assert!(!store.saved().contains(&3));
+
+        // The pending snapshot is captured at the next cadence boundary.
+        assert_eq!(gate.poll(&engine, 4, 4), GateDecision::Continue);
+        assert_eq!(gate.last_snapshot_seq(), 4);
+        wait_until(|| store.saved().contains(&4));
+
+        drop(filler);
+        drop(gate);
+        worker.join().expect("snapshot worker");
+    }
+
+    #[test]
     fn snapshots_are_never_saved_ahead_of_the_durability_watermark() {
         let config = RuntimeConfig {
             snapshot_cadence: 2,
@@ -1540,6 +1237,101 @@ mod tests {
         assert!(envelope.enqueued_at.is_some());
         drop(envelope);
         drop(ticket);
+    }
+
+    #[test]
+    fn metrics_disabled_submission_and_dequeue_touch_no_depth_counter() {
+        let shared = SharedState::new(None);
+        let (sender, receiver) = sync_channel(4);
+        let submitter = IngressSubmitter::new(sender, SlotPool::new(4), shared.clone());
+
+        let _ticket = submitter.submit(simple_command(1)).expect("submit");
+        assert_eq!(
+            shared.ingress_depth.load(Ordering::Relaxed),
+            0,
+            "metrics disabled must not update the ingress depth gauge"
+        );
+
+        let envelope = receiver.recv().expect("envelope");
+        assert_eq!(
+            shared.note_ingress_dequeued(),
+            None,
+            "metrics disabled must not decrement the ingress depth gauge"
+        );
+        assert_eq!(shared.ingress_depth.load(Ordering::Relaxed), 0);
+        drop(envelope);
+    }
+
+    #[test]
+    fn high_concurrency_ingress_depth_never_wraps_or_exceeds_the_queue_bound() {
+        const PRODUCERS: usize = 8;
+        const PER_PRODUCER: usize = 500;
+        const QUEUE_CAPACITY: usize = 8;
+
+        let metrics = Arc::new(RuntimeMetrics::new());
+        let shared = SharedState::new(Some(Arc::clone(&metrics)));
+        let (sender, receiver) = sync_channel(QUEUE_CAPACITY);
+        let submitter = IngressSubmitter::new(
+            sender,
+            SlotPool::new(PRODUCERS * PER_PRODUCER + 16),
+            shared.clone(),
+        );
+
+        // A consumer that decrements as fast as it can, so the old
+        // increment-after-send order would underflow the gauge.
+        let consumer_shared = shared.clone();
+        let consumer_metrics = Arc::clone(&metrics);
+        let consumer = thread::spawn(move || {
+            while let Ok(envelope) = receiver.recv() {
+                if let Some(previous) = consumer_shared.note_ingress_dequeued() {
+                    consumer_metrics
+                        .observe_queue_depth(usize::try_from(previous).unwrap_or(usize::MAX));
+                }
+                drop(envelope);
+            }
+        });
+
+        let producers = (0..PRODUCERS)
+            .map(|producer| {
+                let submitter = submitter.clone();
+                thread::spawn(move || {
+                    let mut accepted = 0usize;
+                    let mut attempts = 0u64;
+                    while accepted < PER_PRODUCER {
+                        let command = simple_command(producer as u64 * 10_000 + attempts + 1);
+                        match submitter.submit(command) {
+                            Ok(ticket) => {
+                                accepted += 1;
+                                drop(ticket);
+                            }
+                            Err(SubmitError::QueueFull) => std::hint::spin_loop(),
+                            Err(other) => panic!("unexpected submit error: {other:?}"),
+                        }
+                        attempts += 1;
+                        assert!(attempts < 1_000_000, "producer made no progress");
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for producer in producers {
+            producer.join().expect("producer thread");
+        }
+        drop(submitter);
+        consumer.join().expect("consumer thread");
+
+        let max = metrics.queue_depth_max();
+        assert!(max >= 1, "the gauge observed the queue at least once");
+        assert!(max < u64::MAX, "the ingress depth gauge wrapped");
+        assert!(
+            max <= (QUEUE_CAPACITY + PRODUCERS) as u64,
+            "queue depth {max} exceeded the bounded ingress plus concurrent submitters"
+        );
+        assert_eq!(
+            shared.ingress_depth.load(Ordering::Relaxed),
+            0,
+            "every accepted envelope was accounted for"
+        );
     }
 
     #[test]

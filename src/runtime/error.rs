@@ -37,6 +37,27 @@ impl std::error::Error for SubmitError {
     }
 }
 
+/// The runtime thread whose panic a lifecycle call observed.
+///
+/// The identity is typed so a caller can distinguish workers without matching
+/// on strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Worker {
+    Matching,
+    Journal,
+    Snapshot,
+}
+
+impl fmt::Display for Worker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Matching => write!(f, "matching"),
+            Self::Journal => write!(f, "journal"),
+            Self::Snapshot => write!(f, "snapshot"),
+        }
+    }
+}
+
 /// Why waiting on a ticket, or a runtime lifecycle call, failed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuntimeError {
@@ -51,7 +72,7 @@ pub enum RuntimeError {
     /// The caller's timeout expired before the requested acknowledgement.
     Timeout,
     /// A worker thread panicked. The value names the worker.
-    WorkerPanicked(&'static str),
+    WorkerPanicked(Worker),
     /// The final snapshot could not be saved during shutdown.
     SnapshotFailed(DurableError),
     /// The runtime could not be started (bad affinity, recovery, or storage).
@@ -121,8 +142,16 @@ mod tests {
     fn runtime_error_display_and_source() {
         assert_eq!(RuntimeError::Timeout.to_string(), "operation timed out");
         assert_eq!(
-            RuntimeError::WorkerPanicked("matching").to_string(),
+            RuntimeError::WorkerPanicked(Worker::Matching).to_string(),
             "runtime worker panicked: matching"
+        );
+        assert_eq!(
+            RuntimeError::WorkerPanicked(Worker::Journal).to_string(),
+            "runtime worker panicked: journal"
+        );
+        assert_eq!(
+            RuntimeError::WorkerPanicked(Worker::Snapshot).to_string(),
+            "runtime worker panicked: snapshot"
         );
         assert_eq!(RuntimeError::QueueFull.to_string(), "command queue is full");
         assert_eq!(RuntimeError::Shutdown.to_string(), "runtime is shut down");
