@@ -6,13 +6,15 @@
 //! behind it up to [`RuntimeConfig::journal_coalesce_max`] records, and calls
 //! [`EventLog::append_batch`] once per group. Only after that call returns
 //! does it advance the shared durability watermark and wake the matching
-//! thread, so no caller is ever told a lost event is durable.
+//! thread and the Event Publisher, so no caller is ever told a lost event is
+//! durable and no subscriber sees a record above the watermark.
 //!
-//! Ticket 08 owns the runtime lifecycle that calls [`spawn`].
+//! The log is a [`SharedEventLog`]: the runtime shares one handle between this
+//! writer and the publisher's reader.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::Instant;
 
@@ -22,6 +24,16 @@ use super::RuntimeConfig;
 use super::matching::JournalSink;
 use super::metrics::RuntimeMetrics;
 use super::shared::SharedState;
+use super::sync::lock;
+
+/// The event log as shared by the journal writer and the publisher reader.
+///
+/// The two threads use the same log handle so the publisher needs no adapter
+/// hook and cannot observe a different log instance. The mutex covers only one
+/// `append_batch` or one `read_from`; synchronous handler dispatch happens
+/// after the read lock is released, so a slow consumer cannot block the
+/// journal.
+pub(crate) type SharedEventLog = Arc<Mutex<Box<dyn EventLog>>>;
 
 /// Something the journal thread can wake after it publishes a watermark
 /// advance.
@@ -108,7 +120,7 @@ impl Drop for ExitSignal {
 }
 
 struct JournalThread<W: Waker> {
-    log: Box<dyn EventLog>,
+    log: SharedEventLog,
     receiver: Receiver<Vec<EventRecord>>,
     shared: SharedState,
     metrics: Option<Arc<RuntimeMetrics>>,
@@ -181,7 +193,7 @@ impl<W: Waker> JournalThread<W> {
         };
 
         let started = self.metrics.as_ref().map(|_| Instant::now());
-        let result = self.log.append_batch(records);
+        let result = lock(&self.log).append_batch(records);
         if let (Some(metrics), Some(started)) = (self.metrics.as_ref(), started) {
             metrics.record_journal_append(started.elapsed());
         }
@@ -189,7 +201,10 @@ impl<W: Waker> JournalThread<W> {
         match result {
             Ok(()) => {
                 // The batch is durable now; only now may anyone observe it.
+                // The publisher is woken after the watermark advance; it
+                // re-reads the log up to that watermark.
                 self.shared.publish_durable(last_sequence);
+                self.shared.notify_publisher();
                 self.waker.wake();
                 true
             }
@@ -202,13 +217,14 @@ impl<W: Waker> JournalThread<W> {
     }
 }
 
-/// Start the journal thread.
+/// Start the journal thread with a log the caller also shares with the
+/// publisher.
 ///
-/// Returns the matching thread's sink and the journal's join handle. The
-/// runtime (ticket 08) creates the waker first, passes one clone here and
-/// attaches the matching thread's handle to the other.
-pub(crate) fn spawn<W: Waker>(
-    log: Box<dyn EventLog>,
+/// The runtime creates the shared log once, passes it here and to
+/// [`super::publisher::spawn`]. Tests that only exercise the journal use
+/// [`spawn`].
+pub(crate) fn spawn_shared<W: Waker>(
+    log: SharedEventLog,
     shared: SharedState,
     config: &RuntimeConfig,
     waker: W,
@@ -235,6 +251,21 @@ pub(crate) fn spawn<W: Waker>(
         .spawn(move || thread.run())
         .expect("start the journal thread");
     (sink, handle)
+}
+
+/// Start the journal thread for a caller that does not need the shared log.
+///
+/// Returns the matching thread's sink and the journal's join handle. The
+/// runtime creates the waker first, passes one clone here and attaches the
+/// matching thread's handle to the other.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn spawn<W: Waker>(
+    log: Box<dyn EventLog>,
+    shared: SharedState,
+    config: &RuntimeConfig,
+    waker: W,
+) -> (JournalThreadSink, JoinHandle<()>) {
+    spawn_shared(Arc::new(Mutex::new(log)), shared, config, waker)
 }
 
 #[cfg(test)]

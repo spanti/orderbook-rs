@@ -31,6 +31,7 @@ try_publish_any(topic: &str, message: &dyn Any) -> Result<(), BusError>
 - handler 在调用者线程同步执行；publisher 对每个 handler 捕获 panic，把该 endpoint 标记为 failed 并继续发布其他 handler。
 - 只有 Event Publisher 线程可以对 `"events"` topic 调用 `try_publish_any`，消息的具体类型是 `EventRecord`。命令不允许进入 bus；`&dyn Any` 无法在类型上强制这一点，因此这是约定 + review 约束。
 - **发布路径**：Journal Thread 在 `append_batch` 落盘后只发一个"水位/唤醒"信号；Event Publisher 用 `EventLog::read_from(last_published + 1)` 读到 `durable_seq`，逐条 `try_publish_any`。这样唤醒丢失也无害，publisher 永远从日志补齐，不漏事件。
+- **读句柄**：Journal 与 Publisher 共享同一个 `EventLog` 句柄（`Arc<Mutex<..>>`）。互斥锁只覆盖一次 `append_batch` 或一次 `read_from` 的拷贝；handler 在锁外同步执行。因此慢订阅者只拖慢后续发布，不会阻塞 Journal 写入或撮合线程，也不需要为每个 adapter 增加读句柄接口。
 - publisher 启动时从恢复出的 durable 水位开始，只发实时事件；历史回放由消费方自己读 `EventLog`，避免每次重启把全量历史重发给所有进程内订阅者。
 - 发布顺序 = 事件序号顺序；publisher 是唯一发布者。bus 不做过滤，消费方自己 downcast/filter。
 - shutdown：publisher 追到 `durable_seq` 后退出，受 `shutdown_timeout` 约束；未发布部分由消费方从日志追赶。

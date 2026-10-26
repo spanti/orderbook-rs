@@ -7,13 +7,52 @@
 //! state.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use crate::durable::DurableError;
 
 use super::metrics::RuntimeMetrics;
 use super::sync::lock;
+
+/// A lost-wakeup-free signal from the journal thread to the Event Publisher.
+///
+/// The journal advances the durability watermark and then bumps a generation
+/// counter under this mutex; the publisher remembers the generation it last
+/// observed, drains the log, and waits only while the generation is unchanged.
+/// A notification that races with a drain therefore makes the next wait return
+/// immediately instead of sleeping until another event arrives.
+#[derive(Default)]
+struct PublisherSignal {
+    generation: Mutex<u64>,
+    ready: Condvar,
+}
+
+impl PublisherSignal {
+    fn generation(&self) -> u64 {
+        *lock(&self.generation)
+    }
+
+    fn notify(&self) {
+        let mut generation = lock(&self.generation);
+        *generation = generation.wrapping_add(1);
+        drop(generation);
+        self.ready.notify_all();
+    }
+
+    /// Block until the generation moves past `seen`. Returns the new
+    /// generation.
+    fn wait_for_change(&self, seen: u64) -> u64 {
+        let mut generation = lock(&self.generation);
+        while *generation == seen {
+            generation = self
+                .ready
+                .wait(generation)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *generation
+    }
+}
 
 /// State shared by the ingress submitters, the matching thread, the journal
 /// thread and the runtime lifecycle.
@@ -29,6 +68,14 @@ pub(crate) struct SharedState {
     /// journal and aborts shutdown with a timeout.
     shutdown_deadline: Arc<Mutex<Option<Instant>>>,
     timed_out: Arc<AtomicBool>,
+    /// Journal-to-publisher wake-up. The journal bumps it after every
+    /// watermark advance; the publisher drains the log to the watermark after
+    /// each change.
+    publisher_signal: Arc<PublisherSignal>,
+    /// Set once no further durability advances can occur (the journal has
+    /// exited and shutdown called [`Self::finish_publisher`]). The publisher
+    /// drains to the final watermark and then exits.
+    publisher_finished: Arc<AtomicBool>,
     /// Envelopes currently in the ingress command queue. Used only to report
     /// queue-depth metrics; it is not a correctness signal.
     pub(crate) ingress_depth: Arc<AtomicU64>,
@@ -57,6 +104,8 @@ impl SharedState {
             applied_command_id: Arc::new(AtomicU64::new(0)),
             shutdown_deadline: Arc::new(Mutex::new(None)),
             timed_out: Arc::new(AtomicBool::new(false)),
+            publisher_signal: Arc::new(PublisherSignal::default()),
+            publisher_finished: Arc::new(AtomicBool::new(false)),
             ingress_depth: Arc::new(AtomicU64::new(0)),
             metrics,
         }
@@ -97,6 +146,38 @@ impl SharedState {
         self.durable_seq.fetch_max(sequence, Ordering::Release);
     }
 
+    /// Wake the Event Publisher after a durability watermark advance.
+    ///
+    /// The signal is advisory: the publisher always re-reads the watermark and
+    /// the log, so a lost wake-up cannot lose an event.
+    pub(crate) fn notify_publisher(&self) {
+        self.publisher_signal.notify();
+    }
+
+    /// The publisher's wake-up generation, used to avoid a lost wake-up.
+    pub(crate) fn publisher_generation(&self) -> u64 {
+        self.publisher_signal.generation()
+    }
+
+    /// Block the publisher until the wake-up generation moves past `seen`.
+    pub(crate) fn wait_for_publisher(&self, seen: u64) -> u64 {
+        self.publisher_signal.wait_for_change(seen)
+    }
+
+    /// Tell the publisher no further durability advances can occur.
+    ///
+    /// Called only after the journal thread has been joined. The publisher
+    /// drains to the final watermark before exiting.
+    pub(crate) fn finish_publisher(&self) {
+        self.publisher_finished.store(true, Ordering::Release);
+        self.notify_publisher();
+    }
+
+    /// Whether shutdown has declared the durability watermark final.
+    pub(crate) fn publisher_finished(&self) -> bool {
+        self.publisher_finished.load(Ordering::Acquire)
+    }
+
     /// The last event sequence the matching thread applied.
     pub(crate) fn applied_seq(&self) -> u64 {
         self.applied_seq.load(Ordering::Acquire)
@@ -126,6 +207,15 @@ impl SharedState {
     /// Whether shutdown's durability deadline has elapsed.
     pub(crate) fn shutdown_expired(&self) -> bool {
         lock(&self.shutdown_deadline).is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    /// How much of the shutdown budget remains; zero when it is unset or
+    /// already expired.
+    pub(crate) fn shutdown_remaining(&self) -> std::time::Duration {
+        match *lock(&self.shutdown_deadline) {
+            Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+            None => std::time::Duration::ZERO,
+        }
     }
 
     /// Record that shutdown stopped waiting for durability.
