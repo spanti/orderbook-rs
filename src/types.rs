@@ -157,8 +157,11 @@ impl OrderRecord {
         matches!(self.status, OrderStatus::New | OrderStatus::PartiallyFilled | OrderStatus::PendingTrigger)
     }
 
-    /// Record a maker fill delta reported by the book.
-    pub(crate) fn apply_maker_fill(&mut self, quantity: u64) {
+    /// Record a fill delta for either the maker or the taker.
+    ///
+    /// The ledger only tracks filled and remaining quantities, so both sides
+    /// apply the same delta.
+    pub(crate) fn apply_fill(&mut self, quantity: u64) {
         debug_assert!(
             quantity <= self.remaining_quantity,
             "maker fill {quantity} exceeds remaining {}",

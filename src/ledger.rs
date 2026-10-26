@@ -56,10 +56,13 @@ impl OrderLedger {
         self.records.insert(order_id, record);
     }
 
-    /// Apply a maker fill delta reported by the book.
-    pub(crate) fn apply_maker_fill(&mut self, order_id: OrderBookId, quantity: u64) {
+    /// Apply a fill delta reported by a `TradeExecuted` event.
+    ///
+    /// Both the maker's and the taker's records reduce their remaining
+    /// quantity by the traded amount; the book carries the maker's placement.
+    pub(crate) fn apply_fill(&mut self, order_id: OrderBookId, quantity: u64) {
         if let Some(record) = self.records.get_mut(&order_id) {
-            record.apply_maker_fill(quantity);
+            record.apply_fill(quantity);
         }
     }
 
