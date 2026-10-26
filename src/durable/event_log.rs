@@ -17,7 +17,7 @@
 
 use std::fmt;
 
-use crate::durable::{DurableError, LogHeader};
+use crate::durable::{DurableError, EventSnapshot, EventSnapshotStore, LogHeader};
 use crate::engine::MatchingEngine;
 use crate::event::DomainEvent;
 use crate::types::{EngineCommand, EngineConfig};
@@ -115,8 +115,10 @@ impl EventCursor {
 pub struct EventSourcedEngine {
     engine: MatchingEngine,
     log: Box<dyn EventLog>,
+    snapshots: Box<dyn EventSnapshotStore>,
     cursor: EventCursor,
     failed: bool,
+    last_snapshot_error: Option<DurableError>,
 }
 
 impl fmt::Debug for EventSourcedEngine {
@@ -124,13 +126,131 @@ impl fmt::Debug for EventSourcedEngine {
         f.debug_struct("EventSourcedEngine")
             .field("cursor", &self.cursor)
             .field("failed", &self.failed)
+            .field("last_snapshot_error", &self.last_snapshot_error)
             .finish_non_exhaustive()
     }
 }
 
+/// Restore engine state from the latest event snapshot plus the contiguous
+/// event-log tail.
+///
+/// Every recovery check lives here so the snapshot boundary, duplicate, gap and
+/// command-id rules cannot drift from the write path. Borrows both stores and
+/// never writes.
+fn recover(
+    log: &dyn EventLog,
+    snapshots: &dyn EventSnapshotStore,
+) -> Result<(MatchingEngine, EventCursor), DurableError> {
+    let header = log.read_header()?.ok_or(DurableError::MissingHeader)?;
+    if header.format_version != EVENT_FORMAT_VERSION {
+        return Err(DurableError::UnsupportedVersion {
+            found: header.format_version,
+            supported: EVENT_FORMAT_VERSION,
+        });
+    }
+
+    let (mut engine, mut applied_seq, mut next_command_id) = match snapshots.load_latest()? {
+        Some(stored) => {
+            if stored.format_version != EVENT_FORMAT_VERSION {
+                return Err(DurableError::UnsupportedVersion {
+                    found: stored.format_version,
+                    supported: EVENT_FORMAT_VERSION,
+                });
+            }
+            if stored.snapshot.config != header.config {
+                return Err(DurableError::ConfigMismatch {
+                    header: header.config,
+                    snapshot: stored.snapshot.config,
+                });
+            }
+
+            // A snapshot may never cover events the log no longer contains.
+            let log_last_seq = log.last_sequence().unwrap_or(0);
+            if stored.applied_seq > log_last_seq {
+                return Err(DurableError::SnapshotAhead {
+                    applied_seq: stored.applied_seq,
+                    log_last_seq,
+                });
+            }
+
+            (
+                MatchingEngine::restore_snapshot(stored.snapshot),
+                stored.applied_seq,
+                stored.last_command_id.saturating_add(1).max(1),
+            )
+        }
+        None => (MatchingEngine::new(header.config), 0, 1),
+    };
+
+    // The log must cover every event after the snapshot boundary. With no
+    // snapshot that boundary is zero, so the log must start at sequence 1.
+    let expected_first = applied_seq.saturating_add(1);
+    if let Some(first) = log.first_sequence()
+        && first > expected_first
+    {
+        return Err(DurableError::RecoveryGap {
+            expected: expected_first,
+            found: Some(first),
+        });
+    }
+
+    for record in log.read_from(expected_first)? {
+        if record.format_version != EVENT_FORMAT_VERSION {
+            return Err(DurableError::UnsupportedVersion {
+                found: record.format_version,
+                supported: EVENT_FORMAT_VERSION,
+            });
+        }
+
+        // At-least-once delivery: a sequence at or below the applied boundary
+        // is a duplicate and is skipped, not re-applied.
+        if record.sequence <= applied_seq {
+            continue;
+        }
+
+        let expected = applied_seq.saturating_add(1);
+        if record.sequence != expected {
+            return Err(DurableError::NonContiguousSequence {
+                expected,
+                found: record.sequence,
+            });
+        }
+
+        engine.apply(&record.event, record.sequence);
+        applied_seq = record.sequence;
+        next_command_id = next_command_id.max(record.command_id.saturating_add(1));
+    }
+
+    // A recovered writer must continue after the log's tail even when the tail
+    // was all duplicates, and after the snapshot when the tail is empty.
+    let log_last = log.last_sequence();
+    let durable_seq = log_last.unwrap_or(applied_seq);
+    let next_sequence = log_last
+        .map(|last| last.saturating_add(1))
+        .unwrap_or(1)
+        .max(applied_seq.saturating_add(1));
+    if let Some(last_id) = log.last_command_id() {
+        next_command_id = next_command_id.max(last_id.saturating_add(1));
+    }
+
+    Ok((
+        engine,
+        EventCursor {
+            applied_seq,
+            durable_seq,
+            next_sequence,
+            next_command_id,
+        },
+    ))
+}
+
 impl EventSourcedEngine {
     /// Create a fresh event-sourced engine and write the v2 log header.
-    pub fn create(config: EngineConfig, mut log: Box<dyn EventLog>) -> Result<Self, DurableError> {
+    pub fn create(
+        config: EngineConfig,
+        mut log: Box<dyn EventLog>,
+        snapshots: Box<dyn EventSnapshotStore>,
+    ) -> Result<Self, DurableError> {
         log.write_header(LogHeader {
             format_version: EVENT_FORMAT_VERSION,
             config,
@@ -139,85 +259,63 @@ impl EventSourcedEngine {
         Ok(Self {
             engine: MatchingEngine::new(config),
             log,
+            snapshots,
             cursor: EventCursor::fresh(),
             failed: false,
+            last_snapshot_error: None,
         })
     }
 
-    /// Recover by folding the event log from empty.
+    /// Recover from the latest event snapshot plus the contiguous log tail.
     ///
-    /// No snapshot is read: ticket 01 proves recovery from the log alone.
-    pub fn open(log: Box<dyn EventLog>) -> Result<Self, DurableError> {
-        let header = log.read_header()?.ok_or(DurableError::MissingHeader)?;
-        if header.format_version != EVENT_FORMAT_VERSION {
-            return Err(DurableError::UnsupportedVersion {
-                found: header.format_version,
-                supported: EVENT_FORMAT_VERSION,
-            });
-        }
-
-        // With no snapshot the log must start at sequence 1.
-        if let Some(first) = log.first_sequence()
-            && first > 1
-        {
-            return Err(DurableError::RecoveryGap {
-                expected: 1,
-                found: Some(first),
-            });
-        }
-
-        let records = log.read_from(1)?;
-        let mut engine = MatchingEngine::new(header.config);
-        let mut applied_seq = 0u64;
-        let mut next_command_id = 1u64;
-
-        for record in &records {
-            if record.format_version != EVENT_FORMAT_VERSION {
-                return Err(DurableError::UnsupportedVersion {
-                    found: record.format_version,
-                    supported: EVENT_FORMAT_VERSION,
-                });
-            }
-
-            // At-least-once delivery: a sequence already applied is a duplicate.
-            if record.sequence <= applied_seq {
-                continue;
-            }
-
-            let expected = applied_seq.saturating_add(1);
-            if record.sequence != expected {
-                return Err(DurableError::NonContiguousSequence {
-                    expected,
-                    found: record.sequence,
-                });
-            }
-
-            engine.apply(&record.event, record.sequence);
-            applied_seq = record.sequence;
-            next_command_id = next_command_id.max(record.command_id.saturating_add(1));
-        }
-
-        let durable_seq = log.last_sequence().unwrap_or(applied_seq);
-        let next_sequence = log
-            .last_sequence()
-            .map(|last| last.saturating_add(1))
-            .unwrap_or(1)
-            .max(applied_seq.saturating_add(1));
-        if let Some(last_id) = log.last_command_id() {
-            next_command_id = next_command_id.max(last_id.saturating_add(1));
-        }
+    /// The snapshot is validated against the log header and the log tail; a
+    /// snapshot ahead of the log, a version or config mismatch, a gap or a
+    /// non-contiguous sequence aborts recovery.
+    pub fn open(
+        log: Box<dyn EventLog>,
+        snapshots: Box<dyn EventSnapshotStore>,
+    ) -> Result<Self, DurableError> {
+        let (engine, cursor) = recover(log.as_ref(), snapshots.as_ref())?;
 
         Ok(Self {
             engine,
             log,
-            cursor: EventCursor {
-                applied_seq,
-                durable_seq,
-                next_sequence,
-                next_command_id,
-            },
+            snapshots,
+            cursor,
             failed: false,
+            last_snapshot_error: None,
         })
+    }
+
+    /// Write a snapshot of the current decision state at the applied event
+    /// boundary.
+    ///
+    /// `execute` applies a whole command before returning, so this is always a
+    /// command boundary. A failure is recorded on the engine and surfaced
+    /// through [`Self::last_snapshot_error`]; it never undoes a durable command.
+    pub fn snapshot_now(&mut self) -> Result<(), DurableError> {
+        let stored = EventSnapshot {
+            format_version: EVENT_FORMAT_VERSION,
+            applied_seq: self.cursor.applied_seq,
+            last_command_id: self.cursor.next_command_id.saturating_sub(1),
+            snapshot: self.engine.capture_snapshot(),
+        };
+
+        match self.snapshots.save(stored) {
+            Ok(()) => {
+                self.last_snapshot_error = None;
+                Ok(())
+            }
+            Err(error) => {
+                self.last_snapshot_error = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    /// The last snapshot failure, if snapshotting is degraded.
+    pub fn last_snapshot_error(&self) -> Option<&DurableError> {
+        self.last_snapshot_error.as_ref()
     }
 
     /// Decide, append every event, then apply it.
