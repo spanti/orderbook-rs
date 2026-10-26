@@ -141,6 +141,18 @@ impl RuntimeMetrics {
         observe_max(&self.durability.durable_wait_ns_max, nanos);
     }
 
+    /// One batch handed to the journal, counted at the handoff.
+    ///
+    /// The matching thread knows the batch size; append timing belongs to the
+    /// journal thread. Ticket 06 must not count the same records again.
+    pub fn record_journal_batch(&self, records: usize) {
+        add(
+            &self.durability.batch_records_sum,
+            u64::try_from(records).unwrap_or(u64::MAX),
+        );
+        count(&self.durability.batch_count);
+    }
+
     /// One journal append (which may cover many records) that took `elapsed`.
     pub fn record_journal_append(&self, elapsed: Duration, records: usize) {
         let nanos = nanos(elapsed);
