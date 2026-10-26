@@ -14,9 +14,11 @@ use crate::snapshot::EngineSnapshot;
 use crate::types::{CommandOutcome, EngineCommand, EngineConfig};
 
 pub mod file_log;
+pub mod file_snapshot;
 pub mod memory;
 
 pub use file_log::FileCommandLog;
+pub use file_snapshot::FileSnapshotStore;
 pub use memory::{InMemoryCommandLog, InMemorySnapshotStore};
 
 /// Version written into every durable envelope. Incompatible versions are
