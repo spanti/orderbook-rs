@@ -42,7 +42,7 @@ _Avoid_: 用 "event" 指代命令
 _Avoid_: event log、order event log
 
 **Sequencer** / 定序器:
-为每条命令分配全局递增命令序号，并保证命令日志按该顺序追加的组件；本项目中由同步 DurableMatchingEngine 或 Matching Runtime 的 Matching Thread 承担。
+为每条命令分配全局递增命令序号，并保证 Command Log 按该顺序追加的组件。同步路径由 `DurableMatchingEngine` 分配；Matching Runtime 由 Matching Thread 在应用命令时分配，Journal Thread 仍按该顺序追加。分配序号不等于落盘。
 _Avoid_: dispatcher、gateway
 
 **Recovery Gap** / 恢复空洞:
@@ -99,14 +99,14 @@ _Avoid_: commit index、checkpoint
 ## Recovery
 
 **Durable Matching Engine** / 持久化撮合引擎:
-组合在纯内存撮合引擎之外的持久化层；同步路径先写命令日志再执行，并按阈值生成引擎快照。撮合引擎本身不感知 IO。
+组合在纯内存撮合引擎之外的同步持久化门面（`DurableMatchingEngine`）；先写命令日志再执行（append-before-apply），并按阈值生成引擎快照。它不同于 apply-first 的 Matching Runtime；两者共享恢复算法与存储 trait。撮合引擎本身不感知 IO。
 _Avoid_: persistent engine、matching service
 
 **Replay** / 重放:
 从全新引擎开始，按顺序应用命令日志中的命令，重建状态。
 
 **Exact Recovery** / 精确恢复:
-恢复后的引擎决策状态与已落盘的 Command Log 逐位一致：簿内订单及优先级、订单台账、止损单、各计数器、成交记录、last trade price、配置。输出/审计缓冲（事件历史、命令缓冲）不属于恢复状态；未被 Durable Acknowledgement 确认的命令不在恢复范围内。
+恢复后的引擎决策状态与按顺序重放已落盘 Command Log 的结果逐位一致：簿内订单及优先级、订单台账、止损单、各计数器、成交记录、last trade price、配置。输出/审计缓冲（事件历史、命令缓冲）不属于恢复状态；只收到 Applied Acknowledgement 而未被 Durable Acknowledgement 确认的命令从未写入日志，因而也不在恢复范围内。
 
 **Engine Snapshot** / 引擎快照:
 某个命令边界上的完整引擎状态，内含 applied command sequence，用于缩短恢复时的重放长度。
@@ -117,7 +117,7 @@ _Avoid_: book snapshot
 _Avoid_: snapshot
 
 **Command Sequence** / 命令序号:
-引擎为每条已持久化命令分配的全局递增序号，是快照的恢复边界。
+引擎为每条已接受命令分配的全局递增序号；运行时在应用时分配，Journal Thread 按同一顺序追加。只有已落盘的序号属于快照与恢复边界。
 _Avoid_: event sequence、sequence_id
 
 **Snapshot Floor** / 快照地板:
