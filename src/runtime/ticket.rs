@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::types::CommandOutcome;
 
+use super::RuntimeConfig;
 use super::error::RuntimeError;
 
 /// The engine's result for one command, tagged with its command sequence.
@@ -108,12 +109,24 @@ impl Default for ResponseSlot {
 #[derive(Debug)]
 pub struct SlotHandle {
     slot: Arc<ResponseSlot>,
+    _lease: Option<Arc<SlotLease>>,
 }
 
 impl SlotHandle {
     /// Create the worker's handle for `slot`.
+    ///
+    /// Handles created this way do not belong to a pool. Runtime envelopes use
+    /// [`SlotPool::checkout`], which keeps the slot reserved until both sides
+    /// are dropped.
     pub fn new(slot: Arc<ResponseSlot>) -> Self {
-        Self { slot }
+        Self { slot, _lease: None }
+    }
+
+    fn with_lease(slot: Arc<ResponseSlot>, lease: Arc<SlotLease>) -> Self {
+        Self {
+            slot,
+            _lease: Some(lease),
+        }
     }
 
     pub fn set_applied(&self, result: Result<CommandReceipt, RuntimeError>) {
@@ -139,6 +152,117 @@ impl Drop for SlotHandle {
     }
 }
 
+/// One checked-out slot's shared reservation.
+///
+/// The ticket and the worker's handle each hold an `Arc` to the lease, so the
+/// slot returns to the pool only when both sides are gone. The worker's drop
+/// behavior (marking the slot stopped) is separate and runs first.
+#[derive(Debug)]
+struct SlotLease {
+    pool: Arc<SlotPoolInner>,
+    index: u32,
+    slot: Arc<ResponseSlot>,
+}
+
+impl Drop for SlotLease {
+    fn drop(&mut self) {
+        self.slot.reset();
+        self.pool.release(self.index);
+    }
+}
+
+#[derive(Debug)]
+struct SlotPoolInner {
+    slots: Vec<Arc<ResponseSlot>>,
+    free: Mutex<Vec<u32>>,
+}
+
+impl SlotPoolInner {
+    fn acquire(&self) -> Option<u32> {
+        self.free
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop()
+    }
+
+    fn release(&self, index: u32) {
+        self.free
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(index);
+    }
+}
+
+/// A fixed-capacity pool of pre-allocated response slots.
+///
+/// Producers check out a slot per submitted command. The slot is reserved
+/// until both the caller's [`Ticket`] and the worker's [`SlotHandle`] are
+/// dropped, at which point it is reset and returned to the free list. An
+/// exhausted pool reports `None`; callers map that to
+/// [`crate::runtime::SubmitError::QueueFull`].
+#[derive(Debug, Clone)]
+pub struct SlotPool {
+    inner: Arc<SlotPoolInner>,
+}
+
+impl SlotPool {
+    /// Pre-allocate `capacity` slots and put them all on the free list.
+    pub fn new(capacity: usize) -> Self {
+        let slots = (0..capacity)
+            .map(|_| Arc::new(ResponseSlot::new()))
+            .collect::<Vec<_>>();
+        let free = (0..capacity).map(|index| index as u32).collect();
+
+        Self {
+            inner: Arc::new(SlotPoolInner {
+                slots,
+                free: Mutex::new(free),
+            }),
+        }
+    }
+
+    /// Build a pool sized for `config`.
+    pub fn from_config(config: &RuntimeConfig) -> Self {
+        Self::new(Self::capacity_for(config))
+    }
+
+    /// The spec's fixed capacity:
+    /// `queue_capacity + journal_batch_capacity * apply_batch_max + 64`.
+    pub fn capacity_for(config: &RuntimeConfig) -> usize {
+        config.queue_capacity + config.journal_batch_capacity * config.apply_batch_max + 64
+    }
+
+    /// Total number of slots, checked out or free.
+    pub fn capacity(&self) -> usize {
+        self.inner.slots.len()
+    }
+
+    /// Number of slots currently free for checkout.
+    pub fn available(&self) -> usize {
+        self.inner
+            .free
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    /// Reserve one slot, or `None` when every slot is checked out.
+    pub fn checkout(&self) -> Option<(Ticket, SlotHandle)> {
+        let index = self.inner.acquire()?;
+        let slot = Arc::clone(&self.inner.slots[index as usize]);
+        let lease = Arc::new(SlotLease {
+            pool: Arc::clone(&self.inner),
+            index,
+            slot: Arc::clone(&slot),
+        });
+
+        Some((
+            Ticket::with_lease(Arc::clone(&slot), Arc::clone(&lease)),
+            SlotHandle::with_lease(slot, lease),
+        ))
+    }
+}
+
 /// The caller's handle to one command's results.
 ///
 /// Both waits take `&self`, so a caller may observe the applied and durable
@@ -146,12 +270,23 @@ impl Drop for SlotHandle {
 #[derive(Debug)]
 pub struct Ticket {
     slot: Arc<ResponseSlot>,
+    _lease: Option<Arc<SlotLease>>,
 }
 
 impl Ticket {
     /// Create a ticket observing `slot`.
+    ///
+    /// Tickets created this way do not belong to a pool; runtime producers use
+    /// [`SlotPool::checkout`].
     pub fn new(slot: Arc<ResponseSlot>) -> Self {
-        Self { slot }
+        Self { slot, _lease: None }
+    }
+
+    fn with_lease(slot: Arc<ResponseSlot>, lease: Arc<SlotLease>) -> Self {
+        Self {
+            slot,
+            _lease: Some(lease),
+        }
     }
 
     /// Wait for the applied acknowledgement (preliminary; may be lost on a
@@ -350,5 +485,165 @@ mod tests {
     fn ticket_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Ticket>();
+    }
+
+    #[test]
+    fn pool_checks_out_and_reclaims_after_both_handles_drop() {
+        let pool = SlotPool::new(1);
+        assert_eq!(pool.available(), 1);
+
+        let (ticket, handle) = pool.checkout().expect("pre-allocated slot");
+        assert_eq!(pool.available(), 0);
+
+        handle.set_applied(Ok(receipt(10)));
+        handle.set_durable(Ok(()));
+        assert_eq!(ticket.wait_durable().unwrap(), receipt(10));
+
+        drop(handle);
+        drop(ticket);
+        assert_eq!(pool.available(), 1);
+    }
+
+    #[test]
+    fn exhausted_pool_returns_none() {
+        let pool = SlotPool::new(2);
+        let first = pool.checkout().expect("first slot");
+        let second = pool.checkout().expect("second slot");
+
+        assert!(pool.checkout().is_none());
+
+        drop(first);
+        assert!(pool.checkout().is_some());
+        drop(second);
+    }
+
+    #[test]
+    fn dropping_only_the_ticket_keeps_the_command_alive_and_slot_reserved() {
+        let pool = SlotPool::new(1);
+        let (ticket, handle) = pool.checkout().expect("slot");
+
+        drop(ticket);
+
+        assert_eq!(pool.available(), 0);
+        assert!(pool.checkout().is_none());
+
+        // The worker can still complete: the slot was neither reset nor
+        // marked stopped by the caller dropping its ticket.
+        handle.set_applied(Ok(receipt(11)));
+        handle.set_durable(Ok(()));
+        drop(handle);
+
+        assert_eq!(pool.available(), 1);
+    }
+
+    #[test]
+    fn dropping_only_the_worker_handle_stops_waiters_and_keeps_slot_reserved() {
+        let pool = SlotPool::new(1);
+        let (ticket, handle) = pool.checkout().expect("slot");
+
+        drop(handle);
+
+        assert_eq!(ticket.wait_applied(), Err(RuntimeError::EngineStopped));
+        assert_eq!(ticket.wait_durable(), Err(RuntimeError::EngineStopped));
+        assert_eq!(pool.available(), 0);
+        assert!(pool.checkout().is_none());
+
+        drop(ticket);
+        assert_eq!(pool.available(), 1);
+    }
+
+    #[test]
+    fn pool_capacity_is_derived_from_runtime_config() {
+        let mut config = crate::runtime::RuntimeConfig::default();
+        config.queue_capacity = 10;
+        config.journal_batch_capacity = 3;
+        config.apply_batch_max = 4;
+
+        assert_eq!(SlotPool::capacity_for(&config), 10 + 3 * 4 + 64);
+
+        let pool = SlotPool::from_config(&config);
+        assert_eq!(pool.capacity(), 86);
+        assert_eq!(pool.available(), 86);
+
+        let defaults = SlotPool::from_config(&crate::runtime::RuntimeConfig::default());
+        assert_eq!(defaults.capacity(), 1024 + 64 * 64 + 64);
+    }
+
+    #[test]
+    fn dropping_both_handles_returns_the_slot_for_reuse() {
+        let pool = SlotPool::new(1);
+
+        for sequence in 0..3 {
+            let (ticket, handle) = pool.checkout().expect("slot reused");
+            handle.set_applied(Ok(receipt(sequence)));
+            handle.set_durable(Ok(()));
+            assert_eq!(ticket.wait_durable().unwrap(), receipt(sequence));
+
+            drop(ticket);
+            drop(handle);
+
+            assert_eq!(pool.available(), 1);
+        }
+    }
+
+    #[test]
+    fn concurrent_checkout_and_return_is_safe() {
+        use std::sync::Mutex as StdMutex;
+        use std::sync::mpsc;
+
+        let capacity = 4;
+        let pool = SlotPool::new(capacity);
+        let (slot_tx, slot_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Arc::new(StdMutex::new(release_rx));
+
+        let workers: Vec<_> = (0..capacity)
+            .map(|_| {
+                let pool = pool.clone();
+                let slot_tx = slot_tx.clone();
+                let release_rx = Arc::clone(&release_rx);
+
+                std::thread::spawn(move || {
+                    let pair = pool.checkout().expect("one slot per producer");
+                    slot_tx
+                        .send(Arc::as_ptr(pair.1.slot()) as usize)
+                        .expect("report checked-out slot");
+                    release_rx
+                        .lock()
+                        .expect("release channel")
+                        .recv()
+                        .expect("release");
+                    pair
+                })
+            })
+            .collect();
+        drop(slot_tx);
+
+        let mut pointers = (0..capacity)
+            .map(|_| slot_rx.recv().expect("producer checked out a slot"))
+            .collect::<Vec<_>>();
+        pointers.sort_unstable();
+        pointers.dedup();
+        assert_eq!(
+            pointers.len(),
+            capacity,
+            "each producer gets a distinct slot"
+        );
+
+        assert_eq!(pool.available(), 0);
+        assert!(pool.checkout().is_none());
+
+        for _ in 0..capacity {
+            release_tx.send(()).expect("release producer");
+        }
+        drop(release_tx);
+
+        let pairs = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("producer thread"))
+            .collect::<Vec<_>>();
+        drop(pairs);
+
+        assert_eq!(pool.available(), capacity);
     }
 }
