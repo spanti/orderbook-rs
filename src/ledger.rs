@@ -43,10 +43,14 @@ impl OrderLedger {
     ///
     /// Both the maker's and the taker's records reduce their remaining
     /// quantity by the traded amount; the book carries the maker's placement.
+    ///
+    /// A fill for an unknown id is a corrupted event stream or a ledger/book
+    /// divergence, so it panics instead of silently dropping the delta.
     pub(crate) fn apply_fill(&mut self, order_id: OrderBookId, quantity: u64) {
-        if let Some(record) = self.records.get_mut(&order_id) {
-            record.apply_fill(quantity);
-        }
+        self.records
+            .get_mut(&order_id)
+            .expect("fill references an order with no ledger record")
+            .apply_fill(quantity);
     }
 
     /// Mark an open order canceled with the remaining quantity taken from the book.
@@ -156,5 +160,13 @@ mod tests {
         let mut ledger = OrderLedger::default();
 
         assert!(ledger.activate_stop(42).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "no ledger record")]
+    fn apply_fill_for_an_unknown_order_panics() {
+        let mut ledger = OrderLedger::default();
+
+        ledger.apply_fill(42, 1);
     }
 }

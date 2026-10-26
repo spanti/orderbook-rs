@@ -2,10 +2,11 @@
 //! event-sequence snapshot stores.
 //!
 //! [`StoredSnapshot`] is tagged with the last applied **event** sequence and the
-//! last `command_id`, not with a command sequence. Both the in-memory and file
-//! adapters keep the two newest complete snapshots so a corrupt newest file can
-//! fall back to the previous one. A version-mismatched snapshot is deliberately
-//! returned, not skipped: the durable layer validates it and fails loudly.
+//! last `command_id`; the command id is grouping metadata, not a recovery
+//! boundary. Both the in-memory and file adapters keep the two newest complete
+//! snapshots so a corrupt newest file can fall back to the previous one. A
+//! version-mismatched snapshot is deliberately returned, not skipped: the
+//! durable layer validates it and fails loudly.
 
 use std::fs;
 use std::path::{Path, PathBuf};

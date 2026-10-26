@@ -1,7 +1,7 @@
 //! Shared `{crc32:08x} {json}\n` framing for the file-backed durable adapters.
 //!
 //! One line holds one JSON value prefixed by a CRC-32 of exactly the JSON
-//! bytes. The command log and the snapshot store use this same convention, so
+//! bytes. The event log and the snapshot store use this same convention, so
 //! encoding and verification live here instead of being duplicated.
 
 use serde::Serialize;

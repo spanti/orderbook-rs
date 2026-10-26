@@ -98,25 +98,21 @@ impl<'a> DecisionScratch<'a> {
         }
     }
 
-    /// `(price, timestamp)` of this symbol's last trade, if there is one.
-    fn last_trade(&self) -> Option<(u64, u64)> {
-        self.engine
-            .last_trades
-            .get(self.symbol)
-            .map(|last| (last.price, last.timestamp))
+    /// This symbol's last trade, if there is one.
+    fn last_trade(&self) -> Option<LastTrade> {
+        self.engine.last_trades.get(self.symbol).copied()
     }
 
     /// Push a `TradeExecuted` per fill, allocating trade ids locally.
     ///
-    /// Returns the last fill's `(price, timestamp)`, or `None` when nothing
-    /// filled.
+    /// Returns the last fill, or `None` when nothing filled.
     fn push_fills(
         symbol: &str,
         timestamp: u64,
         fills: Vec<Fill>,
         next_trade_id: &mut u64,
         events: &mut Vec<DomainEvent>,
-    ) -> Option<(u64, u64)> {
+    ) -> Option<LastTrade> {
         let mut last = None;
         for fill in fills {
             let trade = Trade {
@@ -130,10 +126,49 @@ impl<'a> DecisionScratch<'a> {
                 timestamp,
             };
             *next_trade_id = next_trade_id.saturating_add(1);
-            last = Some((fill.price, timestamp));
+            last = Some(LastTrade {
+                price: fill.price,
+                timestamp,
+            });
             events.push(DomainEvent::TradeExecuted { trade });
         }
         last
+    }
+
+    /// Emit the trailing event for an order whose match left a remainder.
+    ///
+    /// Shared by the normal taker path and the stop cascade: a remainder that
+    /// can rest becomes [`DomainEvent::OrderRested`]; one that cannot (IOC or
+    /// market) becomes [`DomainEvent::OrderCanceled`] with
+    /// [`OrderCancelReason::UnfilledResidual`]. A fully filled order emits
+    /// nothing.
+    fn push_residual_tail(
+        symbol: &str,
+        order: &Order,
+        remaining_quantity: u64,
+        rested: bool,
+        events: &mut Vec<DomainEvent>,
+    ) {
+        if remaining_quantity == 0 {
+            return;
+        }
+
+        if rested {
+            events.push(DomainEvent::OrderRested {
+                symbol: symbol.to_string(),
+                order: Order {
+                    quantity: remaining_quantity,
+                    ..order.clone()
+                },
+            });
+        } else {
+            events.push(DomainEvent::OrderCanceled {
+                symbol: symbol.to_string(),
+                order_id: order.id,
+                canceled_quantity: remaining_quantity,
+                reason: OrderCancelReason::UnfilledResidual,
+            });
+        }
     }
 
     /// Emit a `StopTriggered` cascade after the command's own events.
@@ -149,11 +184,15 @@ impl<'a> DecisionScratch<'a> {
         book: &mut OrderBook,
         stops: &mut StopBook,
         symbol: &str,
-        mut last_trade: Option<(u64, u64)>,
+        mut last_trade: Option<LastTrade>,
         next_trade_id: &mut u64,
         events: &mut Vec<DomainEvent>,
     ) {
-        while let Some((last_price, last_timestamp)) = last_trade {
+        while let Some(LastTrade {
+            price: last_price,
+            timestamp: last_timestamp,
+        }) = last_trade
+        {
             let Some(stop_id) = stops.next_triggered(last_price) else {
                 break;
             };
@@ -196,25 +235,7 @@ impl<'a> DecisionScratch<'a> {
 
             let cascade_last =
                 Self::push_fills(symbol, last_timestamp, fills, next_trade_id, events);
-
-            if remaining_quantity > 0 {
-                if rested {
-                    events.push(DomainEvent::OrderRested {
-                        symbol: symbol.to_string(),
-                        order: Order {
-                            quantity: remaining_quantity,
-                            ..converted
-                        },
-                    });
-                } else {
-                    events.push(DomainEvent::OrderCanceled {
-                        symbol: symbol.to_string(),
-                        order_id: stop.id,
-                        canceled_quantity: remaining_quantity,
-                        reason: OrderCancelReason::UnfilledResidual,
-                    });
-                }
-            }
+            Self::push_residual_tail(symbol, &converted, remaining_quantity, rested, events);
 
             // If the converted order did not trade, the last price is unchanged
             // and the next eligible stop (if any) triggers at the same price.
@@ -227,9 +248,9 @@ impl<'a> DecisionScratch<'a> {
     /// Push `OrderAccepted`, the matching `TradeExecuted` events, and the
     /// trailing rest/residual event for one taker order.
     ///
-    /// Returns the last fill's `(price, timestamp)`, or `None` when nothing
-    /// filled. The caller supplies the scratch book so modify can reuse the
-    /// same routine after removing the old order.
+    /// Returns the last fill, or `None` when nothing filled. The caller
+    /// supplies the scratch book so modify can reuse the same routine after
+    /// removing the old order.
     #[allow(clippy::too_many_arguments)]
     fn push_taker_match(
         symbol: &str,
@@ -239,7 +260,7 @@ impl<'a> DecisionScratch<'a> {
         book: &mut OrderBook,
         next_trade_id: &mut u64,
         events: &mut Vec<DomainEvent>,
-    ) -> Option<(u64, u64)> {
+    ) -> Option<LastTrade> {
         events.push(DomainEvent::OrderAccepted {
             symbol: symbol.to_string(),
             order: order.clone(),
@@ -253,25 +274,7 @@ impl<'a> DecisionScratch<'a> {
         } = book.submit(order.clone());
 
         let last_trade = Self::push_fills(symbol, timestamp, fills, next_trade_id, events);
-
-        if remaining_quantity > 0 {
-            if rested {
-                events.push(DomainEvent::OrderRested {
-                    symbol: symbol.to_string(),
-                    order: Order {
-                        quantity: remaining_quantity,
-                        ..order
-                    },
-                });
-            } else {
-                events.push(DomainEvent::OrderCanceled {
-                    symbol: symbol.to_string(),
-                    order_id: order.id,
-                    canceled_quantity: remaining_quantity,
-                    reason: OrderCancelReason::UnfilledResidual,
-                });
-            }
-        }
+        Self::push_residual_tail(symbol, &order, remaining_quantity, rested, events);
 
         last_trade
     }
@@ -360,11 +363,13 @@ impl<'a> DecisionScratch<'a> {
         }
 
         // 3. Cancel the old order on the scratch book. The ledger is not
-        //    mutated here: `apply(OrderCanceled)` does that.
+        //    mutated here: `apply(OrderCanceled)` does that. The ledger said
+        //    the order was open and this symbol's, so its absence from the
+        //    book is ledger/book divergence, not a business rejection.
         let mut scratch_book = self.scratch_book();
-        let Some(old_order) = scratch_book.cancel_limit_order(order_id) else {
-            return Err(EngineError::UnknownOrder);
-        };
+        let old_order = scratch_book.cancel_limit_order(order_id).expect(
+            "ledger/book divergence: ledger says the order is open but it is missing from the book",
+        );
 
         let symbol = self.symbol.to_string();
         let mut events = Vec::new();
@@ -456,12 +461,7 @@ impl<'a> DecisionScratch<'a> {
         if record.status == OrderStatus::PendingTrigger {
             // A pending stop is canceled with `StopCanceled`, not
             // `OrderCanceled`; it must still be in this symbol's stop book.
-            let present = self
-                .engine
-                .stop_books
-                .get(self.symbol)
-                .is_some_and(|stops| stops.get(order_id).is_some());
-            if !present {
+            if !self.engine.has_pending_stop(self.symbol, order_id) {
                 return Err(EngineError::UnknownOrder);
             }
             return Ok(vec![DomainEvent::StopCanceled {
@@ -473,13 +473,15 @@ impl<'a> DecisionScratch<'a> {
             return Err(EngineError::UnknownOrder);
         }
 
-        let resting = self
-            .engine
-            .order_books
-            .get(self.symbol)
-            .is_some_and(|book| book.contains_order(order_id));
+        let resting = self.engine.has_book_order(self.symbol, order_id);
         if !resting {
-            return Err(EngineError::UnknownOrder);
+            // The ledger says the order is open and this symbol's, so its
+            // absence from the book is ledger/book divergence. A real bug must
+            // not be disguised as `OrderRejected`.
+            panic!(
+                "ledger/book divergence: ledger says order {order_id} is open but it is missing \
+                 from the book"
+            );
         }
 
         Ok(vec![DomainEvent::OrderCanceled {
@@ -658,11 +660,19 @@ impl MatchingEngine {
         })
     }
 
-    /// Convenience composition of [`Self::decide`] and [`Self::apply`].
+    /// Convenience composition of [`Self::decide`] and [`Self::apply`] for
+    /// direct, in-process use.
     ///
-    /// Returns the command's events, which are the only command result. This
-    /// path allocates the next contiguous event sequences locally; the durable
-    /// layer assigns the authoritative sequences from its log cursor.
+    /// Returns the command's events, which are the only command result.
+    ///
+    /// **Sequence semantics:** this is not a second writer. `execute` assigns
+    /// each event a *local* sequence derived from the last applied cursor
+    /// (`last_applied_sequence + offset`); the durable layer
+    /// ([`crate::durable::DurableMatchingEngine`]) and the runtime
+    /// ([`crate::runtime::EngineRuntime`]) are the writers that assign the
+    /// persisted event sequence from their own cursor. Do not mix `execute`
+    /// with either writer on the same engine, and never treat its local
+    /// numbers as log sequences.
     pub fn execute(&mut self, command: EngineCommand) -> Vec<DomainEvent> {
         let events = self.decide(&command);
         for event in &events {
@@ -680,20 +690,19 @@ impl MatchingEngine {
     /// [`DomainEvent::OrderRejected`] carrying the full command, never an
     /// `Err`. Internal invariant violations still panic.
     pub fn decide(&self, command: &EngineCommand) -> Vec<DomainEvent> {
+        let symbol = command.symbol();
         let decision = match command {
-            EngineCommand::SubmitOrder { symbol, request } => {
+            EngineCommand::SubmitOrder { request, .. } => {
                 DecisionScratch::new(self, symbol).decide_submit(request)
             }
-            EngineCommand::SubmitStopOrder { symbol, request } => {
+            EngineCommand::SubmitStopOrder { request, .. } => {
                 DecisionScratch::new(self, symbol).decide_submit_stop(request)
             }
-            EngineCommand::CancelOrder { symbol, order_id } => {
+            EngineCommand::CancelOrder { order_id, .. } => {
                 DecisionScratch::new(self, symbol).decide_cancel(*order_id)
             }
             EngineCommand::ModifyOrder {
-                symbol,
-                order_id,
-                request,
+                order_id, request, ..
             } => DecisionScratch::new(self, symbol).decide_modify(*order_id, request),
         };
 
@@ -705,14 +714,8 @@ impl MatchingEngine {
 
     /// Build the audit event for a business rejection.
     fn rejected_event(command: &EngineCommand, reason: EngineError) -> DomainEvent {
-        let symbol = match command {
-            EngineCommand::SubmitOrder { symbol, .. }
-            | EngineCommand::SubmitStopOrder { symbol, .. }
-            | EngineCommand::CancelOrder { symbol, .. }
-            | EngineCommand::ModifyOrder { symbol, .. } => symbol,
-        };
         DomainEvent::OrderRejected {
-            symbol: symbol.clone(),
+            symbol: command.symbol().to_string(),
             reason,
             command: command.clone(),
         }
@@ -916,6 +919,20 @@ impl MatchingEngine {
     /// Whether `order_id` is currently open (`New` or `PartiallyFilled`).
     pub fn is_open(&self, order_id: OrderBookId) -> bool {
         self.ledger.is_open(order_id)
+    }
+
+    /// Whether `order_id` is resting in `symbol`'s order book.
+    fn has_book_order(&self, symbol: &str, order_id: OrderBookId) -> bool {
+        self.order_books
+            .get(symbol)
+            .is_some_and(|book| book.contains_order(order_id))
+    }
+
+    /// Whether `order_id` is still pending in `symbol`'s stop book.
+    fn has_pending_stop(&self, symbol: &str, order_id: OrderBookId) -> bool {
+        self.stop_books
+            .get(symbol)
+            .is_some_and(|stops| stops.get(order_id).is_some())
     }
 
     /// Every lifecycle record, keyed by order id.
@@ -1946,5 +1963,57 @@ mod tests {
         submit(engine, "BTC-USDT", limit(1, Side::Ask, price, 1));
         submit(engine, "BTC-USDT", limit(2, Side::Bid, price, 1));
         assert_eq!(engine.last_trade_price("BTC-USDT"), Some(price));
+    }
+
+    /// An engine whose ledger says `order_id` is open but whose book is empty:
+    /// an impossible state produced only by a ledger/book divergence.
+    fn diverged_engine(order_id: OrderBookId, symbol: &str, quantity: u64) -> MatchingEngine {
+        let mut engine = MatchingEngine::new(EngineConfig::default());
+        engine.ledger = OrderLedger::from_records(vec![(
+            order_id,
+            OrderRecord::new(symbol.to_string(), quantity),
+        )]);
+        engine
+    }
+
+    #[test]
+    #[should_panic(expected = "ledger/book divergence")]
+    fn modifying_a_ledger_open_order_missing_from_the_book_panics() {
+        let engine = diverged_engine(1, "BTC-USDT", 5);
+
+        let _ = engine.decide(&modify_command("BTC-USDT", 1, 100, 5, 2));
+    }
+
+    #[test]
+    #[should_panic(expected = "ledger/book divergence")]
+    fn canceling_a_ledger_open_order_missing_from_the_book_panics() {
+        let engine = diverged_engine(1, "BTC-USDT", 5);
+
+        let _ = engine.decide(&cancel_command("BTC-USDT", 1));
+    }
+
+    #[test]
+    #[should_panic(expected = "no ledger record")]
+    fn applying_a_trade_for_an_unknown_taker_panics() {
+        let mut engine = MatchingEngine::new(EngineConfig::default());
+        submit(&mut engine, "BTC-USDT", limit(1, Side::Ask, 100, 5));
+
+        // The maker (1) is resting and in the ledger; the taker (99) has no
+        // ledger record. A replayed fill for it is a corrupted event stream.
+        engine.apply(
+            &DomainEvent::TradeExecuted {
+                trade: Trade {
+                    id: 1,
+                    symbol: "BTC-USDT".to_string(),
+                    maker_order_id: 1,
+                    taker_order_id: 99,
+                    price: 100,
+                    quantity: 1,
+                    taker_side: Side::Bid,
+                    timestamp: 2,
+                },
+            },
+            99,
+        );
     }
 }

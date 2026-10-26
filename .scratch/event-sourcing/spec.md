@@ -84,7 +84,7 @@ Redesign the event vocabulary so every event is a replayable state delta, then m
 
 ### Event model
 
-- The event catalog is: `OrderAccepted`, `OrderRested`, `TradeExecuted`, `OrderCanceled`, `StopPlaced`, `StopTriggered`, `StopCanceled`, `OrderRejected`. `Order` carries id/side/price/quantity/timestamp/type/TIF; the event carries the symbol because `Order` does not.
+- The event catalog is: `OrderAccepted`, `OrderRested`, `TradeExecuted`, `OrderCanceled`, `StopPlaced`, `StopTriggered`, `StopCanceled`, `OrderRejected`. `Order` carries id/side/price/quantity/timestamp/type/TIF; the event carries the symbol because `Order` does not. `OrderAccepted` additionally carries `post_only` and `StopTriggered` additionally carries the triggering `last_price`; both are consumer metadata that `apply` does not read.
 - `OrderRested` and `StopTriggered` carry an `Order` whose `quantity` is the remaining quantity at that point.
 - Per-command sequence:
   - submit: `OrderAccepted` -> `TradeExecuted`* -> `OrderRested` or `OrderCanceled{UnfilledResidual}`; a full fill has neither trailing event.

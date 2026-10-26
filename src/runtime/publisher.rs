@@ -36,7 +36,6 @@ use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
 
 use crate::bus::{EVENTS_TOPIC, MessageBus};
-use crate::durable::DurableError;
 
 use super::journal::SharedEventLog;
 use super::shared::SharedState;
@@ -48,10 +47,6 @@ struct EventPublisher {
     bus: Arc<dyn MessageBus>,
     /// The last event sequence this publisher has dispatched.
     last_published: u64,
-    /// A log read or ordering failure that stopped publication. Publication is
-    /// best effort: consumers can always catch up from the event log.
-    #[allow(dead_code)]
-    last_error: Option<DurableError>,
 }
 
 impl EventPublisher {
@@ -91,10 +86,9 @@ impl EventPublisher {
         let read = lock(&self.log).read_from(self.last_published.saturating_add(1));
         let records = match read {
             Ok(records) => records,
-            Err(error) => {
-                self.last_error = Some(error);
-                return false;
-            }
+            // Publication is best effort: consumers catch up from the log, so
+            // a read failure only stops this publisher.
+            Err(_) => return false,
         };
 
         for record in records {
@@ -107,10 +101,8 @@ impl EventPublisher {
                 continue;
             }
             if record.sequence != self.last_published.saturating_add(1) {
-                self.last_error = Some(DurableError::RecoveryGap {
-                    expected: self.last_published.saturating_add(1),
-                    found: Some(record.sequence),
-                });
+                // A gap means the log cannot be published in order. Consumers
+                // still read the log directly.
                 return false;
             }
 
@@ -141,7 +133,6 @@ pub(crate) fn spawn(
         shared,
         bus,
         last_published: start_at,
-        last_error: None,
     };
     let handle = thread::Builder::new()
         .name("publisher".to_string())

@@ -28,7 +28,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// The endpoint the runtime publishes durable [`EventRecord`]s on.
 ///
@@ -106,6 +106,60 @@ pub trait MessageBus: Send + Sync + 'static {
     /// recorded as failed, and the remaining handlers still run; the call
     /// still returns `Ok(())` because publication itself succeeded.
     fn try_publish_any(&self, topic: &str, message: &dyn Any) -> Result<(), BusError>;
+}
+
+/// A registered bus handler: borrowed message in, synchronous, sendable.
+pub type BusHandler = Box<dyn Fn(&dyn Any) + Send + 'static>;
+
+/// A subscriber-only view of a [`MessageBus`].
+///
+/// [`EngineHandle::bus`](crate::runtime::EngineHandle::bus) and
+/// [`EngineRuntime::bus`](crate::runtime::EngineRuntime::bus) return this view
+/// instead of the writable bus. It exposes registration only: publishing is
+/// reserved for the Event Publisher, so a producer that holds an engine handle
+/// cannot inject events or otherwise use the bus as a second command ingress.
+///
+/// Publishing is not merely discouraged; it is unreachable:
+///
+/// ```compile_fail
+/// use orderbook_rs::bus::{InProcessBus, SubscriberBus};
+/// use std::sync::Arc;
+///
+/// let view = SubscriberBus::new(Arc::new(InProcessBus::new()));
+/// view.try_publish_any("events", &());
+/// ```
+#[derive(Clone)]
+pub struct SubscriberBus {
+    inner: Arc<dyn MessageBus>,
+}
+
+impl SubscriberBus {
+    /// Wrap the writable bus, hiding its publisher.
+    pub fn new(inner: Arc<dyn MessageBus>) -> Self {
+        Self { inner }
+    }
+
+    /// Register a handler for `endpoint`; see [`MessageBus::register_any`].
+    pub fn register_any(&self, endpoint: &str, handler: BusHandler) -> Result<(), BusError> {
+        self.inner.register_any(endpoint, handler)
+    }
+
+    /// Register a response handler; always [`BusError::Unsupported`] in this
+    /// release, exactly like the underlying bus.
+    pub fn register_response_handler(
+        &self,
+        correlation_id: u64,
+        handler: BusHandler,
+    ) -> Result<(), BusError> {
+        self.inner
+            .register_response_handler(correlation_id, handler)
+    }
+}
+
+impl fmt::Debug for SubscriberBus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SubscriberBus").finish_non_exhaustive()
+    }
 }
 
 /// In-process synchronous [`MessageBus`] implementation.

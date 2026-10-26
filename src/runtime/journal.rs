@@ -258,7 +258,7 @@ pub(crate) fn spawn_shared<W: Waker>(
 /// Returns the matching thread's sink and the journal's join handle. The
 /// runtime creates the waker first, passes one clone here and attaches the
 /// matching thread's handle to the other.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn spawn<W: Waker>(
     log: Box<dyn EventLog>,
     shared: SharedState,

@@ -19,7 +19,7 @@ use super::ticket::{SlotPool, Ticket};
 /// [`CommandEnvelope`], and offers it to the bounded ingress queue without
 /// blocking. Pool exhaustion and a full channel both surface as
 /// [`SubmitError::QueueFull`]; the command is not applied and consumes no
-/// command sequence.
+/// event sequence.
 #[derive(Clone)]
 pub(crate) struct IngressSubmitter {
     sender: SyncSender<CommandEnvelope>,

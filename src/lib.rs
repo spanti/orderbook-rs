@@ -12,7 +12,7 @@ pub mod snapshot;
 mod stop_book;
 pub mod types;
 
-pub use bus::{BusError, EVENTS_TOPIC, InProcessBus, MessageBus};
+pub use bus::{BusError, EVENTS_TOPIC, InProcessBus, MessageBus, SubscriberBus};
 pub use durable::{
     DurableMatchingEngine, EventCursor, EventLog, EventRecord, FORMAT_VERSION, FileEventLog,
     FileSnapshotStore, InMemoryEventLog, InMemorySnapshotStore, SnapshotStore, StoredSnapshot,

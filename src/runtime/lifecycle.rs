@@ -16,7 +16,7 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::bus::{InProcessBus, MessageBus};
+use crate::bus::{InProcessBus, MessageBus, SubscriberBus};
 use crate::durable::{
     DurableError, EventCursor, EventLog, FORMAT_VERSION, LogHeader, SnapshotStore, recover,
 };
@@ -47,18 +47,22 @@ pub struct EngineHandle {
     submitter: IngressSubmitter,
     shared: SharedState,
     metrics: Option<Arc<RuntimeMetrics>>,
-    bus: Arc<dyn MessageBus>,
+    bus: SubscriberBus,
 }
 
 impl EngineHandle {
-    /// The bus durable events are published on.
+    /// A subscriber-only view of the bus durable events are published on.
     ///
     /// Subscribers register on [`crate::bus::EVENTS_TOPIC`] and downcast each
     /// message to [`crate::durable::EventRecord`]. Events that were already
     /// published (for example while this handle was not subscribed) are read
     /// from the event log with `read_from(last_seen + 1)`.
-    pub fn bus(&self) -> Arc<dyn MessageBus> {
-        Arc::clone(&self.bus)
+    ///
+    /// The view deliberately exposes no publisher: only the Event Publisher
+    /// writes to the bus, so holding a handle cannot make the bus a command
+    /// ingress.
+    pub fn bus(&self) -> SubscriberBus {
+        self.bus.clone()
     }
 
     /// Try to submit without blocking.
@@ -66,13 +70,13 @@ impl EngineHandle {
     /// Returns [`SubmitError::QueueFull`] when the ingress Command Queue or the
     /// response-slot pool is exhausted, [`SubmitError::Shutdown`] after
     /// shutdown starts, and [`SubmitError::EngineFailed`] after a fatal journal
-    /// failure. The command is not applied and consumes no command sequence on
+    /// failure. The command is not applied and consumes no event sequence on
     /// any error; clone it first to retry.
     pub fn try_submit(&self, command: EngineCommand) -> Result<Ticket, SubmitError> {
         self.submitter.submit(command)
     }
 
-    /// Submit and wait until the command record is durable.
+    /// Submit and wait until all of the command's event records are durable.
     pub fn submit_and_wait(&self, command: EngineCommand) -> Result<CommandReceipt, RuntimeError> {
         let ticket = self.try_submit(command)?;
         ticket.wait_durable()
@@ -124,7 +128,7 @@ impl EngineRuntime {
     /// Start a fresh runtime, writing the log header.
     ///
     /// The engine starts empty: `applied_seq = 0`, `durable_seq = 0`, and the
-    /// first command sequence is `1`.
+    /// first event sequence and `command_id` are both `1`.
     pub fn create(
         config: RuntimeConfig,
         engine_config: EngineConfig,
@@ -249,7 +253,7 @@ impl EngineRuntime {
             submitter,
             shared: shared.clone(),
             metrics: config.metrics.clone(),
-            bus: Arc::clone(&bus),
+            bus: SubscriberBus::new(Arc::clone(&bus)),
         };
 
         let waker = ThreadWaker::new();
@@ -387,12 +391,13 @@ impl EngineRuntime {
         self.config.metrics.as_ref()
     }
 
-    /// The bus durable events are published on.
+    /// A subscriber-only view of the bus durable events are published on.
     ///
     /// Subscribers register before submitting commands; events published before
-    /// a subscriber exists are recovered from the event log.
-    pub fn bus(&self) -> Arc<dyn MessageBus> {
-        Arc::clone(&self.bus)
+    /// a subscriber exists are recovered from the event log. The view exposes
+    /// no publisher, so only the runtime's Event Publisher writes to the bus.
+    pub fn bus(&self) -> SubscriberBus {
+        SubscriberBus::new(Arc::clone(&self.bus))
     }
 
     fn stop(&mut self, final_snapshot: bool) -> Result<(), RuntimeError> {

@@ -122,6 +122,42 @@ fn subscribers_receive_durable_events_in_sequence_order() {
 }
 
 #[test]
+fn the_engine_handle_exposes_a_subscriber_only_bus_view() {
+    let bus = Arc::new(InProcessBus::new());
+    let (handle, runtime) = EngineRuntime::create_with_bus(
+        RuntimeConfig::default(),
+        EngineConfig::default(),
+        Box::new(InMemoryEventLog::new()),
+        Box::new(InMemorySnapshotStore::new()),
+        Arc::clone(&bus) as Arc<dyn MessageBus>,
+    )
+    .expect("create a runtime with a bus");
+
+    // The handle's bus surface is the subscriber view, not the writable bus:
+    // it has `register_any`/`register_response_handler` and no publisher.
+    let view: orderbook_rs::bus::SubscriberBus = handle.bus();
+    let received = Arc::new(Mutex::new(Vec::<u64>::new()));
+    let seen = Arc::clone(&received);
+    view.register_any(
+        EVENTS_TOPIC,
+        Box::new(move |message: &dyn Any| {
+            let record = message.downcast_ref::<EventRecord>().expect("EventRecord");
+            seen.lock().unwrap().push(record.sequence);
+        }),
+    )
+    .expect("subscribe through the handle's view");
+
+    handle
+        .submit_and_wait(submit_order(1))
+        .expect("durable submission");
+
+    wait_until(|| received.lock().unwrap().len() == 2);
+    assert_eq!(*received.lock().unwrap(), vec![1, 2]);
+
+    runtime.shutdown().expect("shutdown");
+}
+
+#[test]
 fn every_handler_on_the_events_endpoint_receives_every_event() {
     let bus = Arc::new(InProcessBus::new());
     let first = Recorder::default();
