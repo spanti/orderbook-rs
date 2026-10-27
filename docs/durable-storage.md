@@ -291,9 +291,12 @@ disabled the hot path performs no clock reads and no metric atomics.
 The pure decision path (`bench --path decide`) reports command -> events latency
 against the same applied budget (`p99 <= 10 µs`, `queue_full == 0`), plus its own
 event volume. It reads engine state and emits events without mutating the engine.
+The current decision strategy is recorded in
+[ADR 0006](adr/0006-borrowed-decision-view.md): `decide` matches on borrowed
+`BookView` / `StopView` overlays instead of cloning the touched symbol's books.
 A miss is recorded as a measured shortfall; the runtime is never silently moved
-onto a different path. Changing the decision strategy instead requires an
-explicit ADR amendment.
+onto a different path. Changing the decision strategy (including this view
+mechanism) instead requires an explicit ADR amendment.
 
 **Windows is functional-only.** Its clocks (QPC) typically tick at about 100 ns,
 so sub-tick differences are not meaningful; do not claim the numeric SLOs there.

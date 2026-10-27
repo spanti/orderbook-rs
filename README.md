@@ -256,7 +256,7 @@ cargo fmt --check
 cargo clippy --all-targets   # 仓库有既有 warning；不要用 -D warnings 判定
 ```
 
-当前主线：`cargo test --all-targets` 399 passed，`cargo test --doc` 1 passed（`SubscriberBus` 的 `compile_fail`），`cargo fmt --check` clean。
+当前主线：`cargo test --all-targets` 413 passed，`cargo test --doc` 1 passed（`SubscriberBus` 的 `compile_fail`），`cargo fmt --check` clean。
 
 ## 文档
 
@@ -264,6 +264,7 @@ cargo clippy --all-targets   # 仓库有既有 warning；不要用 -D warnings �
 - [ADR 0003：apply-first 运行时与有界队列](docs/adr/0003-apply-first-runtime-with-bounded-queues.md)
 - [ADR 0004：以事件日志作为恢复事实源](docs/adr/0004-event-sourced-order-log.md)
 - [ADR 0005：进程内 MessageBus 与日志追赶](docs/adr/0005-in-process-message-bus.md)
+- [ADR 0006：决策阶段使用借用视图](docs/adr/0006-borrowed-decision-view.md)
 - [存储契约与格式](docs/durable-storage.md)
 - [领域词汇表](GLOSSARY.md)
 - Event-sourcing 设计材料： [spec](.scratch/event-sourcing/spec.md)、[plan](.scratch/event-sourcing/plan.md)、[tickets](.scratch/event-sourcing/issues/)

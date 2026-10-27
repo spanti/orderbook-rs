@@ -38,8 +38,8 @@ pub enum BenchPath {
     Runtime,
     /// Measure the pure event-sourced `decide` step only.
     ///
-    /// This is the decision-scratch baseline: command in, events out, with no
-    /// engine clone and no state mutation.
+    /// The decision runs on borrowed `BookView` / `StopView` overlays: command
+    /// in, events out, with no book clone and no state mutation.
     Decide,
 }
 

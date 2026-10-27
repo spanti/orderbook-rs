@@ -31,9 +31,10 @@ pub fn run(config: &BenchConfig) -> Result<BenchReport, BenchError> {
 
 /// Measure the pure event-sourced decision step.
 ///
-/// The engine is never mutated inside the timed window, so this is a baseline
-/// for `decide` + its borrow-based `DecisionScratch`: command in, events out.
-/// A whole-engine clone on this path would show up immediately here.
+/// The engine is never mutated inside the timed window. `decide` runs on the
+/// borrowed `BookView` / `StopView` overlays, so this is command in, events
+/// out, with no book clone and no state mutation. The seeded ask makes the
+/// view perform a real opposite-book lookup.
 fn run_decide(config: &BenchConfig) -> Result<BenchReport, BenchError> {
     let symbol = format!("{SYMBOL_PREFIX}0");
     let mut engine = MatchingEngine::new(EngineConfig::default());
