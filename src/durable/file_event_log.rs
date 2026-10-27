@@ -248,12 +248,13 @@ impl EventLog for FileEventLog {
     }
 
     fn read_from(&self, from: u64) -> Result<Vec<EventRecord>, DurableError> {
-        Ok(self
+        // Records are appended in sequence order, so the first match is found
+        // by binary search instead of scanning the whole log. Only the
+        // requested suffix is cloned.
+        let start = self
             .records
-            .iter()
-            .filter(|record| record.sequence >= from)
-            .cloned()
-            .collect())
+            .partition_point(|record| record.sequence < from);
+        Ok(self.records[start..].to_vec())
     }
 
     fn first_sequence(&self) -> Option<u64> {

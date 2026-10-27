@@ -106,6 +106,15 @@ pub trait MessageBus: Send + Sync + 'static {
     /// recorded as failed, and the remaining handlers still run; the call
     /// still returns `Ok(())` because publication itself succeeded.
     fn try_publish_any(&self, topic: &str, message: &dyn Any) -> Result<(), BusError>;
+
+    /// Whether at least one handler is registered under `topic`.
+    ///
+    /// The Event Publisher uses this to skip reading and cloning the log when
+    /// nobody is listening. The default keeps publication unconditional, so
+    /// an adapter that cannot answer cheaply remains correct.
+    fn has_subscribers(&self, _topic: &str) -> bool {
+        true
+    }
 }
 
 /// A registered bus handler: borrowed message in, synchronous, sendable.
@@ -200,6 +209,12 @@ impl InProcessBus {
 }
 
 impl MessageBus for InProcessBus {
+    fn has_subscribers(&self, topic: &str) -> bool {
+        self.lock()
+            .get(topic)
+            .is_some_and(|registrations| !registrations.is_empty())
+    }
+
     fn register_any(
         &self,
         endpoint: &str,

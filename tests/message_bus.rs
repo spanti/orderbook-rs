@@ -241,3 +241,27 @@ fn the_bus_is_object_safe_and_shareable_across_threads() {
 
     assert_eq!(received.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn has_subscribers_is_scoped_to_the_endpoint() {
+    let bus = InProcessBus::new();
+    assert!(!bus.has_subscribers(EVENTS_TOPIC));
+    assert!(!bus.has_subscribers("other"));
+
+    bus.register_any("other", Box::new(|_: &dyn Any| {}))
+        .expect("register on another endpoint");
+    assert!(
+        !bus.has_subscribers(EVENTS_TOPIC),
+        "a handler on another endpoint is not a subscriber of the events topic"
+    );
+    assert!(bus.has_subscribers("other"));
+
+    bus.register_any(EVENTS_TOPIC, Box::new(|_: &dyn Any| {}))
+        .expect("register on the events topic");
+    assert!(bus.has_subscribers(EVENTS_TOPIC));
+
+    // The publisher calls this through a trait object.
+    let dynamic: Arc<dyn MessageBus> = Arc::new(bus);
+    assert!(dynamic.has_subscribers(EVENTS_TOPIC));
+    assert!(!dynamic.has_subscribers("missing"));
+}

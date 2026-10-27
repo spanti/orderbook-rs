@@ -85,6 +85,14 @@ impl EventPublisher {
             return true;
         }
 
+        // Nobody is listening: skip the log read and clone entirely. A
+        // consumer that registers later receives live events only and catches
+        // up from the log, exactly as a consumer that misses a publication.
+        if !self.bus.has_subscribers(EVENTS_TOPIC) {
+            self.last_published = durable;
+            return true;
+        }
+
         let read = lock(&self.log).read_from(self.last_published.saturating_add(1));
         let records = match read {
             Ok(records) => records,
@@ -141,4 +149,157 @@ pub(crate) fn spawn(
         .spawn(move || publisher.run(done_sender))
         .expect("start the Event Publisher thread");
     (handle, done_receiver)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::any::Any;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::bus::BusError;
+    use crate::durable::{DurableError, EventLog, EventRecord, FORMAT_VERSION, LogHeader};
+    use crate::event::DomainEvent;
+    use crate::types::{EngineCommand, EngineError};
+
+    fn record(sequence: u64) -> EventRecord {
+        EventRecord {
+            format_version: FORMAT_VERSION,
+            sequence,
+            command_id: sequence,
+            event: DomainEvent::OrderRejected {
+                symbol: "BTC-USDT".to_string(),
+                reason: EngineError::UnknownOrder,
+                command: EngineCommand::CancelOrder {
+                    symbol: "BTC-USDT".to_string(),
+                    order_id: sequence,
+                },
+            },
+        }
+    }
+
+    struct CountingLog {
+        reads: Arc<AtomicUsize>,
+        records: Vec<EventRecord>,
+    }
+
+    impl EventLog for CountingLog {
+        fn read_header(&self) -> Result<Option<LogHeader>, DurableError> {
+            Ok(None)
+        }
+
+        fn write_header(&mut self, _header: LogHeader) -> Result<(), DurableError> {
+            Ok(())
+        }
+
+        fn append(&mut self, _record: EventRecord) -> Result<(), DurableError> {
+            Ok(())
+        }
+
+        fn read_from(&self, from: u64) -> Result<Vec<EventRecord>, DurableError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Ok(self
+                .records
+                .iter()
+                .filter(|record| record.sequence >= from)
+                .cloned()
+                .collect())
+        }
+
+        fn first_sequence(&self) -> Option<u64> {
+            self.records.first().map(|record| record.sequence)
+        }
+
+        fn last_stored_sequence(&self) -> Option<u64> {
+            self.records.last().map(|record| record.sequence)
+        }
+
+        fn last_command_id(&self) -> Option<u64> {
+            self.records.last().map(|record| record.command_id)
+        }
+    }
+
+    struct TestBus {
+        subscribers: bool,
+        published: AtomicUsize,
+    }
+
+    impl MessageBus for TestBus {
+        fn register_any(
+            &self,
+            _endpoint: &str,
+            _handler: Box<dyn Fn(&dyn Any) + Send + 'static>,
+        ) -> Result<(), BusError> {
+            Ok(())
+        }
+
+        fn register_response_handler(
+            &self,
+            _correlation_id: u64,
+            _handler: Box<dyn Fn(&dyn Any) + Send + 'static>,
+        ) -> Result<(), BusError> {
+            Err(BusError::Unsupported)
+        }
+
+        fn send_any(&self, _endpoint: &str, _message: &dyn Any) -> Result<(), BusError> {
+            Err(BusError::Unsupported)
+        }
+
+        fn try_publish_any(&self, _topic: &str, _message: &dyn Any) -> Result<(), BusError> {
+            self.published.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn has_subscribers(&self, _topic: &str) -> bool {
+            self.subscribers
+        }
+    }
+
+    fn publisher(subscribers: bool) -> (EventPublisher, Arc<AtomicUsize>, Arc<TestBus>) {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let log = CountingLog {
+            reads: Arc::clone(&reads),
+            records: (1..=3).map(record).collect(),
+        };
+        let bus = Arc::new(TestBus {
+            subscribers,
+            published: AtomicUsize::new(0),
+        });
+        let bus_dyn: Arc<dyn MessageBus> = bus.clone();
+        let shared = SharedState::new(None);
+        shared.watermark().publish_durable(3);
+
+        let publisher = EventPublisher {
+            log: Arc::new(Mutex::new(Box::new(log) as Box<dyn EventLog>)),
+            shared,
+            bus: bus_dyn,
+            last_published: 0,
+        };
+        (publisher, reads, bus)
+    }
+
+    #[test]
+    fn drain_skips_the_log_when_nobody_is_subscribed() {
+        let (mut publisher, reads, bus) = publisher(false);
+
+        assert!(publisher.drain());
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            0,
+            "an unsubscribed publisher must not read or clone the log"
+        );
+        assert_eq!(bus.published.load(Ordering::Relaxed), 0);
+        assert_eq!(publisher.last_published, 3);
+    }
+
+    #[test]
+    fn drain_reads_and_publishes_when_a_subscriber_exists() {
+        let (mut publisher, reads, bus) = publisher(true);
+
+        assert!(publisher.drain());
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        assert_eq!(bus.published.load(Ordering::Relaxed), 3);
+        assert_eq!(publisher.last_published, 3);
+    }
 }

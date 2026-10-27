@@ -110,14 +110,30 @@ fn contract_append_and_bounds(log: &mut dyn EventLog) {
 
 fn contract_read_from_is_ordered(log: &mut dyn EventLog) {
     log.write_header(header()).unwrap();
+
+    // An empty log has no records regardless of the requested sequence.
+    assert!(log.read_from(0).unwrap().is_empty());
+    assert!(log.read_from(1).unwrap().is_empty());
+    assert!(log.read_from(u64::MAX).unwrap().is_empty());
+
     for sequence in 1..=4 {
         log.append(record(sequence)).unwrap();
     }
 
+    let all = (1..=4).map(record).collect::<Vec<_>>();
+    // From below the first record returns the whole log; the boundaries
+    // themselves are inclusive at `from` and exclusive at `from + 1`.
+    assert_eq!(log.read_from(0).unwrap(), all);
+    assert_eq!(log.read_from(1).unwrap(), all);
+    assert_eq!(
+        log.read_from(2).unwrap(),
+        (2..=4).map(record).collect::<Vec<_>>()
+    );
     assert_eq!(
         log.read_from(3).unwrap(),
         (3..=4).map(record).collect::<Vec<_>>()
     );
+    assert_eq!(log.read_from(4).unwrap(), vec![record(4)]);
     assert!(log.read_from(5).unwrap().is_empty());
     assert!(log.read_from(u64::MAX).unwrap().is_empty());
 }
@@ -140,8 +156,38 @@ fn contract_non_contiguous_append_is_rejected(log: &mut dyn EventLog) {
             found: 3,
         })
     );
+    // A rejected append leaves the stored log untouched.
+    assert_eq!(log.read_from(1).unwrap(), vec![record(1)]);
+    assert!(log.read_from(2).unwrap().is_empty());
+
     log.append(record(2)).unwrap();
     assert_eq!(log.last_stored_sequence(), Some(2));
+
+    // A duplicate of an already stored sequence is rejected as
+    // non-contiguous, and still leaves the log unchanged.
+    assert_eq!(
+        log.append(record(2)),
+        Err(DurableError::NonContiguousSequence {
+            expected: 3,
+            found: 2,
+        })
+    );
+    assert_eq!(log.read_from(1).unwrap(), vec![record(1), record(2)]);
+    assert_eq!(log.read_from(2).unwrap(), vec![record(2)]);
+    assert!(log.read_from(3).unwrap().is_empty());
+}
+
+fn contract_empty_batch_is_a_noop(log: &mut dyn EventLog) {
+    log.write_header(header()).unwrap();
+
+    log.append_batch(Vec::new()).unwrap();
+    assert_eq!(log.last_stored_sequence(), None);
+    assert!(log.read_from(0).unwrap().is_empty());
+
+    log.append(record(1)).unwrap();
+    log.append_batch(Vec::new()).unwrap();
+    assert_eq!(log.last_stored_sequence(), Some(1));
+    assert_eq!(log.read_from(1).unwrap(), vec![record(1)]);
 }
 
 fn contract_batch_append(log: &mut dyn EventLog) {
@@ -152,6 +198,8 @@ fn contract_batch_append(log: &mut dyn EventLog) {
         log.read_from(1).unwrap(),
         (1..=4).map(record).collect::<Vec<_>>()
     );
+    assert_eq!(log.read_from(4).unwrap(), vec![record(4)]);
+    assert!(log.read_from(5).unwrap().is_empty());
     assert_eq!(log.last_stored_sequence(), Some(4));
     assert_eq!(log.last_command_id(), Some(2));
 }
@@ -208,6 +256,15 @@ fn both_adapters_append_a_contiguous_batch() {
     let dir = tempdir().unwrap();
     let mut file = FileEventLog::open(dir.path().join("events.log")).unwrap();
     contract_batch_append(&mut file);
+}
+
+#[test]
+fn both_adapters_treat_an_empty_batch_as_a_noop() {
+    contract_empty_batch_is_a_noop(&mut InMemoryEventLog::new());
+
+    let dir = tempdir().unwrap();
+    let mut file = FileEventLog::open(dir.path().join("events.log")).unwrap();
+    contract_empty_batch_is_a_noop(&mut file);
 }
 
 // ---------------------------------------------------------------------------
