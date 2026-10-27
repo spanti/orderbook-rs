@@ -323,11 +323,17 @@ impl DurableMatchingEngine {
     /// command boundary. A failure is recorded on the engine and surfaced
     /// through [`Self::last_snapshot_error`]; it never undoes a durable command.
     pub fn snapshot_now(&mut self) -> Result<(), DurableError> {
-        let stored = StoredSnapshot {
-            format_version: FORMAT_VERSION,
-            applied_seq: self.sequencer.applied_seq(),
-            last_command_id: self.sequencer.last_command_id(),
-            snapshot: self.engine.capture_snapshot(),
+        let stored = match StoredSnapshot::capture_checked(
+            &self.engine,
+            self.sequencer.applied_seq(),
+            self.log.last_stored_sequence().unwrap_or(0),
+            self.sequencer.last_command_id(),
+        ) {
+            Ok(stored) => stored,
+            Err(error) => {
+                self.last_snapshot_error = Some(error.clone());
+                return Err(error);
+            }
         };
 
         match self.snapshots.save(stored) {

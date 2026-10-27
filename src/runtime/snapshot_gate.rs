@@ -10,7 +10,7 @@
 //! a snapshot never covers a half-applied command or an event the log does not
 //! hold.
 
-use crate::durable::{FORMAT_VERSION, StoredSnapshot};
+use crate::durable::StoredSnapshot;
 use crate::engine::MatchingEngine;
 
 use super::snapshot::{SnapshotSend, SnapshotSink};
@@ -87,6 +87,7 @@ impl CadenceSnapshotGate {
         &mut self,
         engine: &MatchingEngine,
         applied_seq: u64,
+        durable_seq: u64,
         last_command_id: u64,
     ) -> bool {
         if applied_seq <= self.last_snapshot_seq {
@@ -94,11 +95,20 @@ impl CadenceSnapshotGate {
             return true;
         }
 
-        let stored = StoredSnapshot {
-            format_version: FORMAT_VERSION,
+        let stored = match StoredSnapshot::capture_checked(
+            engine,
             applied_seq,
+            durable_seq,
             last_command_id,
-            snapshot: engine.capture_snapshot(),
+        ) {
+            Ok(stored) => stored,
+            Err(_) => {
+                // Durability has not caught up to the boundary. Keep the
+                // snapshot due and let matching continue; the next boundary
+                // where the watermark agrees retries.
+                self.pending = SnapshotPending::Due;
+                return false;
+            }
         };
 
         match self.sink.try_send(stored) {
@@ -142,14 +152,14 @@ impl SnapshotGate for CadenceSnapshotGate {
                 // The watermark caught up; capturing may still find the
                 // worker channel full, in which case matching continues and
                 // the capture stays due.
-                self.try_capture(engine, applied_seq, last_command_id);
+                self.try_capture(engine, applied_seq, durable_seq, last_command_id);
                 GateDecision::Continue
             }
             SnapshotPending::Due => {
                 // A full worker channel must never stall matching. Retry at
                 // the next boundary where durability has caught up.
                 if applied_seq == durable_seq {
-                    self.try_capture(engine, applied_seq, last_command_id);
+                    self.try_capture(engine, applied_seq, durable_seq, last_command_id);
                 }
                 GateDecision::Continue
             }
@@ -161,7 +171,7 @@ impl SnapshotGate for CadenceSnapshotGate {
                     return GateDecision::Pause;
                 }
 
-                self.try_capture(engine, applied_seq, last_command_id);
+                self.try_capture(engine, applied_seq, durable_seq, last_command_id);
                 GateDecision::Continue
             }
         }

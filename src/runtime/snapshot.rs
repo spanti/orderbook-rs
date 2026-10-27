@@ -14,7 +14,7 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use crate::durable::{DurableError, FORMAT_VERSION, SnapshotStore, StoredSnapshot};
+use crate::durable::{DurableError, SnapshotStore, StoredSnapshot};
 use crate::engine::MatchingEngine;
 
 use super::sync::lock;
@@ -95,18 +95,9 @@ impl SnapshotSink {
         durable_seq: u64,
         last_command_id: u64,
     ) -> Result<(), DurableError> {
-        if applied_seq != durable_seq {
-            return Err(DurableError::Storage(format!(
-                "cannot snapshot applied sequence {applied_seq} with durable sequence {durable_seq}"
-            )));
-        }
-
-        self.save_and_wait(StoredSnapshot {
-            format_version: FORMAT_VERSION,
-            applied_seq,
-            last_command_id,
-            snapshot: engine.capture_snapshot(),
-        })
+        let stored =
+            StoredSnapshot::capture_checked(engine, applied_seq, durable_seq, last_command_id)?;
+        self.save_and_wait(stored)
     }
 }
 
@@ -160,7 +151,7 @@ pub(crate) fn spawn(store: Box<dyn SnapshotStore>) -> (SnapshotSink, JoinHandle<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::durable::InMemorySnapshotStore;
+    use crate::durable::{FORMAT_VERSION, InMemorySnapshotStore};
     use crate::snapshot::EngineSnapshot;
     use crate::types::EngineConfig;
     use std::time::{Duration, Instant};

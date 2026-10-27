@@ -5,9 +5,7 @@ use std::collections::HashMap;
 use crate::event::{DomainEvent, OrderCancelReason};
 use crate::ledger::OrderLedger;
 use crate::orderbook::{BookView, OrderBook};
-use crate::snapshot::{
-    BookState, EngineSnapshot, LastTradeState, LedgerEntry, PriceLevelState, StopBookState,
-};
+use crate::snapshot::EngineSnapshot;
 use crate::stop_book::{StopBook, StopView};
 use crate::types::{
     BookSnapshot, EngineCommand, EngineConfig, EngineError, Fill, ModifyRequest, Order,
@@ -16,16 +14,36 @@ use crate::types::{
 };
 
 #[derive(Debug, Clone, Copy)]
-struct LastTrade {
-    price: u64,
-    timestamp: u64,
+pub(crate) struct LastTrade {
+    pub(crate) price: u64,
+    pub(crate) timestamp: u64,
 }
 
-fn price_level_states(levels: Vec<(u64, Vec<Order>)>) -> Vec<PriceLevelState> {
-    levels
-        .into_iter()
-        .map(|(price, orders)| PriceLevelState { price, orders })
-        .collect()
+/// Borrowed view of every field needed to capture an [`EngineSnapshot`].
+///
+/// This is the only seam through which `crate::snapshot` reads engine state; the
+/// engine fields themselves stay private.
+pub(crate) struct EnginePartsRef<'a> {
+    pub(crate) config: EngineConfig,
+    pub(crate) next_order_id: u64,
+    pub(crate) next_trade_id: u64,
+    pub(crate) books: &'a HashMap<String, OrderBook>,
+    pub(crate) ledger: &'a OrderLedger,
+    pub(crate) stops: &'a HashMap<String, StopBook>,
+    pub(crate) last_trades: &'a HashMap<String, LastTrade>,
+    pub(crate) trades: &'a [Trade],
+}
+
+/// Owned counterpart of [`EnginePartsRef`], used to rebuild an engine.
+pub(crate) struct EngineParts {
+    pub(crate) config: EngineConfig,
+    pub(crate) next_order_id: u64,
+    pub(crate) next_trade_id: u64,
+    pub(crate) books: HashMap<String, OrderBook>,
+    pub(crate) ledger: OrderLedger,
+    pub(crate) stops: HashMap<String, StopBook>,
+    pub(crate) last_trades: HashMap<String, LastTrade>,
+    pub(crate) trades: Vec<Trade>,
 }
 
 // I want to implement a matching engine for the order book system
@@ -527,58 +545,7 @@ impl MatchingEngine {
     /// Books (including empty ones), ledger records, stop books and last trades
     /// are emitted in a canonical order so equal state has equal bytes.
     pub fn capture_snapshot(&self) -> EngineSnapshot {
-        let mut book_symbols: Vec<&String> = self.order_books.keys().collect();
-        book_symbols.sort();
-        let books = book_symbols
-            .into_iter()
-            .map(|symbol| {
-                let (bids, asks) = self.order_books[symbol].export_levels();
-                BookState {
-                    symbol: symbol.clone(),
-                    bids: price_level_states(bids),
-                    asks: price_level_states(asks),
-                }
-            })
-            .collect();
-
-        let ledger = self
-            .ledger
-            .export_records()
-            .into_iter()
-            .map(|(order_id, record)| LedgerEntry { order_id, record })
-            .collect();
-
-        let mut stop_symbols: Vec<&String> = self.stop_books.keys().collect();
-        stop_symbols.sort();
-        let stops = stop_symbols
-            .into_iter()
-            .map(|symbol| StopBookState {
-                symbol: symbol.clone(),
-                stops: self.stop_books[symbol].export_stops(),
-            })
-            .collect();
-
-        let mut last_trades: Vec<LastTradeState> = self
-            .last_trades
-            .iter()
-            .map(|(symbol, last)| LastTradeState {
-                symbol: symbol.clone(),
-                price: last.price,
-                timestamp: last.timestamp,
-            })
-            .collect();
-        last_trades.sort_by(|left, right| left.symbol.cmp(&right.symbol));
-
-        EngineSnapshot {
-            config: self.config,
-            next_order_id: self.next_order_id,
-            next_trade_id: self.next_trade_id,
-            books,
-            ledger,
-            stops,
-            last_trades,
-            trades: self.trades.clone(),
-        }
+        EngineSnapshot::capture(self)
     }
 
     /// Rebuild an engine from a snapshot without running any matching.
@@ -587,62 +554,38 @@ impl MatchingEngine {
     /// the stored orders; the ledger and both stop indexes are reinserted
     /// directly. Events start empty.
     pub fn restore_snapshot(snapshot: EngineSnapshot) -> Self {
-        let order_books = snapshot
-            .books
-            .into_iter()
-            .map(|state| {
-                let bids = state
-                    .bids
-                    .into_iter()
-                    .map(|level| (level.price, level.orders))
-                    .collect();
-                let asks = state
-                    .asks
-                    .into_iter()
-                    .map(|level| (level.price, level.orders))
-                    .collect();
-                (state.symbol, OrderBook::from_levels(bids, asks))
-            })
-            .collect();
+        snapshot.restore()
+    }
 
-        let ledger = OrderLedger::from_records(
-            snapshot
-                .ledger
-                .into_iter()
-                .map(|entry| (entry.order_id, entry.record))
-                .collect(),
-        );
+    /// Borrow the engine fields the snapshot module needs.
+    pub(crate) fn parts(&self) -> EnginePartsRef<'_> {
+        EnginePartsRef {
+            config: self.config,
+            next_order_id: self.next_order_id,
+            next_trade_id: self.next_trade_id,
+            books: &self.order_books,
+            ledger: &self.ledger,
+            stops: &self.stop_books,
+            last_trades: &self.last_trades,
+            trades: &self.trades,
+        }
+    }
 
-        let stop_books = snapshot
-            .stops
-            .into_iter()
-            .map(|state| (state.symbol, StopBook::from_stops(state.stops)))
-            .collect();
-
-        let last_trades = snapshot
-            .last_trades
-            .into_iter()
-            .map(|last| {
-                (
-                    last.symbol,
-                    LastTrade {
-                        price: last.price,
-                        timestamp: last.timestamp,
-                    },
-                )
-            })
-            .collect();
-
+    /// Rebuild an engine from owned parts, dropping the derived event cursor.
+    ///
+    /// A snapshot does not store the applied event boundary; the durable layer
+    /// sets it after restoring.
+    pub(crate) fn from_parts(parts: EngineParts) -> Self {
         Self {
-            order_books,
-            trades: snapshot.trades,
-            next_trade_id: snapshot.next_trade_id,
-            config: snapshot.config,
-            ledger,
-            next_order_id: snapshot.next_order_id,
+            order_books: parts.books,
+            trades: parts.trades,
+            next_trade_id: parts.next_trade_id,
+            config: parts.config,
+            ledger: parts.ledger,
+            next_order_id: parts.next_order_id,
             last_applied_sequence: 0,
-            stop_books,
-            last_trades,
+            stop_books: parts.stops,
+            last_trades: parts.last_trades,
         }
     }
 
