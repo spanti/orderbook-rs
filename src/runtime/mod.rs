@@ -12,16 +12,21 @@
 //!
 //! # Thread ownership
 //!
-//! - **Matching thread**: owns all mutable engine state, the applied and next
+//! - **Matching thread**: owns all mutable engine state, the next event and
 //!   command counters, the journal buffer, the pending-durable queue, and the
 //!   snapshot gate. It is the only writer, so the single-writer invariant is a
 //!   structural property rather than a convention.
-//! - **Journal thread**: owns the [`CommandLog`](crate::durable::CommandLog).
+//! - **Journal thread**: owns the [`EventLog`](crate::durable::EventLog).
 //!   It coalesces batches, calls `append_batch`, and advances the shared
 //!   durability watermark only after the append returns.
+//! - **Event Publisher**: runs on its own thread. It shares the log handle with
+//!   the journal only to read committed records, and synchronously publishes
+//!   durable [`EventRecord`](crate::durable::EventRecord)s on the
+//!   [`MessageBus`](crate::bus::MessageBus). It starts at the recovered
+//!   durability watermark and never replays history.
 //! - **Snapshot worker**: owns the
-//!   [`SnapshotStore`](crate::durable::SnapshotStore) and saves snapshots off
-//!   the matching thread.
+//!   [`SnapshotStore`](crate::durable::SnapshotStore) and saves
+//!   snapshots off the matching thread.
 //! - **Producers**: own only [`EngineHandle`] clones. They never touch engine
 //!   state.
 //!
@@ -30,9 +35,10 @@
 //! ```text
 //! producers --try_submit--> ingress sync_channel(queue_capacity)
 //!     --> matching thread --apply--> Applied Acknowledgement
-//!         matching thread --Vec<CommandRecord>--> journal sync_channel(journal_batch_capacity)
+//!         matching thread --Vec<EventRecord>--> journal sync_channel(journal_batch_capacity)
 //!             --> journal thread --append_batch + fsync--> durability watermark
 //!                 --> matching thread --Durable Acknowledgement
+//!                 --> Event Publisher --read_from(watermark)--> MessageBus subscribers
 //!         matching thread --StoredSnapshot--> snapshot sync_channel(1)
 //!             --> snapshot worker --save--> SnapshotStore
 //! ```
@@ -45,16 +51,21 @@
 //!
 //! # Ordering guarantees
 //!
-//! - The matching thread assigns one global, contiguous command sequence in
-//!   application order. Sequences are the recovery and snapshot boundary and
-//!   are unrelated to event sequences: one command may emit several events.
+//! - The matching thread assigns one global, contiguous **event** sequence in
+//!   application order and one `command_id` per command. The event sequence is
+//!   the recovery, durability, and snapshot boundary; `command_id` groups the
+//!   events one command produced.
 //! - Commands submitted from one producer thread are applied in submission
 //!   order because the std channel preserves per-sender FIFO. Commands from
 //!   different producers interleave in whatever order the queue serializes;
 //!   that interleaving is the engine's total order.
 //! - `applied_seq` never decreases, and the durability watermark never exceeds
-//!   it. A durable acknowledgement is sent only after its record is in the
-//!   log.
+//!   it. A durable acknowledgement is sent only after the command's **last**
+//!   event sequence is in the log.
+//! - The Event Publisher dispatches durable records in event-sequence order.
+//!   The bus is synchronous, so a slow handler delays publication for every
+//!   subscriber but never the matching thread; a handler panic is isolated.
+//!   Consumers that miss events read `EventLog::read_from(last_seen + 1)`.
 //!
 //! # Failure modes
 //!
@@ -72,12 +83,16 @@
 //!   `"snapshot"`).
 //! - Shutdown is bounded by [`RuntimeConfig::shutdown_timeout`]. A journal
 //!   already blocked in an fsync cannot be interrupted, so the final join may
-//!   still wait for that fsync.
+//!   still wait for that fsync. Publication is drained to the final durability
+//!   watermark; a handler that cannot be interrupted is detached at the
+//!   timeout, and consumers catch up from the event log.
 //!
 //! # Non-goals and known deviations
 //!
-//! - No read or query API through [`EngineHandle`]. There is no market-data
-//!   output stream, and the runtime clears engine events after every command.
+//! - No read or query API through [`EngineHandle`]. Durable events are emitted
+//!   on the [`MessageBus`](crate::bus::MessageBus); the applied receipt also
+//!   carries the command's events. The bus is in-process, synchronous, and has
+//!   no per-subscriber queue, lag detection, or command path.
 //! - No client idempotency or request deduplication; `request_id` is
 //!   observability only.
 //! - No per-symbol sharding, timers, GTT, or auction events.
@@ -89,7 +104,7 @@
 //! - One journal thread with group commit; no replication and no `io_uring`.
 //!   There is no real-time priority or NUMA control, and core affinity is
 //!   opt-in only.
-//! - Trade history, the order ledger, and the command log grow for the process
+//! - Trade history, the order ledger, and the event log grow for the process
 //!   lifetime; snapshots grow with the ledger and trades. Retention and
 //!   archival are out of scope.
 //! - `wait_applied` is preliminary and can lose data on a crash between apply
@@ -104,6 +119,7 @@ pub(crate) mod journal;
 pub(crate) mod lifecycle;
 pub(crate) mod matching;
 pub mod metrics;
+pub(crate) mod publisher;
 pub(crate) mod shared;
 pub(crate) mod snapshot;
 pub(crate) mod snapshot_gate;
@@ -142,7 +158,7 @@ pub struct RuntimeConfig {
     pub journal_coalesce_max: usize,
     /// Upper bound on how long the first record in a group waits for a flush.
     pub journal_flush_interval: Duration,
-    /// Automatic snapshot cadence in command sequences; `0` disables them.
+    /// Automatic snapshot cadence in **event** sequences; `0` disables them.
     pub snapshot_cadence: u64,
     /// How the matching thread waits when the queue is empty.
     pub idle: IdleStrategy,

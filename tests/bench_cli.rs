@@ -86,6 +86,36 @@ fn runtime_path_runs_a_tiny_workload_and_prints_both_latency_families() {
 }
 
 #[test]
+fn decide_path_reports_event_volume_and_the_applied_slo_gate() {
+    let output = bench(&[
+        "--allow-debug",
+        "--path",
+        "decide",
+        "--events",
+        "200",
+        "--warmup",
+        "10",
+        "--rate",
+        "0",
+    ]);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("decide metrics"));
+    assert!(text.contains("event volume"));
+    assert!(text.contains("events/command"));
+    assert!(text.contains("submit -> decide"));
+    assert!(text.contains("target=10,000 ns"));
+    // The decide path is gated against the applied SLO. On Windows the
+    // tick-limited clock makes the status functional-only.
+    assert!(text.contains("PASS") || text.contains("FAIL") || text.contains("NOT APPLICABLE"));
+    if cfg!(target_os = "windows") {
+        assert!(text.contains("NOT APPLICABLE"));
+        assert!(text.contains("QPC"));
+    }
+}
+
+#[test]
 fn runtime_path_supports_in_flight_and_file_log() {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -119,7 +149,7 @@ fn runtime_path_supports_in_flight_and_file_log() {
     assert!(output.status.success(), "stderr: {stderr_text}");
     assert!(text.contains("log=file"));
     assert!(text.contains("in_flight=4"));
-    assert!(dir.join("commands.log").exists());
+    assert!(dir.join("events.log").exists());
     assert!(dir.join("snapshots").exists());
 
     let _ = std::fs::remove_dir_all(&dir);

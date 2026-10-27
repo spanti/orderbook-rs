@@ -10,25 +10,28 @@
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use crate::types::CommandOutcome;
+use crate::event::DomainEvent;
 
 use super::RuntimeConfig;
 use super::error::RuntimeError;
 
-/// The engine's result for one command, tagged with its command sequence.
+/// The events one command produced, tagged with their event-sequence range.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandReceipt {
-    pub outcome: CommandOutcome,
-    /// Global command sequence assigned by the matching thread. Not an event
-    /// sequence: one command may emit several events.
-    pub command_sequence: u64,
+    /// Every event the command decided, in apply order.
+    pub events: Vec<DomainEvent>,
+    /// Global event sequence assigned to the first event.
+    pub first_event_sequence: u64,
+    /// Global event sequence assigned to the last event. This is the value the
+    /// durability watermark must reach before the command is durable.
+    pub last_event_sequence: u64,
 }
 
 /// Results written into one response slot.
 ///
 /// `applied` is the preliminary acknowledgement; `durable` is set once the
-/// record is confirmed in the command log. `stopped` unblocks waiters when a
-/// worker disappears before both results are written.
+/// command's event records are confirmed in the event log. `stopped` unblocks
+/// waiters when a worker disappears before both results are written.
 #[derive(Debug, Default)]
 pub(crate) struct SlotState {
     pub applied: Option<Result<CommandReceipt, RuntimeError>>,
@@ -322,7 +325,7 @@ impl Ticket {
         self.wait(WaitLevel::Applied, Some(timeout))
     }
 
-    /// Wait until the command record is durable in the command log.
+    /// Wait until every event of the command is durable in the event log.
     pub fn wait_durable(&self) -> Result<CommandReceipt, RuntimeError> {
         self.wait(WaitLevel::Durable, None)
     }
@@ -414,14 +417,23 @@ fn read_result(
 mod tests {
     use super::*;
     use crate::durable::DurableError;
-    use crate::types::EngineError;
+    use crate::event::DomainEvent;
+    use crate::types::{EngineCommand, EngineError};
     use std::sync::Arc;
     use std::time::Duration;
 
     fn receipt(sequence: u64) -> CommandReceipt {
         CommandReceipt {
-            outcome: CommandOutcome::Rejected(EngineError::UnknownOrder),
-            command_sequence: sequence,
+            events: vec![DomainEvent::OrderRejected {
+                symbol: "BTC-USDT".to_string(),
+                reason: EngineError::UnknownOrder,
+                command: EngineCommand::CancelOrder {
+                    symbol: "BTC-USDT".to_string(),
+                    order_id: 7,
+                },
+            }],
+            first_event_sequence: sequence,
+            last_event_sequence: sequence,
         }
     }
 

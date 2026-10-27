@@ -126,7 +126,7 @@ pub enum OrderStatus {
     PartiallyFilled, // 部分成交，剩余挂在簿上
     Filled,          // 全部成交
     Canceled,        // 未成交或剩余部分被丢弃（市价单/IOC）
-    PendingTrigger,   // 等待触发的止损单
+    PendingTrigger,  // 等待触发的止损单
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -154,11 +154,17 @@ impl OrderRecord {
 
     /// Whether the order is still working on the book.
     pub fn is_open(&self) -> bool {
-        matches!(self.status, OrderStatus::New | OrderStatus::PartiallyFilled | OrderStatus::PendingTrigger)
+        matches!(
+            self.status,
+            OrderStatus::New | OrderStatus::PartiallyFilled | OrderStatus::PendingTrigger
+        )
     }
 
-    /// Record a maker fill delta reported by the book.
-    pub(crate) fn apply_maker_fill(&mut self, quantity: u64) {
+    /// Record a fill delta for either the maker or the taker.
+    ///
+    /// The ledger only tracks filled and remaining quantities, so both sides
+    /// apply the same delta.
+    pub(crate) fn apply_fill(&mut self, quantity: u64) {
         debug_assert!(
             quantity <= self.remaining_quantity,
             "maker fill {quantity} exceeds remaining {}",
@@ -170,30 +176,6 @@ impl OrderRecord {
             OrderStatus::Filled
         } else {
             OrderStatus::PartiallyFilled
-        };
-        self.debug_assert_invariant();
-    }
-
-    /// Record the taker's final match result. `rests` is true when the
-    /// leftover was placed on the book, as opposed to discarded (IOC/market).
-    pub(crate) fn complete_taker(&mut self, remaining_quantity: u64, rests: bool) {
-        debug_assert!(
-            remaining_quantity <= self.original_quantity,
-            "remaining {remaining_quantity} exceeds original {}",
-            self.original_quantity
-        );
-        self.filled_quantity = self.original_quantity.saturating_sub(remaining_quantity);
-        self.remaining_quantity = remaining_quantity;
-        self.status = if remaining_quantity == 0 {
-            OrderStatus::Filled
-        } else if rests {
-            if self.filled_quantity > 0 {
-                OrderStatus::PartiallyFilled
-            } else {
-                OrderStatus::New
-            }
-        } else {
-            OrderStatus::Canceled
         };
         self.debug_assert_invariant();
     }
@@ -210,19 +192,6 @@ impl OrderRecord {
         self.debug_assert_invariant();
     }
 
-    /// The single projection from a record to an execution report.
-    pub(crate) fn to_report(&self, order_id: OrderBookId, fills: Vec<Trade>) -> ExecutionReport {
-        ExecutionReport {
-            order_id,
-            symbol: self.symbol.clone(),
-            status: self.status,
-            original_quantity: self.original_quantity,
-            filled_quantity: self.filled_quantity,
-            remaining_quantity: self.remaining_quantity,
-            fills,
-        }
-    }
-
     /// Every mutation must preserve `filled + remaining == original`.
     fn debug_assert_invariant(&self) {
         debug_assert_eq!(
@@ -235,24 +204,6 @@ impl OrderRecord {
             self.status
         );
     }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ExecutionReport {
-    pub order_id: u64,
-    pub symbol: String,
-    pub status: OrderStatus,
-    pub original_quantity: u64,
-    pub filled_quantity: u64,
-    pub remaining_quantity: u64,
-    pub fills: Vec<Trade>,
-}
-
-#[derive(Debug, Clone)]
-pub struct CancelReport {
-    pub order_id: OrderBookId,
-    pub symbol: String,
-    pub canceled_quantity: u64, // 撤单时的剩余量
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -272,7 +223,7 @@ impl Default for EngineConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EngineError {
     QuantityOutOfRange,
     PriceNotOnTick,
@@ -315,49 +266,14 @@ pub enum EngineCommand {
     },
 }
 
-/// What [`crate::engine::MatchingEngine::execute`] did with a command.
-#[derive(Debug, Clone, PartialEq)]
-pub enum CommandOutcome {
-    Accepted(ExecutionReport),
-    Canceled(ExecutionReport),
-    Rejected(EngineError),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum EngineEvent {
-    OrderAccepted {
-        sequence_id: u64,
-        report: ExecutionReport,
-    },
-    TradeExecuted {
-        sequence_id: u64,
-        trade: Trade,
-    },
-    OrderCanceled {
-        sequence_id: u64,
-        report: ExecutionReport,
-    },
-    OrderRejected {
-        sequence_id: u64,
-        reason: EngineError,
-    },
-    StopTriggered {
-        symbol: String,
-        sequence_id: u64,
-        order_id: OrderBookId,
-        stop_price: u64,
-        last_price: u64,   // 触发瞬间的成交价
-    },
-}
-
-impl EngineEvent {
-    pub fn sequence_id(&self) -> u64 {
+impl EngineCommand {
+    /// The symbol every command variant carries.
+    pub fn symbol(&self) -> &str {
         match self {
-            EngineEvent::OrderAccepted { sequence_id, .. } => *sequence_id,
-            EngineEvent::TradeExecuted { sequence_id, .. } => *sequence_id,
-            EngineEvent::OrderCanceled { sequence_id, .. } => *sequence_id,
-            EngineEvent::OrderRejected { sequence_id, .. } => *sequence_id,
-            EngineEvent::StopTriggered { sequence_id, .. } => *sequence_id,
+            Self::SubmitOrder { symbol, .. }
+            | Self::SubmitStopOrder { symbol, .. }
+            | Self::CancelOrder { symbol, .. }
+            | Self::ModifyOrder { symbol, .. } => symbol,
         }
     }
 }
@@ -373,7 +289,7 @@ pub struct BookSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum StopKind {
     Market,
-    Limit { price: u64 },   // 触发后转换成的限价
+    Limit { price: u64 }, // 触发后转换成的限价
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -593,7 +509,11 @@ mod serialization_tests {
         let mut engine = crate::engine::MatchingEngine::default();
         assert_eq!(
             engine.execute(command.clone()),
-            CommandOutcome::Rejected(EngineError::QuantityOutOfRange)
+            vec![crate::event::DomainEvent::OrderRejected {
+                symbol: "BTCUSDT".to_string(),
+                reason: EngineError::QuantityOutOfRange,
+                command: command.clone(),
+            }]
         );
 
         let json = serde_json::to_value(&command).expect("rejected command must serialize");
@@ -620,10 +540,7 @@ mod serialization_tests {
         assert!(serde_json::from_str::<StopKind>(r#""TrailingStop""#).is_err());
         assert!(serde_json::from_str::<OrderStatus>(r#""Expired""#).is_err());
         assert!(
-            serde_json::from_str::<EngineCommand>(
-                r#"{"CancelAll":{"symbol":"BTCUSDT"}}"#
-            )
-            .is_err()
+            serde_json::from_str::<EngineCommand>(r#"{"CancelAll":{"symbol":"BTCUSDT"}}"#).is_err()
         );
     }
 }

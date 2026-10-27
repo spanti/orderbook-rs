@@ -36,15 +36,20 @@ pub enum BenchPath {
     Direct,
     /// Submit through the matching runtime's bounded Command Queue.
     Runtime,
+    /// Measure the pure event-sourced `decide` step only.
+    ///
+    /// This is the decision-scratch baseline: command in, events out, with no
+    /// engine clone and no state mutation.
+    Decide,
 }
 
 /// Storage adapters used by the runtime path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LogKind {
-    /// In-memory command log and snapshot store.
+    /// In-memory event log and snapshot store.
     #[default]
     Memory,
-    /// File-backed command log and snapshot store under `--data-dir`.
+    /// File-backed event log and snapshot store under `--data-dir`.
     File,
 }
 
@@ -73,6 +78,7 @@ Options:
 
 Runtime path options:
   --path direct|runtime    Execution path (default: direct)
+  --path decide            Pure event-sourced decide baseline
   --queue-capacity <N>     Ingress Command Queue capacity (default: 1024)
   --journal-batch-capacity <N>
                            Journal batches in flight before backpressure (default: 64)
@@ -82,7 +88,8 @@ Runtime path options:
   --journal-flush-us <N>   Upper bound on buffering before a flush, in us (default: 100)
   --idle spin|backoff      Matching-thread idle strategy; runtime default: spin
   --affinity <CORE>        Pin the matching thread to a core index
-  --snapshot-cadence <N>   Automatic snapshots every N commands; 0 disables (default: 0)
+  --snapshot-cadence <N>   Automatic snapshots every N event sequences, captured at the next
+                           command boundary; 0 disables (default: 0)
   --log memory|file        Runtime storage adapters (default: memory)
   --data-dir <PATH>        Directory for file adapters; required with --log file
   --in-flight <N>          Commands in flight; 1 measures submit-to-ack latency (default: 1)
@@ -468,8 +475,9 @@ fn parse_path(value: &str) -> Result<BenchPath, BenchError> {
     match value {
         "direct" => Ok(BenchPath::Direct),
         "runtime" => Ok(BenchPath::Runtime),
+        "decide" => Ok(BenchPath::Decide),
         _ => Err(BenchError::usage(format!(
-            "invalid value for --path: {value} (expected direct or runtime)"
+            "invalid value for --path: {value} (expected direct, runtime or decide)"
         ))),
     }
 }

@@ -17,7 +17,7 @@ use crate::types::{OrderBookId, Side, StopOrder};
 /// descending stop price. Orders at the same stop price break by ascending
 /// order id. Storing the sell side under `Reverse(stop_price)` lets both
 /// indexes share one ascending scan.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct StopBook {
     buy: BTreeSet<(u64, OrderBookId)>, // (stop_price, order_id)
     sell: BTreeSet<(Reverse<u64>, OrderBookId)>, // (Reverse(stop_price), order_id)

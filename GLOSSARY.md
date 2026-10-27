@@ -30,23 +30,39 @@ _Avoid_: ledger（有歧义）
 ## Commands and Events
 
 **Command** / 命令:
-一次进入引擎的状态变更请求：提交订单、改单、撤单、提交止损单。
+一次进入引擎的状态变更请求：提交订单、改单、撤单、提交止损单。命令只用于驱动撮合引擎产生事件，不被持久化，也不能用于恢复状态。
 _Avoid_: order event、request
 
 **Event** / 事件:
-引擎处理命令后发出的结果通知（OrderAccepted、TradeExecuted、OrderCanceled、OrderRejected、StopTriggered）。事件由命令派生，不用于恢复状态。
-_Avoid_: 用 "event" 指代命令
+引擎对一条命令作出决策后产生的、可重放的事实。除 `OrderRejected` 外，事件是状态变更增量并携带重建状态所需的完整信息；`OrderRejected` 是唯一不改变状态的审计事件，重放时无效果。事件日志是重建引擎状态的唯一事实来源。
+_Avoid_: 用 "event" 指代命令、notification
 
-**Command Log** / 命令日志:
-按全局顺序持久化的命令序列，是重建引擎状态的唯一事实来源，等价于 WAL。
-_Avoid_: event log、order event log
+**Event Log** / 事件日志:
+按全局顺序持久化的事件序列，是重建引擎状态的唯一事实来源，等价于 WAL。命令不进入事件日志。
+_Avoid_: command log、order event log
+
+**Event Record** / 事件记录:
+Event Log 中的一条记录：format version、全局事件序号、command id 与事件本身。日志单位是事件记录，不是命令。
+_Avoid_: command record、log line
+
+**Command Id** / 命令关联标识:
+写者为每条命令分配的全局递增标识，盖在该命令产生的所有事件记录上，用于下游分组与回执；不是恢复边界，重放忽略。
+_Avoid_: command sequence、event sequence
+
+**Decide** / 决策:
+纯函数步骤：读取引擎状态与一条命令，产出事件列表，不修改状态。
+_Avoid_: execute（决策阶段）
+
+**Apply** / 应用:
+唯一的状态写入口：把一个事件增量折叠进引擎状态。重放只调用 apply，不重新撮合。
+_Avoid_: execute、replay command
 
 **Sequencer** / 定序器:
-为每条命令分配全局递增命令序号，并保证 Command Log 按该顺序追加的组件。同步路径由 `DurableMatchingEngine` 分配；Matching Runtime 由 Matching Thread 在应用命令时分配，Journal Thread 仍按该顺序追加。分配序号不等于落盘。
+为每个事件分配全局递增事件序号，并保证 Event Log 按该顺序追加的组件。分配序号不等于落盘。
 _Avoid_: dispatcher、gateway
 
 **Recovery Gap** / 恢复空洞:
-命令日志中缺失的序号区间，使快照与剩余日志无法衔接。出现时必须拒绝启动，而不是带病运行。
+事件日志中缺失的序号区间，使快照与剩余日志无法衔接。出现时必须拒绝启动，而不是带病运行。
 
 ## Ingestion
 
@@ -67,7 +83,7 @@ _Avoid_: request（request 专指命令内携带的参数载体）、client orde
 _Avoid_: future、promise
 
 **Matching Thread** / 撮合线程:
-独占引擎状态、从 Command Queue 取出命令并执行的唯一线程。
+独占引擎状态、从 Command Queue 取出命令、决策并应用其事件的唯一线程。
 _Avoid_: worker、dispatcher
 
 **Engine Handle** / 引擎句柄:
@@ -81,7 +97,7 @@ _Avoid_: client、proxy、gateway
 _Avoid_: server、engine service
 
 **Journal Thread** / 日志线程:
-独占 Command Log、按批次追加记录并 fsync 的线程。它不拥有撮合状态。
+独占 Event Log、按批次追加事件记录并 fsync 的线程。它不拥有撮合状态。
 _Avoid_: writer、logger
 
 **Snapshot Worker** / 快照工作线程:
@@ -89,45 +105,50 @@ _Avoid_: writer、logger
 _Avoid_: checkpoint thread
 
 **Applied Acknowledgement** / 应用回执:
-命令已改变引擎状态、但尚未确认落盘的回执。它是 preliminary 的：崩溃后该命令可能不在 Command Log 中。
+命令产生的全部事件已应用到引擎状态、但尚未确认落盘的回执。它是 preliminary 的：崩溃后该命令的事件可能不在 Event Log 中。
 _Avoid_: immediate ack、soft ack
 
 **Durable Acknowledgement** / 持久化回执:
-命令记录已落盘、可从 Command Log 恢复的回执。它同时蕴含 Applied Acknowledgement。
+命令产生的全部事件已落盘、可从 Event Log 恢复的回执。它同时蕴含 Applied Acknowledgement。
 _Avoid_: commit ack、hard ack
 
 **Durability Watermark** / 持久化水位:
-已确认落盘的最大 Command Sequence（`durable_seq`）。Engine Snapshot 不得越过它。
+已确认落盘的最大 Event Sequence（`durable_seq`）。Engine Snapshot 不得越过它。
 _Avoid_: commit index、checkpoint
+
+## Distribution
+
+**MessageBus** / 消息总线:
+进程内同步分发的事件出口。消费者按 endpoint 注册 handler；事件在落盘后由 Event Publisher 发布。它不持久化，也不承载命令。
+_Avoid_: broker、queue
+
+**Event Publisher** / 事件发布者:
+独立线程，按事件序号从 Event Log 读取已落盘事件并发布到 MessageBus；启动时从恢复水位开始，不重发历史。
+_Avoid_: journal thread、dispatcher
 
 ## Recovery
 
 **Durable Matching Engine** / 持久化撮合引擎:
-组合在纯内存撮合引擎之外的同步持久化门面（`DurableMatchingEngine`）；先写命令日志再执行（append-before-apply），并按阈值生成引擎快照。它不同于 apply-first 的 Matching Runtime；两者共享恢复算法与存储 trait。撮合引擎本身不感知 IO。
+组合在纯内存撮合引擎之外的同步持久化门面（`DurableMatchingEngine`）；先决策、追加事件、再应用事件（append-before-apply），并可按需生成引擎快照。自动、按事件阈值触发的快照属于 Matching Runtime 的 Snapshot Gate，不在本门面内。它不同于 apply-first 的 Matching Runtime；两者共享 `decide`/`apply`、恢复算法与存储 trait。撮合引擎本身不感知 IO。
 _Avoid_: persistent engine、matching service
 
 **Replay** / 重放:
-从全新引擎开始，按顺序应用命令日志中的命令，重建状态。
+从全新引擎开始，按顺序应用事件日志中的事件，重建状态。重放不重新撮合、不重新判定拒绝。
 
 **Exact Recovery** / 精确恢复:
-恢复后的引擎决策状态与按顺序重放已落盘 Command Log 的结果逐位一致：簿内订单及优先级、订单台账、止损单、各计数器、成交记录、last trade price、配置。输出/审计缓冲（事件历史、命令缓冲）不属于恢复状态；只收到 Applied Acknowledgement 而未被 Durable Acknowledgement 确认的命令从未写入日志，因而也不在恢复范围内。
+恢复后的引擎决策状态与按顺序折叠已落盘 Event Log 的结果逐位一致：簿内订单及优先级、订单台账、止损单、各计数器、成交记录、last trade price、配置。只收到 Applied Acknowledgement 而未被 Durable Acknowledgement 确认的事件从未写入日志，因而也不在恢复范围内。
 
 **Engine Snapshot** / 引擎快照:
-某个命令边界上的完整引擎状态，内含 applied command sequence，用于缩短恢复时的重放长度。
+某个事件边界上的完整引擎状态，内含 applied event sequence，用于缩短恢复时的重放长度。它是事件日志的派生缓存，不是事实来源。
 _Avoid_: book snapshot
 
 **Book Snapshot** / 行情快照:
 某 symbol 的聚合价格档位视图，只用于行情展示，不能用于恢复状态。
 _Avoid_: snapshot
 
-**Command Sequence** / 命令序号:
-引擎为每条已接受命令分配的全局递增序号；运行时在应用时分配，Journal Thread 按同一顺序追加。只有已落盘的序号属于快照与恢复边界。
-_Avoid_: event sequence、sequence_id
-
 **Snapshot Floor** / 快照地板:
-快照存储中已持久化的最大 applied command sequence；新快照不得低于它，命令日志也不得在它之前被清理。
+快照存储中已持久化的最大 applied event sequence；新快照不得低于它，事件日志也不得在它之前被清理。
 _Avoid_: checkpoint offset
 
 **Event Sequence** / 事件序号:
-引擎为每个输出事件分配的全局递增序号（`EngineEvent::sequence_id`）。一条命令可能产生多个事件，因此事件序号不是恢复边界。
-_Avoid_: command sequence
+事件在 Event Log 中的全局递增序号，是恢复与快照边界。一条命令可能产生多个事件，它们共享同一个命令关联标识但各自占用一个事件序号。

@@ -19,7 +19,23 @@ pub struct BenchReport {
     pub latency: LatencyReport,
     /// Present only for the runtime path. Direct output is unchanged.
     pub runtime: Option<RuntimeReport>,
+    /// Present only for the pure `decide` path.
+    pub decide: Option<DecideReport>,
     pub env: EnvInfo,
+}
+
+/// Measurements for the pure `decide` path.
+///
+/// This is the decision-scratch baseline gated against the applied SLO:
+/// command in, events out, with no state mutation. If it cannot meet the
+/// applied target, that is a measured shortfall, not a reason to move the
+/// runtime onto a different path.
+#[derive(Debug, Clone)]
+pub struct DecideReport {
+    pub latency: Summary,
+    pub events_total: u64,
+    pub events_per_command: f64,
+    pub slo: SloCheck,
 }
 
 /// In-process runtime measurements beyond the direct-path latency tables.
@@ -33,9 +49,15 @@ pub struct RuntimeReport {
     pub apply_service: LatencyMetric,
     pub durable_wait: LatencyMetric,
     pub journal_append: LatencyMetric,
-    /// Mean records per journal handoff batch.
+    /// Mean event records per journal handoff batch.
     pub batch_size_mean: f64,
+    /// Largest event-record count in one journal handoff batch.
+    pub batch_size_max: u64,
     pub batch_count: u64,
+    /// Event records applied in the measured window.
+    pub events_total: u64,
+    /// Mean event records per applied command.
+    pub events_per_command: f64,
     pub queue_depth_max: u64,
     pub queue_full: u64,
     /// Journal append time / durable wait time, as a share of durable latency.
@@ -137,6 +159,9 @@ pub struct RunStats {
     pub achieved_rate: f64,
     pub commands: u64,
     pub engine_events: u64,
+    /// Mean engine events per command. Event volume grows with fills and
+    /// rejections, so this is reported next to the raw count.
+    pub events_per_command: f64,
     pub trades: u64,
     pub rejections: u64,
     pub final_open_orders: u64,
@@ -251,9 +276,10 @@ impl BenchReport {
             .expect("writing to a String cannot fail");
         writeln!(
             out,
-            "  engine events   {} ({}/s)",
+            "  engine events   {} ({}/s, {:.2}/command)",
             commas(self.run.engine_events),
-            commas(per_second(self.run.engine_events, self.run.wall_time_ns))
+            commas(per_second(self.run.engine_events, self.run.wall_time_ns)),
+            self.run.events_per_command
         )
         .expect("writing to a String cannot fail");
         writeln!(
@@ -338,8 +364,16 @@ impl BenchReport {
             write_metric_row(&mut out, "journal append", runtime.journal_append);
             writeln!(
                 out,
-                "  batch size       mean={:.2} records  batches={}",
+                "  event volume     events={}  events/command={:.2}",
+                commas(runtime.events_total),
+                runtime.events_per_command
+            )
+            .expect("writing to a String cannot fail");
+            writeln!(
+                out,
+                "  batch size       mean={:.2} max={} records  batches={}",
                 runtime.batch_size_mean,
+                commas(runtime.batch_size_max),
                 commas(runtime.batch_count)
             )
             .expect("writing to a String cannot fail");
@@ -364,13 +398,49 @@ impl BenchReport {
             write_slo_row(&mut out, "submit -> durable", runtime.slo.durable);
             writeln!(
                 out,
-                "note: SLO setup requires a Linux release build, --idle spin, a pinned matching core, and FileCommandLog on NVMe for the durable level; queue_full must be 0 for a PASS"
+                "note: SLO setup requires a Linux release build, --idle spin, a pinned matching core, and FileEventLog on NVMe for the durable level; queue_full must be 0 for a PASS"
             )
             .expect("writing to a String cannot fail");
             if self.config.log == LogKind::Memory {
                 writeln!(
                     out,
                     "note: the durable SLO is NOT APPLICABLE with --log memory; rerun with --log file on NVMe to judge it"
+                )
+                .expect("writing to a String cannot fail");
+            }
+        }
+
+        if let Some(decide) = &self.decide {
+            writeln!(out).expect("writing to a String cannot fail");
+            writeln!(out, "decide metrics").expect("writing to a String cannot fail");
+            writeln!(
+                out,
+                "  {:<16} mean={} ns  max={} ns",
+                "decide service",
+                commas(decide.latency.mean),
+                commas(decide.latency.max)
+            )
+            .expect("writing to a String cannot fail");
+            writeln!(
+                out,
+                "  event volume     events={}  events/command={:.2}",
+                commas(decide.events_total),
+                decide.events_per_command
+            )
+            .expect("writing to a String cannot fail");
+
+            writeln!(out).expect("writing to a String cannot fail");
+            writeln!(out, "slo").expect("writing to a String cannot fail");
+            write_slo_row(&mut out, "submit -> decide", decide.slo);
+            writeln!(
+                out,
+                "note: the pure decide path is gated against the applied SLO; measure a Linux release build for a numeric judgement"
+            )
+            .expect("writing to a String cannot fail");
+            if decide.slo.status == SloStatus::NotApplicable {
+                writeln!(
+                    out,
+                    "note: the decide SLO is NOT APPLICABLE on this platform; Windows QPC tick resolution makes sub-tick numbers functional-only"
                 )
                 .expect("writing to a String cannot fail");
             }
@@ -484,6 +554,12 @@ impl BenchReport {
             .expect("writing to a String cannot fail");
         writeln!(out, "    \"engine_events\": {},", self.run.engine_events)
             .expect("writing to a String cannot fail");
+        writeln!(
+            out,
+            "    \"events_per_command\": {:.3},",
+            self.run.events_per_command
+        )
+        .expect("writing to a String cannot fail");
         writeln!(out, "    \"trades\": {},", self.run.trades)
             .expect("writing to a String cannot fail");
         writeln!(out, "    \"rejections\": {},", self.run.rejections)
@@ -592,8 +668,18 @@ impl BenchReport {
                 runtime.batch_size_mean
             )
             .expect("writing to a String cannot fail");
+            writeln!(out, "    \"batch_size_max\": {},", runtime.batch_size_max)
+                .expect("writing to a String cannot fail");
             writeln!(out, "    \"batch_count\": {},", runtime.batch_count)
                 .expect("writing to a String cannot fail");
+            writeln!(out, "    \"events_total\": {},", runtime.events_total)
+                .expect("writing to a String cannot fail");
+            writeln!(
+                out,
+                "    \"events_per_command\": {:.3},",
+                runtime.events_per_command
+            )
+            .expect("writing to a String cannot fail");
             writeln!(out, "    \"queue_depth_max\": {},", runtime.queue_depth_max)
                 .expect("writing to a String cannot fail");
             writeln!(out, "    \"queue_full\": {},", runtime.queue_full)
@@ -611,6 +697,28 @@ impl BenchReport {
             writeln!(out, "      }},").expect("writing to a String cannot fail");
             writeln!(out, "      \"durable\": {{").expect("writing to a String cannot fail");
             write_json_slo_fields(&mut out, runtime.slo.durable, "        ");
+            writeln!(out, "      }}").expect("writing to a String cannot fail");
+            writeln!(out, "    }}").expect("writing to a String cannot fail");
+            writeln!(out, "  }},").expect("writing to a String cannot fail");
+        }
+
+        if let Some(decide) = &self.decide {
+            writeln!(out, "  \"decide\": {{").expect("writing to a String cannot fail");
+            writeln!(out, "    \"latency\": {{").expect("writing to a String cannot fail");
+            write_json_summary_fields(&mut out, decide.latency, "      ", false);
+            writeln!(out, "    }},").expect("writing to a String cannot fail");
+            writeln!(out, "    \"events_total\": {},", decide.events_total)
+                .expect("writing to a String cannot fail");
+            writeln!(
+                out,
+                "    \"events_per_command\": {:.3},",
+                decide.events_per_command
+            )
+            .expect("writing to a String cannot fail");
+            writeln!(out, "    \"slo\": {{").expect("writing to a String cannot fail");
+            writeln!(out, "      \"submit_to_decide\": {{")
+                .expect("writing to a String cannot fail");
+            write_json_slo_fields(&mut out, decide.slo, "        ");
             writeln!(out, "      }}").expect("writing to a String cannot fail");
             writeln!(out, "    }}").expect("writing to a String cannot fail");
             writeln!(out, "  }},").expect("writing to a String cannot fail");

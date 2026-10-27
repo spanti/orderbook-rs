@@ -3,15 +3,18 @@
 use std::time::{Duration, Instant};
 
 use crate::engine::MatchingEngine;
+use crate::event::DomainEvent;
 use crate::orderbook::OrderBook;
 use crate::types::{
-    CommandOutcome, EngineCommand, EngineConfig, OrderBookId, OrderRequest, OrderType, Side,
-    TimeInForce,
+    EngineCommand, EngineConfig, OrderBookId, OrderRequest, OrderType, Side, TimeInForce,
 };
 
 use super::config::{BenchConfig, BenchError, BenchPath};
-use super::report::{BenchReport, CategoryStats, DepthLevels, EnvInfo, LatencyReport, RunStats};
-use super::stats::Samples;
+use super::report::{
+    APPLIED_SLO_NS, BenchReport, CategoryStats, DecideReport, DepthLevels, EnvInfo, LatencyReport,
+    RunStats, SloCheck,
+};
+use super::stats::{Samples, Summary};
 use super::workload::{Action, CommandKind, SYMBOL_PREFIX, Workload};
 
 const DEPTH_SCAN_CAP: u64 = 10_000;
@@ -22,7 +25,129 @@ pub fn run(config: &BenchConfig) -> Result<BenchReport, BenchError> {
     match config.path {
         BenchPath::Direct => run_direct(config),
         BenchPath::Runtime => super::runtime_path::run_runtime(config),
+        BenchPath::Decide => run_decide(config),
     }
+}
+
+/// Measure the pure event-sourced decision step.
+///
+/// The engine is never mutated inside the timed window, so this is a baseline
+/// for `decide` + its borrow-based `DecisionScratch`: command in, events out.
+/// A whole-engine clone on this path would show up immediately here.
+fn run_decide(config: &BenchConfig) -> Result<BenchReport, BenchError> {
+    let symbol = format!("{SYMBOL_PREFIX}0");
+    let mut engine = MatchingEngine::new(EngineConfig::default());
+
+    // Seed one resting ask with the legacy path so the scratch performs a real
+    // opposite-book lookup. The bid below never crosses it.
+    let ask = EngineCommand::SubmitOrder {
+        symbol: symbol.clone(),
+        request: OrderRequest {
+            side: Side::Ask,
+            price: config.mid.saturating_add(config.price_band),
+            quantity: config.order_quantity,
+            timestamp: 0,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            post_only: false,
+        },
+    };
+    let _ = engine.execute(ask);
+
+    let command = EngineCommand::SubmitOrder {
+        symbol,
+        request: OrderRequest {
+            side: Side::Bid,
+            price: config.mid.saturating_sub(config.price_band),
+            quantity: config.order_quantity,
+            timestamp: 1,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            post_only: false,
+        },
+    };
+
+    for _ in 0..config.warmup {
+        let events = engine.decide(&command);
+        std::hint::black_box(&events);
+    }
+
+    let mut samples = Samples::default();
+    let mut events_total = 0u64;
+    let measured_start = Instant::now();
+    for _ in 0..config.events {
+        let start = Instant::now();
+        let events = engine.decide(&command);
+        let elapsed = ns_between(start, Instant::now());
+        std::hint::black_box(&events);
+        events_total = events_total.saturating_add(events.len() as u64);
+        samples.push(elapsed);
+    }
+
+    let wall_time_ns = duration_ns(measured_start.elapsed());
+    let summary = samples.summary();
+    let achieved_rate = if wall_time_ns == 0 {
+        0.0
+    } else {
+        config.events as f64 / (wall_time_ns as f64 / 1e9)
+    };
+    let events_per_command = events_total as f64 / config.events as f64;
+    // The pure decide path is gated against the applied SLO: if it cannot
+    // produce the events within that budget, the shortfall is reported rather
+    // than moving the runtime onto a different execution path.
+    //
+    // Windows QPC resolves around 100 ns, so a sub-tick comparison is not a
+    // numeric claim. Report the percentiles and mark this SLO not applicable
+    // there; the Linux release build is the judging environment.
+    let slo = if cfg!(target_os = "windows") {
+        SloCheck::not_applicable(summary, APPLIED_SLO_NS, 0)
+    } else {
+        SloCheck::new(summary, APPLIED_SLO_NS, 0)
+    };
+
+    Ok(BenchReport {
+        config: config.clone(),
+        run: RunStats {
+            wall_time_ns,
+            achieved_rate,
+            commands: config.events,
+            engine_events: events_total,
+            events_per_command,
+            trades: 0,
+            rejections: 0,
+            final_open_orders: 1,
+            peak_open_orders: 1,
+            final_depth_levels: DepthLevels {
+                bids: 0,
+                asks: 1,
+                bids_capped: false,
+                asks_capped: false,
+            },
+        },
+        latency: LatencyReport {
+            total: CategoryStats {
+                all: summary,
+                limit: summary,
+                market: Summary::default(),
+                cancel: Summary::default(),
+            },
+            service: CategoryStats {
+                all: summary,
+                limit: summary,
+                market: Summary::default(),
+                cancel: Summary::default(),
+            },
+            send_lag: Summary::default(),
+        },
+        runtime: None,
+        decide: Some(DecideReport {
+            latency: summary,
+            events_total,
+            events_per_command,
+            slo,
+        }),
+        env: EnvInfo::current(),
+    })
 }
 
 fn run_direct(config: &BenchConfig) -> Result<BenchReport, BenchError> {
@@ -38,9 +163,9 @@ fn run_direct(config: &BenchConfig) -> Result<BenchReport, BenchError> {
         if config.rate > 0 {
             pace(intended_time(warmup_start, index, config.rate));
         }
-        let outcome = engine.execute(command);
-        std::hint::black_box(&outcome);
-        record_workload(&mut workload, &action, outcome, |id| engine.is_open(id));
+        let events = engine.execute(command);
+        std::hint::black_box(&events);
+        record_workload(&mut workload, &action, &events, |id| engine.is_open(id));
     }
 
     let mut total_all = Samples::default();
@@ -56,7 +181,7 @@ fn run_direct(config: &BenchConfig) -> Result<BenchReport, BenchError> {
     workload.start_measurement();
 
     let measured_start = Instant::now();
-    let events_before = engine.events().len();
+    let mut measured_events = 0u64;
     let trades_before = engine.trades().len();
 
     for index in 0..config.events {
@@ -73,9 +198,9 @@ fn run_direct(config: &BenchConfig) -> Result<BenchReport, BenchError> {
         }
 
         let send = Instant::now();
-        let outcome = engine.execute(command);
+        let events = engine.execute(command);
         let done = Instant::now();
-        std::hint::black_box(&outcome);
+        std::hint::black_box(&events);
 
         let service = ns_between(send, done);
         let (total, send_lag) = match intended {
@@ -101,11 +226,12 @@ fn run_direct(config: &BenchConfig) -> Result<BenchReport, BenchError> {
             }
         }
 
-        record_workload(&mut workload, &action, outcome, |id| engine.is_open(id));
+        measured_events = measured_events.saturating_add(events.len() as u64);
+        record_workload(&mut workload, &action, &events, |id| engine.is_open(id));
     }
 
     let wall_time_ns = duration_ns(measured_start.elapsed());
-    let engine_events = (engine.events().len() - events_before) as u64;
+    let engine_events = measured_events;
     let trades = (engine.trades().len() - trades_before) as u64;
     let final_depth_levels = count_depth(&engine, &symbols);
 
@@ -130,6 +256,7 @@ fn run_direct(config: &BenchConfig) -> Result<BenchReport, BenchError> {
     } else {
         config.events as f64 / (wall_time_ns as f64 / 1e9)
     };
+    let events_per_command = events_per_command(engine_events, config.events);
 
     Ok(BenchReport {
         config: config.clone(),
@@ -138,6 +265,7 @@ fn run_direct(config: &BenchConfig) -> Result<BenchReport, BenchError> {
             achieved_rate,
             commands: config.events,
             engine_events,
+            events_per_command,
             trades,
             rejections: workload.rejections(),
             final_open_orders: workload.open_len(),
@@ -146,8 +274,17 @@ fn run_direct(config: &BenchConfig) -> Result<BenchReport, BenchError> {
         },
         latency,
         runtime: None,
+        decide: None,
         env: EnvInfo::current(),
     })
+}
+
+pub(crate) fn events_per_command(events: u64, commands: u64) -> f64 {
+    if commands == 0 {
+        0.0
+    } else {
+        events as f64 / commands as f64
+    }
 }
 
 /// The bench's symbol names, in workload-index order.
@@ -198,25 +335,19 @@ pub(crate) fn command_from_action(action: &Action, symbols: &[String]) -> Engine
     }
 }
 
-/// Feed one command outcome back into the workload after the timed command
+/// Feed one command's events back into the workload after the timed command
 /// window has closed. The engine's lifecycle query is deliberately evaluated
 /// here, not inside `send..done`, so bookkeeping never enters a latency sample.
 pub(crate) fn record_workload(
     workload: &mut Workload,
     action: &Action,
-    outcome: CommandOutcome,
+    events: &[DomainEvent],
     is_open: impl Fn(OrderBookId) -> bool,
 ) {
-    match outcome {
-        CommandOutcome::Accepted(report) => workload.on_submit_result(action, &Ok(report), is_open),
-        CommandOutcome::Canceled(report) => workload.on_cancel_result(action, Some(&report)),
-        CommandOutcome::Rejected(reason) => {
-            if action.kind == CommandKind::Cancel {
-                workload.on_cancel_result(action, None);
-            } else {
-                workload.on_submit_result(action, &Err(reason), is_open);
-            }
-        }
+    if action.kind == CommandKind::Cancel {
+        workload.on_cancel_events(action, events);
+    } else {
+        workload.on_submit_events(action, events, is_open);
     }
 }
 
@@ -310,6 +441,49 @@ mod tests {
         config.symbols = 1;
         config.seed = 7;
         config
+    }
+
+    #[test]
+    fn decide_path_reports_the_pure_decision_baseline() {
+        let mut config = tiny_config();
+        config.path = BenchPath::Decide;
+        config.events = 200;
+        config.warmup = 10;
+
+        let report = run(&config).expect("decide baseline run");
+        assert_eq!(report.latency.total.all.count, 200);
+        assert_eq!(report.latency.service.all.count, 200);
+        assert_eq!(
+            report.run.engine_events, 400,
+            "two events per resting submit"
+        );
+        assert_eq!(
+            report.run.events_per_command, 2.0,
+            "the run reports event volume per command"
+        );
+        assert_eq!(report.run.final_open_orders, 1, "only the seeded ask rests");
+        assert!(report.runtime.is_none());
+
+        let decide = report.decide.as_ref().expect("decide SLO section");
+        assert_eq!(
+            decide.slo.target_ns,
+            crate::bench::report::APPLIED_SLO_NS,
+            "the pure decide path is gated against the applied SLO"
+        );
+        assert_eq!(decide.events_total, 400);
+        assert_eq!(decide.events_per_command, 2.0);
+        assert_eq!(decide.latency.count, 200);
+
+        let text = report.render_text();
+        assert!(text.contains("engine events"));
+        assert!(text.contains("event volume"));
+        assert!(text.contains("submit -> decide"));
+        assert!(text.contains("target=10,000 ns"));
+
+        let json = report.to_json();
+        assert!(json.contains("\"decide\""));
+        assert!(json.contains("\"submit_to_decide\""));
+        assert!(json.contains("\"events_per_command\""));
     }
 
     #[test]
@@ -438,12 +612,25 @@ mod tests {
         assert_eq!(runtime.applied_count, 100);
         assert_eq!(runtime.durable_count, 100);
         assert_eq!(runtime.queue_full, 0);
+        assert_eq!(runtime.events_total, report.run.engine_events);
+        assert!(
+            runtime.events_total >= runtime.applied_count,
+            "every applied command emits at least one event"
+        );
+        assert!(runtime.events_per_command >= 1.0);
+        assert_eq!(
+            runtime.events_per_command,
+            runtime.events_total as f64 / runtime.applied_count as f64
+        );
+        assert!(runtime.batch_size_max >= 1);
 
         let text = report.render_text();
         assert!(text.contains("runtime latency (ns)"));
         assert!(text.contains("applied"));
         assert!(text.contains("durable"));
         assert!(text.contains("slo"));
+        assert!(text.contains("event volume"));
+        assert!(text.contains("events/command"));
         assert!(text.contains("target=10,000 ns"));
         assert!(text.contains("target=500,000 ns"));
 
@@ -457,6 +644,9 @@ mod tests {
         assert!(json.contains("\"journal_append\""));
         assert!(json.contains("\"queue_full\""));
         assert!(json.contains("\"fsync_share\""));
+        assert!(json.contains("\"events_total\""));
+        assert!(json.contains("\"events_per_command\""));
+        assert!(json.contains("\"batch_size_max\""));
         assert!(json.contains("\"slo\""));
     }
 
@@ -492,7 +682,7 @@ mod tests {
                 .count,
             20
         );
-        assert!(dir.path().join("commands.log").exists());
+        assert!(dir.path().join("events.log").exists());
         assert!(dir.path().join("snapshots").exists());
         assert_ne!(
             report.runtime.as_ref().unwrap().slo.durable.status,

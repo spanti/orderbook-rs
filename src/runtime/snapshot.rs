@@ -1,9 +1,9 @@
 //! The snapshot worker: best-effort engine snapshots off the matching thread.
 //!
 //! The matching thread captures an [`StoredSnapshot`] and offers it through
-//! [`SnapshotSink::try_send`]. The worker owns the [`SnapshotStore`], saves jobs
-//! sequentially, records the last failure, and keeps running after failures;
-//! only a disconnected channel stops it after draining.
+//! [`SnapshotSink::try_send`]. The worker owns the [`SnapshotStore`], saves
+//! jobs sequentially, records the last failure, and keeps running after
+//! failures; only a disconnected channel stops it after draining.
 //!
 //! Explicit shutdown uses [`SnapshotSink::capture_final`], which waits for the
 //! worker to finish saving so a failure can surface. Snapshots are never part
@@ -93,6 +93,7 @@ impl SnapshotSink {
         engine: &MatchingEngine,
         applied_seq: u64,
         durable_seq: u64,
+        last_command_id: u64,
     ) -> Result<(), DurableError> {
         if applied_seq != durable_seq {
             return Err(DurableError::Storage(format!(
@@ -103,6 +104,7 @@ impl SnapshotSink {
         self.save_and_wait(StoredSnapshot {
             format_version: FORMAT_VERSION,
             applied_seq,
+            last_command_id,
             snapshot: engine.capture_snapshot(),
         })
     }
@@ -169,11 +171,11 @@ mod tests {
         StoredSnapshot {
             format_version: FORMAT_VERSION,
             applied_seq,
+            last_command_id: applied_seq,
             snapshot: EngineSnapshot {
                 config: EngineConfig::default(),
                 next_order_id: 1,
                 next_trade_id: 1,
-                next_event_sequence: 1,
                 books: Vec::new(),
                 ledger: Vec::new(),
                 stops: Vec::new(),
@@ -366,7 +368,7 @@ mod tests {
         let engine = MatchingEngine::new(EngineConfig::default());
 
         let error = sink
-            .capture_final(&engine, 2, 1)
+            .capture_final(&engine, 2, 1, 1)
             .expect_err("a snapshot must not cover a command the log may not hold");
         assert!(matches!(error, DurableError::Storage(_)));
         assert!(
@@ -374,7 +376,7 @@ mod tests {
             "nothing was handed to the worker"
         );
 
-        sink.capture_final(&engine, 0, 0)
+        sink.capture_final(&engine, 0, 0, 0)
             .expect("an empty engine at sequence zero is snapshotable");
         assert_eq!(store.load_latest().unwrap().unwrap().applied_seq, 0);
 
@@ -389,7 +391,7 @@ mod tests {
         let (sink, handle) = spawn(Box::new(store.handle()));
         let engine = MatchingEngine::new(EngineConfig::default());
 
-        assert_eq!(sink.capture_final(&engine, 0, 0), Err(error));
+        assert_eq!(sink.capture_final(&engine, 0, 0, 0), Err(error));
         assert!(sink.last_error().is_some());
 
         drop(sink);

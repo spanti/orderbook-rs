@@ -9,7 +9,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::durable::{
-    CommandLog, CommandRecord, DurableError, LogHeader, SnapshotStore, StoredSnapshot,
+    DurableError, EventLog, EventRecord, FORMAT_VERSION, LogHeader, SnapshotStore, StoredSnapshot,
 };
 
 /// Lock a mutex, recovering the guard if a previous holder panicked.
@@ -23,18 +23,21 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 #[derive(Debug, Default)]
-struct LogState {
+struct EventLogState {
     header: Option<LogHeader>,
-    records: Vec<CommandRecord>,
+    records: Vec<EventRecord>,
 }
 
-/// In-memory [`CommandLog`] shared by every clone of a handle.
+/// In-memory [`EventLog`] shared by every clone of a handle.
+///
+/// Fast recovery tests can drop a [`DurableMatchingEngine`](crate::durable::DurableMatchingEngine)
+/// and reopen from a second handle to the same log.
 #[derive(Debug, Clone, Default)]
-pub struct InMemoryCommandLog {
-    state: Arc<Mutex<LogState>>,
+pub struct InMemoryEventLog {
+    state: Arc<Mutex<EventLogState>>,
 }
 
-impl InMemoryCommandLog {
+impl InMemoryEventLog {
     pub fn new() -> Self {
         Self::default()
     }
@@ -45,12 +48,18 @@ impl InMemoryCommandLog {
     }
 }
 
-impl CommandLog for InMemoryCommandLog {
+impl EventLog for InMemoryEventLog {
     fn read_header(&self) -> Result<Option<LogHeader>, DurableError> {
         Ok(lock(&self.state).header.clone())
     }
 
     fn write_header(&mut self, header: LogHeader) -> Result<(), DurableError> {
+        if header.format_version != FORMAT_VERSION {
+            return Err(DurableError::UnsupportedVersion {
+                found: header.format_version,
+                supported: FORMAT_VERSION,
+            });
+        }
         let mut state = lock(&self.state);
         if state.header.is_some() {
             return Err(DurableError::HeaderAlreadyPresent);
@@ -59,10 +68,16 @@ impl CommandLog for InMemoryCommandLog {
         Ok(())
     }
 
-    fn append(&mut self, record: CommandRecord) -> Result<(), DurableError> {
+    fn append(&mut self, record: EventRecord) -> Result<(), DurableError> {
         let mut state = lock(&self.state);
         if state.header.is_none() {
             return Err(DurableError::MissingHeader);
+        }
+        if record.format_version != FORMAT_VERSION {
+            return Err(DurableError::UnsupportedVersion {
+                found: record.format_version,
+                supported: FORMAT_VERSION,
+            });
         }
 
         let expected = state
@@ -81,7 +96,43 @@ impl CommandLog for InMemoryCommandLog {
         Ok(())
     }
 
-    fn read_from(&self, from: u64) -> Result<Vec<CommandRecord>, DurableError> {
+    fn append_batch(&mut self, records: Vec<EventRecord>) -> Result<(), DurableError> {
+        let mut state = lock(&self.state);
+        if state.header.is_none() {
+            return Err(DurableError::MissingHeader);
+        }
+        if let Some(record) = records
+            .iter()
+            .find(|record| record.format_version != FORMAT_VERSION)
+        {
+            return Err(DurableError::UnsupportedVersion {
+                found: record.format_version,
+                supported: FORMAT_VERSION,
+            });
+        }
+
+        // Validate the whole batch before mutating, so a gap cannot leave a
+        // partial batch visible.
+        let mut expected = state
+            .records
+            .last()
+            .map(|last| last.sequence.saturating_add(1))
+            .unwrap_or(1);
+        for record in &records {
+            if record.sequence != expected {
+                return Err(DurableError::NonContiguousSequence {
+                    expected,
+                    found: record.sequence,
+                });
+            }
+            expected = expected.saturating_add(1);
+        }
+
+        state.records.extend(records);
+        Ok(())
+    }
+
+    fn read_from(&self, from: u64) -> Result<Vec<EventRecord>, DurableError> {
         let state = lock(&self.state);
         Ok(state
             .records
@@ -98,11 +149,18 @@ impl CommandLog for InMemoryCommandLog {
             .map(|record| record.sequence)
     }
 
-    fn last_sequence(&self) -> Option<u64> {
+    fn last_stored_sequence(&self) -> Option<u64> {
         lock(&self.state)
             .records
             .last()
             .map(|record| record.sequence)
+    }
+
+    fn last_command_id(&self) -> Option<u64> {
+        lock(&self.state)
+            .records
+            .last()
+            .map(|record| record.command_id)
     }
 }
 
@@ -178,13 +236,14 @@ mod tests {
     }
 
     #[test]
-    fn a_poisoned_log_lock_does_not_panic_trait_methods() {
-        let log = InMemoryCommandLog::new();
+    fn a_poisoned_event_log_lock_does_not_panic_trait_methods() {
+        let log = InMemoryEventLog::new();
         poison(&log.state);
 
         assert_eq!(log.read_header().unwrap(), None);
         assert_eq!(log.first_sequence(), None);
-        assert_eq!(log.last_sequence(), None);
+        assert_eq!(log.last_stored_sequence(), None);
+        assert_eq!(log.last_command_id(), None);
         assert!(log.read_from(1).unwrap().is_empty());
     }
 

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::durable::{
-    CommandLog, FileCommandLog, FileSnapshotStore, InMemoryCommandLog, InMemorySnapshotStore,
+    EventLog, FileEventLog, FileSnapshotStore, InMemoryEventLog, InMemorySnapshotStore,
     SnapshotStore,
 };
 use crate::engine::MatchingEngine;
@@ -30,8 +30,8 @@ use super::report::{
     LatencyReport, RunStats, RuntimeReport, SloCheck, SloReport,
 };
 use super::run::{
-    book_prices, command_from_action, count_depth, duration_ns, intended_time, ns_between, pace,
-    record_workload, symbol_list,
+    book_prices, command_from_action, count_depth, duration_ns, events_per_command, intended_time,
+    ns_between, pace, record_workload, symbol_list,
 };
 use super::stats::Samples;
 use super::workload::{Action, CommandKind, Workload};
@@ -61,7 +61,6 @@ pub(crate) fn run_runtime(config: &BenchConfig) -> Result<BenchReport, BenchErro
     workload.start_measurement();
 
     let baseline = MetricsSnapshot::read(&metrics);
-    let events_before = shadow.events().len();
     let trades_before = shadow.trades().len();
 
     let measured_start = Instant::now();
@@ -78,7 +77,8 @@ pub(crate) fn run_runtime(config: &BenchConfig) -> Result<BenchReport, BenchErro
     let wall_time_ns = duration_ns(measured_start.elapsed());
     let delta = MetricsSnapshot::read(&metrics).delta(&baseline);
 
-    let engine_events = (shadow.events().len() - events_before) as u64;
+    // The runtime's own counter is the domain-event volume.
+    let engine_events = delta.event_records;
     let trades = (shadow.trades().len() - trades_before) as u64;
     let final_depth_levels = count_depth(&shadow, &symbols);
 
@@ -136,7 +136,10 @@ pub(crate) fn run_runtime(config: &BenchConfig) -> Result<BenchReport, BenchErro
         } else {
             delta.batch_records_sum as f64 / delta.batch_count as f64
         },
+        batch_size_max: delta.batch_records_max,
         batch_count: delta.batch_count,
+        events_total: delta.event_records,
+        events_per_command: events_per_command(delta.event_records, delta.applied),
         queue_depth_max: delta.queue_depth_max,
         queue_full: delta.queue_full,
         fsync_share: ratio(delta.journal_append_ns_sum, delta.durable_wait_ns_sum),
@@ -144,7 +147,7 @@ pub(crate) fn run_runtime(config: &BenchConfig) -> Result<BenchReport, BenchErro
         durable_count: delta.durable,
         slo: SloReport {
             applied: SloCheck::new(applied_all, APPLIED_SLO_NS, delta.queue_full),
-            // The durable SLO is defined against FileCommandLog on NVMe. An
+            // The durable SLO is defined against FileEventLog on NVMe. An
             // in-memory log cannot exercise fsync, so reporting PASS/FAIL there
             // would be a false claim.
             durable: if config.log == LogKind::Memory {
@@ -166,6 +169,7 @@ pub(crate) fn run_runtime(config: &BenchConfig) -> Result<BenchReport, BenchErro
             achieved_rate,
             commands: config.events,
             engine_events,
+            events_per_command: events_per_command(engine_events, config.events),
             trades,
             rejections: workload.rejections(),
             final_open_orders: workload.open_len(),
@@ -178,6 +182,7 @@ pub(crate) fn run_runtime(config: &BenchConfig) -> Result<BenchReport, BenchErro
             send_lag,
         },
         runtime: Some(runtime_report),
+        decide: None,
         env: EnvInfo::current(),
     })
 }
@@ -188,9 +193,9 @@ fn create_runtime(
 ) -> Result<(EngineHandle, EngineRuntime), BenchError> {
     let runtime_config = config.runtime_config(metrics);
 
-    let (log, snapshots): (Box<dyn CommandLog>, Box<dyn SnapshotStore>) = match config.log {
+    let (log, snapshots): (Box<dyn EventLog>, Box<dyn SnapshotStore>) = match config.log {
         LogKind::Memory => (
-            Box::new(InMemoryCommandLog::new()),
+            Box::new(InMemoryEventLog::new()),
             Box::new(InMemorySnapshotStore::new()),
         ),
         LogKind::File => {
@@ -205,9 +210,9 @@ fn create_runtime(
                 ))
             })?;
 
-            let log_path = dir.join("commands.log");
+            let log_path = dir.join("events.log");
             let snapshot_dir = dir.join("snapshots");
-            let log = FileCommandLog::open(&log_path).map_err(|error| {
+            let log = FileEventLog::open(&log_path).map_err(|error| {
                 BenchError::Io(format!("cannot open {}: {error}", log_path.display()))
             })?;
             let snapshots = FileSnapshotStore::open(&snapshot_dir).map_err(|error| {
@@ -320,8 +325,8 @@ fn drain_one(
     let durable_ns = ns_between(submit_start, Instant::now());
 
     debug_assert_eq!(
-        applied_receipt.command_sequence, durable_receipt.command_sequence,
-        "per-producer FIFO must preserve the command sequence across levels"
+        applied_receipt.last_event_sequence, durable_receipt.last_event_sequence,
+        "per-producer FIFO must preserve the event range across levels"
     );
 
     if measure {
@@ -335,12 +340,8 @@ fn drain_one(
         stats.send_lag.push(send_lag_ns);
     }
 
-    let outcome = shadow.execute(command);
-    debug_assert_eq!(
-        outcome, applied_receipt.outcome,
-        "the shadow engine must reproduce the runtime's receipt outcome"
-    );
-    record_workload(workload, &action, outcome, |id| shadow.is_open(id));
+    let events = shadow.execute(command);
+    record_workload(workload, &action, &events, |id| shadow.is_open(id));
     Ok(())
 }
 
@@ -401,7 +402,9 @@ struct MetricsSnapshot {
     journal_append_ns_max: u64,
     journal_append_count: u64,
     batch_records_sum: u64,
+    batch_records_max: u64,
     batch_count: u64,
+    event_records: u64,
     queue_depth_max: u64,
 }
 
@@ -421,7 +424,9 @@ impl MetricsSnapshot {
             journal_append_ns_max: metrics.journal_append_ns_max(),
             journal_append_count: metrics.journal_append_count(),
             batch_records_sum: metrics.batch_records_sum(),
+            batch_records_max: metrics.batch_records_max(),
             batch_count: metrics.batch_count(),
+            event_records: metrics.event_records(),
             queue_depth_max: metrics.queue_depth_max(),
         }
     }
@@ -451,7 +456,9 @@ impl MetricsSnapshot {
             batch_records_sum: self
                 .batch_records_sum
                 .saturating_sub(before.batch_records_sum),
+            batch_records_max: self.batch_records_max,
             batch_count: self.batch_count.saturating_sub(before.batch_count),
+            event_records: self.event_records.saturating_sub(before.event_records),
             queue_depth_max: self.queue_depth_max,
         }
     }
