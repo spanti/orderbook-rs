@@ -4,11 +4,11 @@ use std::collections::HashMap;
 
 use crate::event::{DomainEvent, OrderCancelReason};
 use crate::ledger::OrderLedger;
-use crate::orderbook::OrderBook;
+use crate::orderbook::{BookView, OrderBook};
 use crate::snapshot::{
     BookState, EngineSnapshot, LastTradeState, LedgerEntry, PriceLevelState, StopBookState,
 };
-use crate::stop_book::StopBook;
+use crate::stop_book::{StopBook, StopView};
 use crate::types::{
     BookSnapshot, EngineCommand, EngineConfig, EngineError, Fill, ModifyRequest, Order,
     OrderBookId, OrderRecord, OrderRequest, OrderStatus, OrderType, Side, StopKind, StopOrder,
@@ -63,10 +63,10 @@ impl Default for MatchingEngine {
 /// Read-only decision state for the event-sourced path.
 ///
 /// A scratch borrows the engine plus the touched symbol and the next order id.
-/// Matching runs on clones of **only** that symbol's book and stop book; the
-/// ledger, trades, last price and counters are read-only. It deliberately does
-/// **not** clone the whole engine, keeping `decide` off the whole-engine-clone
-/// path.
+/// Matching runs on a [`BookView`] and a [`StopView`], which borrow that
+/// symbol's book and stop book and record their effects in small copy-on-write
+/// overlays; the ledger, trades, last price and counters are read-only. Nothing
+/// is cloned, so `decide` costs O(touched levels/orders).
 pub struct DecisionScratch<'a> {
     engine: &'a MatchingEngine,
     symbol: &'a str,
@@ -84,18 +84,14 @@ impl<'a> DecisionScratch<'a> {
         }
     }
 
-    fn scratch_book(&self) -> OrderBook {
-        match self.engine.order_books.get(self.symbol) {
-            Some(book) => book.clone(),
-            None => OrderBook::new(),
-        }
+    /// A borrowed decision view over this symbol's book (empty when absent).
+    fn book_view(&self) -> BookView<'_> {
+        BookView::new(self.engine.order_books.get(self.symbol))
     }
 
-    fn scratch_stops(&self) -> StopBook {
-        match self.engine.stop_books.get(self.symbol) {
-            Some(stops) => stops.clone(),
-            None => StopBook::default(),
-        }
+    /// A borrowed decision view over this symbol's pending stops.
+    fn stop_view(&self) -> StopView<'_> {
+        StopView::new(self.engine.stop_books.get(self.symbol))
     }
 
     /// This symbol's last trade, if there is one.
@@ -174,15 +170,15 @@ impl<'a> DecisionScratch<'a> {
     /// Emit a `StopTriggered` cascade after the command's own events.
     ///
     /// Each triggered stop is converted to a market+IOC or limit+GTC order and
-    /// matched against the scratch book. Events follow the catalog order:
-    /// `StopTriggered`, `TradeExecuted`*, then `OrderRested` or
+    /// matched through the shared [`BookView`]. Events follow the catalog
+    /// order: `StopTriggered`, `TradeExecuted`*, then `OrderRested` or
     /// `OrderCanceled{UnfilledResidual}`. The loop continues with the resulting
     /// last price until no pending stop triggers.
     #[allow(clippy::too_many_arguments)]
     fn run_stop_cascade(
         &self,
-        book: &mut OrderBook,
-        stops: &mut StopBook,
+        book: &mut BookView<'_>,
+        stops: &mut StopView<'_>,
         symbol: &str,
         mut last_trade: Option<LastTrade>,
         next_trade_id: &mut u64,
@@ -231,7 +227,7 @@ impl<'a> DecisionScratch<'a> {
                 remaining_quantity,
                 fills,
                 rested,
-            } = book.submit(converted.clone());
+            } = book.plan(converted.clone());
 
             let cascade_last =
                 Self::push_fills(symbol, last_timestamp, fills, next_trade_id, events);
@@ -249,15 +245,15 @@ impl<'a> DecisionScratch<'a> {
     /// trailing rest/residual event for one taker order.
     ///
     /// Returns the last fill, or `None` when nothing filled. The caller
-    /// supplies the scratch book so modify can reuse the same routine after
-    /// removing the old order.
+    /// supplies the shared [`BookView`] so modify can reuse the same routine
+    /// after removing the old order.
     #[allow(clippy::too_many_arguments)]
     fn push_taker_match(
         symbol: &str,
         order: Order,
         post_only: bool,
         timestamp: u64,
-        book: &mut OrderBook,
+        book: &mut BookView<'_>,
         next_trade_id: &mut u64,
         events: &mut Vec<DomainEvent>,
     ) -> Option<LastTrade> {
@@ -271,7 +267,7 @@ impl<'a> DecisionScratch<'a> {
             remaining_quantity,
             fills,
             rested,
-        } = book.submit(order.clone());
+        } = book.plan(order.clone());
 
         let last_trade = Self::push_fills(symbol, timestamp, fills, next_trade_id, events);
         Self::push_residual_tail(symbol, &order, remaining_quantity, rested, events);
@@ -281,11 +277,12 @@ impl<'a> DecisionScratch<'a> {
 
     /// Decide a fresh submit: policy, matching, then fill/rest/cancel events.
     ///
-    /// Matching runs against a clone of **only** the touched symbol's book and
-    /// stop book. The engine's book, ledger, trades, last price and counters
-    /// are never mutated; order and trade ids are allocated in local variables
-    /// and only become state when the events are applied. Any pending stops
-    /// the resulting last price triggers become part of the same event stream.
+    /// Matching walks a [`BookView`] over **only** the touched symbol's book;
+    /// fills and rests are recorded in its overlay. The engine's book, ledger,
+    /// trades, last price and counters are never mutated; order and trade ids
+    /// are allocated in local variables and only become state when the events
+    /// are applied. Any pending stops the resulting last price triggers become
+    /// part of the same event stream through the same book view.
     pub fn decide_submit(&self, request: &OrderRequest) -> Result<Vec<DomainEvent>, EngineError> {
         // Validation order matches the command-sourced path: validate, then
         // post-only crossing, then FOK liquidity.
@@ -294,9 +291,9 @@ impl<'a> DecisionScratch<'a> {
         let accepted = request.to_order(self.order_id);
         let symbol = self.symbol.to_string();
 
-        // The book this decision runs against: a private copy. `submit` both
-        // matches and decides whether the remainder rests.
-        let mut scratch_book = self.scratch_book();
+        // The borrowed decision view. `plan` both matches and decides whether
+        // the remainder rests, recording the effect for the stop cascade.
+        let mut book = self.book_view();
         let mut events = Vec::new();
 
         // Trade ids are allocated locally; `apply(TradeExecuted)` advances the
@@ -307,18 +304,18 @@ impl<'a> DecisionScratch<'a> {
             accepted,
             request.post_only,
             request.timestamp,
-            &mut scratch_book,
+            &mut book,
             &mut next_trade_id,
             &mut events,
         );
 
         // A trade can reach a pending stop's trigger price. Run the cascade on
-        // the same scratch book/stop book so the decision is self-contained.
+        // the same book/stop views so the decision is self-contained.
         let last_trade = command_last_trade.or_else(|| self.last_trade());
-        let mut scratch_stops = self.scratch_stops();
+        let mut stops = self.stop_view();
         self.run_stop_cascade(
-            &mut scratch_book,
-            &mut scratch_stops,
+            &mut book,
+            &mut stops,
             &symbol,
             last_trade,
             &mut next_trade_id,
@@ -334,8 +331,8 @@ impl<'a> DecisionScratch<'a> {
     /// first, a pending stop is not modifiable, and an unknown or closed order
     /// is rejected. The replacement is a limit/GTC order on the old side with
     /// the requested price, quantity and timestamp. It always gets a new id
-    /// and runs against the same scratch book, so the old priority is lost and
-    /// the new order matches as a taker. The stop cascade follows the
+    /// and runs against the same borrowed view, so the old priority is lost
+    /// and the new order matches as a taker. The stop cascade follows the
     /// replacement's match result.
     pub fn decide_modify(
         &self,
@@ -362,12 +359,12 @@ impl<'a> DecisionScratch<'a> {
             return Err(EngineError::UnknownOrder);
         }
 
-        // 3. Cancel the old order on the scratch book. The ledger is not
-        //    mutated here: `apply(OrderCanceled)` does that. The ledger said
-        //    the order was open and this symbol's, so its absence from the
-        //    book is ledger/book divergence, not a business rejection.
-        let mut scratch_book = self.scratch_book();
-        let old_order = scratch_book.cancel_limit_order(order_id).expect(
+        // 3. Cancel the old order in the view. The ledger is not mutated here:
+        //    `apply(OrderCanceled)` does that. The ledger said the order was
+        //    open and this symbol's, so its absence from the book is
+        //    ledger/book divergence, not a business rejection.
+        let mut book = self.book_view();
+        let old_order = book.cancel_limit_order(order_id).expect(
             "ledger/book divergence: ledger says the order is open but it is missing from the book",
         );
 
@@ -399,17 +396,17 @@ impl<'a> DecisionScratch<'a> {
             replacement,
             false,
             request.timestamp,
-            &mut scratch_book,
+            &mut book,
             &mut next_trade_id,
             &mut events,
         );
 
         // 5. The replacement's trades can trigger pending stops.
         let last_trade = command_last_trade.or_else(|| self.last_trade());
-        let mut scratch_stops = self.scratch_stops();
+        let mut stops = self.stop_view();
         self.run_stop_cascade(
-            &mut scratch_book,
-            &mut scratch_stops,
+            &mut book,
+            &mut stops,
             &symbol,
             last_trade,
             &mut next_trade_id,
@@ -2015,5 +2012,253 @@ mod tests {
             },
             99,
         );
+    }
+
+    /// Reference stop cascade: the pre-view implementation, cloning the books
+    /// and mutating the clone with `OrderBook::submit` / `StopBook::remove`.
+    fn reference_cascade(
+        book: &mut OrderBook,
+        stops: &mut StopBook,
+        symbol: &str,
+        mut last_trade: Option<LastTrade>,
+        next_trade_id: &mut u64,
+        events: &mut Vec<DomainEvent>,
+    ) {
+        while let Some(LastTrade {
+            price: last_price,
+            timestamp: last_timestamp,
+        }) = last_trade
+        {
+            let Some(stop_id) = stops.next_triggered(last_price) else {
+                break;
+            };
+            let stop = stops
+                .remove(stop_id)
+                .expect("triggered stop missing from the stop book");
+            let converted = match stop.order_type {
+                StopKind::Market => Order {
+                    id: stop.id,
+                    side: stop.side,
+                    price: 0,
+                    quantity: stop.quantity,
+                    timestamp: last_timestamp,
+                    order_type: OrderType::Market,
+                    time_in_force: TimeInForce::IOC,
+                },
+                StopKind::Limit { price } => Order {
+                    id: stop.id,
+                    side: stop.side,
+                    price,
+                    quantity: stop.quantity,
+                    timestamp: last_timestamp,
+                    order_type: OrderType::Limit,
+                    time_in_force: TimeInForce::GTC,
+                },
+            };
+            events.push(DomainEvent::StopTriggered {
+                symbol: symbol.to_string(),
+                order: converted.clone(),
+                last_price,
+            });
+            let SubmitResult {
+                remaining_quantity,
+                fills,
+                rested,
+            } = book.submit(converted.clone());
+            let cascade_last =
+                DecisionScratch::push_fills(symbol, last_timestamp, fills, next_trade_id, events);
+            DecisionScratch::push_residual_tail(
+                symbol,
+                &converted,
+                remaining_quantity,
+                rested,
+                events,
+            );
+            if let Some(new_last) = cascade_last {
+                last_trade = Some(new_last);
+            }
+        }
+    }
+
+    fn reference_submit(
+        engine: &MatchingEngine,
+        symbol: &str,
+        request: &OrderRequest,
+    ) -> Vec<DomainEvent> {
+        let mut book = engine
+            .order_books
+            .get(symbol)
+            .cloned()
+            .unwrap_or_else(OrderBook::new);
+        let mut stops = engine.stop_books.get(symbol).cloned().unwrap_or_default();
+        let mut events = Vec::new();
+        let mut next_trade_id = engine.next_trade_id;
+
+        let order = request.to_order(engine.next_order_id);
+        events.push(DomainEvent::OrderAccepted {
+            symbol: symbol.to_string(),
+            order: order.clone(),
+            post_only: request.post_only,
+        });
+        let SubmitResult {
+            remaining_quantity,
+            fills,
+            rested,
+        } = book.submit(order.clone());
+        let command_last = DecisionScratch::push_fills(
+            symbol,
+            request.timestamp,
+            fills,
+            &mut next_trade_id,
+            &mut events,
+        );
+        DecisionScratch::push_residual_tail(
+            symbol,
+            &order,
+            remaining_quantity,
+            rested,
+            &mut events,
+        );
+        let last_trade = command_last.or_else(|| engine.last_trades.get(symbol).copied());
+        reference_cascade(
+            &mut book,
+            &mut stops,
+            symbol,
+            last_trade,
+            &mut next_trade_id,
+            &mut events,
+        );
+        events
+    }
+
+    fn reference_modify(
+        engine: &MatchingEngine,
+        symbol: &str,
+        order_id: OrderBookId,
+        request: &ModifyRequest,
+    ) -> Vec<DomainEvent> {
+        let record = engine
+            .ledger
+            .get(order_id)
+            .expect("reference modify requires an open order");
+        assert_eq!(record.symbol, symbol);
+
+        let mut book = engine
+            .order_books
+            .get(symbol)
+            .cloned()
+            .unwrap_or_else(OrderBook::new);
+        let mut stops = engine.stop_books.get(symbol).cloned().unwrap_or_default();
+        let old_order = book
+            .cancel_limit_order(order_id)
+            .expect("open modify target is resting");
+
+        let mut events = vec![DomainEvent::OrderCanceled {
+            symbol: symbol.to_string(),
+            order_id,
+            canceled_quantity: old_order.quantity,
+            reason: OrderCancelReason::Modified,
+        }];
+        let replacement = OrderRequest {
+            side: old_order.side,
+            price: request.price,
+            quantity: request.quantity,
+            timestamp: request.timestamp,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::GTC,
+            post_only: false,
+        }
+        .to_order(engine.next_order_id);
+        events.push(DomainEvent::OrderAccepted {
+            symbol: symbol.to_string(),
+            order: replacement.clone(),
+            post_only: false,
+        });
+        let mut next_trade_id = engine.next_trade_id;
+        let SubmitResult {
+            remaining_quantity,
+            fills,
+            rested,
+        } = book.submit(replacement.clone());
+        let command_last = DecisionScratch::push_fills(
+            symbol,
+            request.timestamp,
+            fills,
+            &mut next_trade_id,
+            &mut events,
+        );
+        DecisionScratch::push_residual_tail(
+            symbol,
+            &replacement,
+            remaining_quantity,
+            rested,
+            &mut events,
+        );
+        let last_trade = command_last.or_else(|| engine.last_trades.get(symbol).copied());
+        reference_cascade(
+            &mut book,
+            &mut stops,
+            symbol,
+            last_trade,
+            &mut next_trade_id,
+            &mut events,
+        );
+        events
+    }
+
+    /// `decide` must produce the same streams as the clone-based reference for
+    /// the commands whose decision path changed. Cancel and stop submission are
+    /// ledger-only and unchanged.
+    fn reference_decide(engine: &MatchingEngine, command: &EngineCommand) -> Vec<DomainEvent> {
+        match command {
+            EngineCommand::SubmitOrder { symbol, request } => {
+                reference_submit(engine, symbol, request)
+            }
+            EngineCommand::ModifyOrder {
+                symbol,
+                order_id,
+                request,
+            } => reference_modify(engine, symbol, *order_id, request),
+            _ => engine.decide(command),
+        }
+    }
+
+    #[test]
+    fn decide_matches_a_clone_based_reference_for_a_mixed_command_sequence() {
+        let commands = vec![
+            submit_command("BTC-USDT", limit(1, Side::Ask, 100, 1)),
+            submit_command("BTC-USDT", limit(2, Side::Bid, 100, 1)),
+            EngineCommand::SubmitStopOrder {
+                symbol: "BTC-USDT".to_string(),
+                request: stop_market(Side::Ask, 95, 2, 3),
+            },
+            submit_command("BTC-USDT", limit(4, Side::Bid, 90, 5)),
+            submit_command("BTC-USDT", limit(5, Side::Ask, 94, 1)),
+            // Crossing this ask trades at 94 and triggers the 95 sell stop.
+            submit_command("BTC-USDT", limit(6, Side::Bid, 94, 1)),
+            // Modify the partially filled bid: cancel 3, rest a replacement.
+            modify_command("BTC-USDT", 4, 91, 3, 7),
+            // Cancel an already-filled order: rejection.
+            cancel_command("BTC-USDT", 5),
+            EngineCommand::SubmitStopOrder {
+                symbol: "BTC-USDT".to_string(),
+                request: stop_market(Side::Bid, 95, 1, 8),
+            },
+            cancel_command("BTC-USDT", 8),
+        ];
+
+        let mut engine = MatchingEngine::new(EngineConfig::default());
+        for command in &commands {
+            let decided = engine.decide(command);
+            let reference = reference_decide(&engine, command);
+            assert_eq!(decided, reference, "decision diverged for {command:?}");
+
+            for event in &decided {
+                let sequence = engine.last_applied_sequence() + 1;
+                engine.apply(event, sequence);
+            }
+        }
+
+        assert_eq!(engine.last_trade_price("BTC-USDT"), Some(90));
     }
 }

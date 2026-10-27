@@ -5,7 +5,7 @@
 //! orders.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::types::{OrderBookId, Side, StopOrder};
 
@@ -56,6 +56,10 @@ impl StopBook {
     ///
     /// Buy stops are eligible at or below `last_price`, sell stops at or above
     /// it. When both sides have a candidate, the smaller order id wins.
+    ///
+    /// [`StopView`] overlays removals on this ordering; the method is kept as
+    /// the reference implementation used by the views' tests.
+    #[allow(dead_code)]
     pub(crate) fn next_triggered(&self, last_price: u64) -> Option<OrderBookId> {
         // 买止损：stop_price <= last，价格升序 + id 升序
         let buy = self
@@ -104,6 +108,67 @@ impl StopBook {
             book.insert(stop);
         }
         book
+    }
+}
+
+/// A borrowed, copy-on-write decision view of one symbol's [`StopBook`].
+///
+/// The stop cascade only ever reads pending stops and removes the ones it
+/// triggers. `StopView` records those removals in an overlay, so the borrowed
+/// book stays untouched while later steps of the same cascade see exactly the
+/// ordering they would see if they had mutated a clone.
+#[derive(Debug, Default)]
+pub(crate) struct StopView<'a> {
+    stops: Option<&'a StopBook>,
+    removed: HashSet<OrderBookId>,
+}
+
+impl<'a> StopView<'a> {
+    pub(crate) fn new(stops: Option<&'a StopBook>) -> Self {
+        Self {
+            stops,
+            removed: HashSet::new(),
+        }
+    }
+
+    /// The next stop a trade at `last_price` should trigger.
+    ///
+    /// Skips stops this view already removed. Buy stops are eligible at or
+    /// below `last_price`, sell stops at or above it; when both sides have a
+    /// candidate the smaller order id wins. This mirrors
+    /// [`StopBook::next_triggered`] on top of the removal overlay.
+    pub(crate) fn next_triggered(&self, last_price: u64) -> Option<OrderBookId> {
+        let stops = self.stops?;
+
+        let buy = stops
+            .buy
+            .range(..=(last_price, OrderBookId::MAX))
+            .find(|&&(_, id)| !self.removed.contains(&id))
+            .map(|&(_, id)| id);
+        let sell = stops
+            .sell
+            .range(..=(Reverse(last_price), OrderBookId::MAX))
+            .find(|&&(_, id)| !self.removed.contains(&id))
+            .map(|&(_, id)| id);
+
+        match (buy, sell) {
+            (Some(buy), Some(sell)) => Some(buy.min(sell)),
+            (buy, sell) => buy.or(sell),
+        }
+    }
+
+    /// Remove a pending stop in the overlay and return it.
+    ///
+    /// Returns `None` when the stop is unknown or was already removed. The
+    /// borrowed [`StopBook`] is never mutated.
+    pub(crate) fn remove(&mut self, order_id: OrderBookId) -> Option<StopOrder> {
+        if self.removed.contains(&order_id) {
+            return None;
+        }
+        let stops = self.stops?;
+        let stop = stops.get(order_id)?.clone();
+        self.removed.insert(order_id);
+        Some(stop)
     }
 }
 
@@ -198,5 +263,47 @@ mod tests {
         assert_eq!(book.next_triggered(200), Some(3));
 
         assert!(book.remove(1).is_none());
+    }
+
+    #[test]
+    fn stop_view_skips_removed_stops_and_matches_book_ordering() {
+        let mut book = StopBook::default();
+        book.insert(stop(1, Side::Bid, 100));
+        book.insert(stop(2, Side::Ask, 100));
+        book.insert(stop(3, Side::Bid, 101));
+
+        let mut view = StopView::new(Some(&book));
+        for last_price in [99u64, 100, 101, 200] {
+            assert_eq!(
+                view.next_triggered(last_price),
+                book.next_triggered(last_price),
+                "the empty overlay must match the base book at {last_price}"
+            );
+        }
+
+        let removed = view.remove(2).expect("stop 2 is pending");
+        assert_eq!(removed.id, 2);
+        assert!(view.remove(2).is_none(), "a stop is removed only once");
+
+        // Removal is overlay-only: the base book still holds stop 2.
+        assert!(book.get(2).is_some());
+
+        // Against a clone with the same stop physically removed, the view
+        // yields the same trigger ordering.
+        let mut reference = book.clone();
+        reference.remove(2);
+        for last_price in [99u64, 100, 101, 200] {
+            assert_eq!(
+                view.next_triggered(last_price),
+                reference.next_triggered(last_price)
+            );
+        }
+    }
+
+    #[test]
+    fn stop_view_on_an_empty_book_never_triggers() {
+        let view = StopView::new(None);
+        assert_eq!(view.next_triggered(0), None);
+        assert_eq!(view.next_triggered(u64::MAX), None);
     }
 }

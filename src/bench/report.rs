@@ -26,10 +26,10 @@ pub struct BenchReport {
 
 /// Measurements for the pure `decide` path.
 ///
-/// This is the decision-scratch baseline gated against the applied SLO:
-/// command in, events out, with no state mutation. If it cannot meet the
-/// applied target, that is a measured shortfall, not a reason to move the
-/// runtime onto a different path.
+/// This is the pure decision baseline gated against the applied SLO: command
+/// in, events out, running on borrowed `BookView` / `StopView` overlays with no
+/// state mutation. If it cannot meet the applied target, that is a measured
+/// shortfall, not a reason to move the runtime onto a different path.
 #[derive(Debug, Clone)]
 pub struct DecideReport {
     pub latency: Summary,

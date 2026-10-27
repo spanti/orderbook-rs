@@ -145,6 +145,18 @@ impl MatchWalk {
             Side::Ask => self.start = Bound::Excluded(price),
         }
     }
+
+    /// Next price to visit in an overlay of orders added by rests.
+    ///
+    /// The overlay shares the same price-priority direction as the base book,
+    /// so [`BookView::plan`] can merge the two walks lazily.
+    fn next_added_price(&self, levels: &BTreeMap<u64, VecDeque<Order>>) -> Option<u64> {
+        let next = match self.side {
+            Side::Bid => levels.range((self.start, self.end)).next_back(),
+            Side::Ask => levels.range((self.start, self.end)).next(),
+        };
+        next.map(|(price, _)| *price)
+    }
 }
 
 /// One side of the OrderBook (either Bid or Ask).
@@ -484,6 +496,268 @@ impl OrderBook {
     }
 }
 
+/// A borrowed, copy-on-write decision view of one symbol's [`OrderBook`].
+///
+/// `decide` walks the base price levels and an overlay of the fills and rests
+/// it has already planned. Nothing is cloned: the base book stays immutable and
+/// the overlay records only the touched orders and levels, so a plan is
+/// O(touched levels/orders) instead of O(resting orders).
+///
+/// The overlay reproduces [`OrderBook::submit`] exactly:
+///
+/// * base orders at a price keep their FIFO position; a nonzero override is a
+///   partial fill and a zero override removes a fully filled/canceled order;
+/// * orders added by an earlier rest are appended after any base orders at the
+///   same price, so later plans in the same stop cascade can match them;
+/// * a partially filled maker keeps its position, a fully filled maker
+///   disappears, and the taker remainder is appended to its own price level.
+#[derive(Debug)]
+pub(crate) struct BookView<'a> {
+    book: Option<&'a OrderBook>,
+    overlay: BookOverlay,
+}
+
+impl<'a> BookView<'a> {
+    pub(crate) fn new(book: Option<&'a OrderBook>) -> Self {
+        Self {
+            book,
+            overlay: BookOverlay::default(),
+        }
+    }
+
+    /// Non-mutating equivalent of [`OrderBook::submit`].
+    ///
+    /// Matches the order against the base book plus earlier planned fills and
+    /// rests, then records its own fills and remainder in the overlay. It never
+    /// mutates the borrowed book, so `decide` stays pure.
+    pub(crate) fn plan(&mut self, mut order: Order) -> SubmitResult {
+        let resting_side = order.side.opposite();
+        let book = self.book;
+        let overlay = &mut self.overlay;
+
+        let mut fills = Vec::new();
+        let mut base_walk = MatchWalk::new(resting_side, &order);
+        let mut added_walk = MatchWalk::new(resting_side, &order);
+
+        while order.quantity > 0 {
+            let next_base =
+                book.and_then(|book| base_walk.next_price(side_levels(book, resting_side)));
+            let next_added = added_walk.next_added_price(overlay.added_levels(resting_side));
+
+            let Some(price) = pick_price(resting_side, next_base, next_added) else {
+                break;
+            };
+
+            // A price held by both sources is matched in one step: base orders
+            // first, then orders added by earlier rests.
+            let base_at_price = next_base == Some(price);
+            let added_at_price = next_added == Some(price);
+            if base_at_price {
+                base_walk.advance_past(price);
+            }
+            if added_at_price {
+                added_walk.advance_past(price);
+            }
+
+            if base_at_price {
+                let level = &side_levels(
+                    book.expect("a base price level implies a base book"),
+                    resting_side,
+                )[&price];
+                for resting in &level.orders {
+                    let quantity = overlay.current_quantity(resting);
+                    if quantity == 0 {
+                        continue;
+                    }
+                    let traded = quantity.min(order.quantity);
+                    fills.push(Fill {
+                        maker_order_id: resting.id,
+                        taker_order_id: order.id,
+                        price: resting.price,
+                        quantity: traded,
+                        taker_side: order.side,
+                    });
+                    order.quantity -= traded;
+
+                    if traded < quantity {
+                        // The taker ran out; the maker keeps its position.
+                        overlay.quantities.insert(resting.id, quantity - traded);
+                        break;
+                    }
+                    overlay.quantities.insert(resting.id, 0);
+                    if order.quantity == 0 {
+                        break;
+                    }
+                }
+            }
+
+            if added_at_price && order.quantity > 0 {
+                let level = overlay
+                    .added_levels_mut(resting_side)
+                    .get_mut(&price)
+                    .expect("added price level disappeared");
+                while order.quantity > 0 {
+                    let Some(maker) = level.front() else {
+                        break;
+                    };
+                    let maker_quantity = maker.quantity;
+                    if maker_quantity == 0 {
+                        level.pop_front();
+                        continue;
+                    }
+                    let maker_id = maker.id;
+                    let maker_price = maker.price;
+                    let traded = maker_quantity.min(order.quantity);
+                    fills.push(Fill {
+                        maker_order_id: maker_id,
+                        taker_order_id: order.id,
+                        price: maker_price,
+                        quantity: traded,
+                        taker_side: order.side,
+                    });
+                    order.quantity -= traded;
+
+                    if traded == maker_quantity {
+                        level.pop_front();
+                    } else {
+                        // The taker ran out; the maker keeps its position.
+                        level
+                            .front_mut()
+                            .expect("maker vanished while partially filled")
+                            .quantity -= traded;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let remaining_quantity = order.quantity;
+        let rested = remaining_quantity > 0 && order.rests();
+
+        if rested {
+            overlay
+                .added_levels_mut(order.side)
+                .entry(order.price)
+                .or_default()
+                .push_back(Order {
+                    quantity: remaining_quantity,
+                    ..order
+                });
+        }
+
+        SubmitResult {
+            remaining_quantity,
+            fills,
+            rested,
+        }
+    }
+
+    /// Non-mutating equivalent of [`OrderBook::cancel_limit_order`].
+    ///
+    /// Returns the order with its current (overlay-aware) remaining quantity,
+    /// or `None` when the order was already filled or canceled. The removal is
+    /// recorded in the overlay and affects subsequent plans.
+    pub(crate) fn cancel_limit_order(&mut self, order_id: OrderBookId) -> Option<Order> {
+        if let Some(order) = self.overlay.remove_added(order_id) {
+            return Some(order);
+        }
+
+        let book = self.book?;
+        for side in [Side::Bid, Side::Ask] {
+            let book_side = match side {
+                Side::Bid => &book.bids,
+                Side::Ask => &book.asks,
+            };
+            let Some(&(_, price)) = book_side.order_map.get(&order_id) else {
+                continue;
+            };
+            let Some(level) = book_side.price_levels.get(&price) else {
+                continue;
+            };
+            let Some(order) = level.orders.iter().find(|order| order.id == order_id) else {
+                continue;
+            };
+            let quantity = self.overlay.current_quantity(order);
+            if quantity == 0 {
+                return None;
+            }
+            self.overlay.quantities.insert(order_id, 0);
+            return Some(Order {
+                quantity,
+                ..order.clone()
+            });
+        }
+        None
+    }
+}
+
+/// The borrowed book's price levels on `side`.
+fn side_levels(book: &OrderBook, side: Side) -> &BTreeMap<u64, PriceLevel> {
+    match side {
+        Side::Bid => &book.bids.price_levels,
+        Side::Ask => &book.asks.price_levels,
+    }
+}
+
+/// The better of the next base and added prices, if either exists.
+fn pick_price(side: Side, base: Option<u64>, added: Option<u64>) -> Option<u64> {
+    match (base, added) {
+        (Some(base), Some(added)) => Some(match side {
+            Side::Bid => base.max(added),
+            Side::Ask => base.min(added),
+        }),
+        (Some(price), None) | (None, Some(price)) => Some(price),
+        (None, None) => None,
+    }
+}
+
+/// Copy-on-write deltas produced by plans against one borrowed [`OrderBook`].
+#[derive(Debug, Default)]
+struct BookOverlay {
+    /// Remaining quantity for an order whose quantity differs from the base
+    /// book. `0` means the order was fully filled or canceled.
+    quantities: HashMap<OrderBookId, u64>,
+    /// Orders added by rests in this decision, per price, in FIFO order. Their
+    /// live quantity is stored on the order itself.
+    added_bids: BTreeMap<u64, VecDeque<Order>>,
+    added_asks: BTreeMap<u64, VecDeque<Order>>,
+}
+
+impl BookOverlay {
+    fn current_quantity(&self, order: &Order) -> u64 {
+        self.quantities
+            .get(&order.id)
+            .copied()
+            .unwrap_or(order.quantity)
+    }
+
+    fn added_levels(&self, side: Side) -> &BTreeMap<u64, VecDeque<Order>> {
+        match side {
+            Side::Bid => &self.added_bids,
+            Side::Ask => &self.added_asks,
+        }
+    }
+
+    fn added_levels_mut(&mut self, side: Side) -> &mut BTreeMap<u64, VecDeque<Order>> {
+        match side {
+            Side::Bid => &mut self.added_bids,
+            Side::Ask => &mut self.added_asks,
+        }
+    }
+
+    /// Remove an order that a prior rest added during this decision.
+    fn remove_added(&mut self, order_id: OrderBookId) -> Option<Order> {
+        for levels in [&mut self.added_bids, &mut self.added_asks] {
+            for level in levels.values_mut() {
+                if let Some(position) = level.iter().position(|order| order.id == order_id) {
+                    return level.remove(position);
+                }
+            }
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,6 +778,13 @@ mod tests {
     fn ioc_limit(id: OrderBookId, side: Side, price: u64, quantity: u64) -> Order {
         Order {
             time_in_force: TimeInForce::IOC,
+            ..limit(id, side, price, quantity)
+        }
+    }
+
+    fn fok_limit(id: OrderBookId, side: Side, price: u64, quantity: u64) -> Order {
+        Order {
+            time_in_force: TimeInForce::FOK,
             ..limit(id, side, price, quantity)
         }
     }
@@ -1308,5 +1589,231 @@ mod tests {
 
         assert_eq!(result.remaining_quantity, 5);
         assert!(result.fills.is_empty());
+    }
+
+    /// `BookView::plan` must agree with `OrderBook::submit` on the result and
+    /// must leave the borrowed book untouched.
+    fn assert_plan_matches_submit(book: &OrderBook, order: Order) {
+        let before = book.clone();
+        let mut view = BookView::new(Some(book));
+        let planned = view.plan(order.clone());
+
+        let mut reference = book.clone();
+        let submitted = reference.submit(order);
+
+        assert_eq!(
+            planned.remaining_quantity, submitted.remaining_quantity,
+            "remaining quantity diverged"
+        );
+        assert_eq!(planned.rested, submitted.rested, "rest verdict diverged");
+        assert_eq!(
+            fill_summary(&planned.fills),
+            fill_summary(&submitted.fills),
+            "fills diverged"
+        );
+        assert_eq!(*book, before, "a plan must not mutate the borrowed book");
+    }
+
+    #[test]
+    fn book_view_plan_matches_submit_for_limit_gtc_resting_and_empty_book() {
+        let empty = OrderBook::new();
+        assert_plan_matches_submit(&empty, limit(1, Side::Bid, 100, 5));
+
+        let mut book = OrderBook::new();
+        book.submit(limit(1, Side::Ask, 101, 1));
+        assert_plan_matches_submit(&book, limit(2, Side::Bid, 100, 5));
+
+        // A post-only order that does not cross is just a resting limit order;
+        // `post_only` is event metadata and does not reach `submit`.
+        assert_plan_matches_submit(&book, limit(3, Side::Bid, 100, 2));
+    }
+
+    #[test]
+    fn book_view_plan_matches_submit_for_partial_fill_and_rest() {
+        let mut book = OrderBook::new();
+        book.submit(limit(1, Side::Ask, 100, 3));
+
+        assert_plan_matches_submit(&book, limit(2, Side::Bid, 105, 10));
+    }
+
+    #[test]
+    fn book_view_plan_matches_submit_for_multi_level_sweeps() {
+        let asks = ask_ladder();
+        assert_plan_matches_submit(&asks, limit(10, Side::Bid, 100, 10));
+
+        let bids = bid_ladder();
+        assert_plan_matches_submit(&bids, limit(20, Side::Ask, 100, 10));
+    }
+
+    #[test]
+    fn book_view_plan_matches_submit_for_discarded_residuals() {
+        let mut book = OrderBook::new();
+        book.submit(limit(1, Side::Ask, 100, 2));
+
+        // Market/IOC remainder never rests.
+        assert_plan_matches_submit(&book, market(2, Side::Bid, 5));
+        assert_plan_matches_submit(&book, ioc_limit(3, Side::Bid, 100, 5));
+    }
+
+    #[test]
+    fn book_view_plan_matches_submit_for_a_fok_sized_fill() {
+        let mut book = OrderBook::new();
+        book.submit(limit(1, Side::Ask, 100, 2));
+        book.submit(limit(2, Side::Ask, 101, 3));
+
+        // Policy has already guaranteed the liquidity; `submit` fills it.
+        assert_plan_matches_submit(&book, fok_limit(3, Side::Bid, 101, 5));
+    }
+
+    #[test]
+    fn book_view_plan_sequence_matches_submit_sequence() {
+        let mut base = OrderBook::new();
+        base.submit(limit(1, Side::Ask, 100, 2));
+
+        let mut reference = base.clone();
+        let mut view = BookView::new(Some(&base));
+
+        // A rest, then a taker that matches the rested order, then a sweep.
+        for order in [
+            limit(2, Side::Bid, 100, 5),
+            limit(3, Side::Ask, 100, 4),
+            market(4, Side::Bid, 10),
+        ] {
+            let planned = view.plan(order.clone());
+            let submitted = reference.submit(order);
+
+            assert_eq!(planned.remaining_quantity, submitted.remaining_quantity);
+            assert_eq!(planned.rested, submitted.rested);
+            assert_eq!(fill_summary(&planned.fills), fill_summary(&submitted.fills));
+        }
+
+        assert_eq!(base.best_ask(), Some(100));
+        assert_eq!(base.depth(Side::Ask, 0), Some((100, 2)));
+    }
+
+    #[test]
+    fn book_view_matches_base_then_added_orders_at_the_same_price() {
+        let mut base = OrderBook::new();
+        base.submit(limit(1, Side::Ask, 100, 2));
+
+        let mut reference = base.clone();
+        let mut view = BookView::new(Some(&base));
+
+        // Rest 4 asks at 100 in the view; the reference appends them after
+        // order 1, which is already at that price.
+        let planned = view.plan(limit(2, Side::Ask, 100, 4));
+        let submitted = reference.submit(limit(2, Side::Ask, 100, 4));
+        assert_eq!(fill_summary(&planned.fills), fill_summary(&submitted.fills));
+        assert_eq!(planned.rested, submitted.rested);
+
+        // A 6-lot bid must consume base order 1 first, then the overlay rest.
+        let planned = view.plan(limit(3, Side::Bid, 100, 6));
+        let submitted = reference.submit(limit(3, Side::Bid, 100, 6));
+        assert_eq!(fill_summary(&planned.fills), fill_summary(&submitted.fills));
+        assert_eq!(
+            fill_summary(&planned.fills),
+            vec![(1, 100, 2), (2, 100, 4)],
+            "base FIFO precedes overlay rests at the same price"
+        );
+        assert_eq!(planned.remaining_quantity, 0);
+    }
+
+    #[test]
+    fn book_view_matches_multiple_added_orders_in_fifo_order() {
+        let base = OrderBook::new();
+        let mut reference = base.clone();
+        let mut view = BookView::new(Some(&base));
+
+        for order in [limit(1, Side::Ask, 100, 2), limit(2, Side::Ask, 100, 3)] {
+            let planned = view.plan(order.clone());
+            let submitted = reference.submit(order);
+            assert_eq!(fill_summary(&planned.fills), fill_summary(&submitted.fills));
+        }
+
+        let planned = view.plan(limit(3, Side::Bid, 100, 6));
+        let submitted = reference.submit(limit(3, Side::Bid, 100, 6));
+        assert_eq!(fill_summary(&planned.fills), fill_summary(&submitted.fills));
+        assert_eq!(
+            fill_summary(&planned.fills),
+            vec![(1, 100, 2), (2, 100, 3)],
+            "added orders are matched in insertion order"
+        );
+        assert_eq!(planned.remaining_quantity, 1);
+        assert!(planned.rested);
+
+        // The bid remainder rests in the overlay; a later ask matches it.
+        let planned = view.plan(limit(4, Side::Ask, 100, 1));
+        let submitted = reference.submit(limit(4, Side::Ask, 100, 1));
+        assert_eq!(fill_summary(&planned.fills), fill_summary(&submitted.fills));
+        assert_eq!(fill_summary(&planned.fills), vec![(3, 100, 1)]);
+    }
+
+    #[test]
+    fn book_view_keeps_a_partially_filled_maker_at_the_front() {
+        let mut base = OrderBook::new();
+        base.submit(limit(1, Side::Ask, 100, 5));
+        base.submit(limit(2, Side::Ask, 100, 5));
+
+        let mut reference = base.clone();
+        let mut view = BookView::new(Some(&base));
+
+        let first = view.plan(limit(3, Side::Bid, 100, 3));
+        let first_reference = reference.submit(limit(3, Side::Bid, 100, 3));
+        assert_eq!(
+            fill_summary(&first.fills),
+            fill_summary(&first_reference.fills)
+        );
+
+        let second = view.plan(limit(4, Side::Bid, 100, 4));
+        let second_reference = reference.submit(limit(4, Side::Bid, 100, 4));
+        assert_eq!(
+            fill_summary(&second.fills),
+            fill_summary(&second_reference.fills)
+        );
+        assert_eq!(
+            fill_summary(&second.fills),
+            vec![(1, 100, 2), (2, 100, 2)],
+            "the partially filled maker keeps its FIFO position"
+        );
+    }
+
+    #[test]
+    fn book_view_cancel_matches_book_cancel_and_affects_later_plans() {
+        let mut base = OrderBook::new();
+        base.submit(limit(1, Side::Ask, 100, 5));
+        base.submit(limit(2, Side::Ask, 100, 3));
+
+        let mut reference = base.clone();
+        let mut view = BookView::new(Some(&base));
+
+        assert_eq!(
+            view.cancel_limit_order(1).expect("order 1 is resting"),
+            reference.cancel_limit_order(1).expect("order 1 is resting")
+        );
+        assert!(view.cancel_limit_order(1).is_none());
+        assert!(reference.cancel_limit_order(1).is_none());
+        assert!(view.cancel_limit_order(42).is_none());
+
+        let planned = view.plan(limit(3, Side::Bid, 100, 4));
+        let submitted = reference.submit(limit(3, Side::Bid, 100, 4));
+        assert_eq!(planned.remaining_quantity, submitted.remaining_quantity);
+        assert_eq!(planned.rested, submitted.rested);
+        assert_eq!(fill_summary(&planned.fills), fill_summary(&submitted.fills));
+
+        // The base book still contains the canceled order.
+        assert_eq!(base.depth(Side::Ask, 0), Some((100, 8)));
+    }
+
+    #[test]
+    fn book_view_plan_does_not_mutate_the_base_book() {
+        let mut base = OrderBook::new();
+        base.submit(limit(1, Side::Ask, 100, 5));
+        let before = base.clone();
+
+        let mut view = BookView::new(Some(&base));
+        let _ = view.plan(limit(2, Side::Bid, 100, 10));
+        let _ = view.plan(limit(3, Side::Bid, 99, 1));
+
+        assert_eq!(base, before);
     }
 }
