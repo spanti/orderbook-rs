@@ -1,5 +1,7 @@
 //! Latency sample collection and nearest-rank summary statistics.
 
+use serde::Serialize;
+
 /// Nearest-rank percentile over a sorted slice.
 ///
 /// Returns the value at index `ceil(p * n) - 1`, clamped to the last sample.
@@ -48,7 +50,7 @@ impl Samples {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct Summary {
     pub count: u64,
     pub p50: u64,

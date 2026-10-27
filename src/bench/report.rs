@@ -2,6 +2,8 @@
 
 use std::fmt::Write;
 
+use serde::Serialize;
+
 use crate::runtime::IdleStrategy;
 
 use super::config::{BenchConfig, LogKind};
@@ -30,16 +32,18 @@ pub struct BenchReport {
 /// in, events out, running on borrowed `BookView` / `StopView` overlays with no
 /// state mutation. If it cannot meet the applied target, that is a measured
 /// shortfall, not a reason to move the runtime onto a different path.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DecideReport {
     pub latency: Summary,
     pub events_total: u64,
+    #[serde(serialize_with = "serialize_round3")]
     pub events_per_command: f64,
+    #[serde(serialize_with = "serialize_decide_slo")]
     pub slo: SloCheck,
 }
 
 /// In-process runtime measurements beyond the direct-path latency tables.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RuntimeReport {
     /// Submit -> applied (`wait_applied`) per command.
     pub applied_latency: Summary,
@@ -50,6 +54,7 @@ pub struct RuntimeReport {
     pub durable_wait: LatencyMetric,
     pub journal_append: LatencyMetric,
     /// Mean event records per journal handoff batch.
+    #[serde(serialize_with = "serialize_round3")]
     pub batch_size_mean: f64,
     /// Largest event-record count in one journal handoff batch.
     pub batch_size_max: u64,
@@ -57,30 +62,33 @@ pub struct RuntimeReport {
     /// Event records applied in the measured window.
     pub events_total: u64,
     /// Mean event records per applied command.
+    #[serde(serialize_with = "serialize_round3")]
     pub events_per_command: f64,
     pub queue_depth_max: u64,
     pub queue_full: u64,
     /// Journal append time / durable wait time, as a share of durable latency.
+    #[serde(serialize_with = "serialize_round6")]
     pub fsync_share: f64,
     pub applied_count: u64,
     pub durable_count: u64,
     pub slo: SloReport,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct LatencyMetric {
     pub mean_ns: u64,
     pub max_ns: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct SloReport {
     pub applied: SloCheck,
     pub durable: SloCheck,
 }
 
 /// Whether an SLO can be judged in this run's setup.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SloStatus {
     /// p99 met the target and the run had no queue-full refusals.
     Pass,
@@ -92,7 +100,7 @@ pub enum SloStatus {
     NotApplicable,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct SloCheck {
     pub target_ns: u64,
     pub p50: u64,
@@ -143,24 +151,18 @@ impl SloCheck {
             SloStatus::NotApplicable => "NOT APPLICABLE",
         }
     }
-
-    fn status_json(&self) -> &'static str {
-        match self.status {
-            SloStatus::Pass => "pass",
-            SloStatus::Fail => "fail",
-            SloStatus::NotApplicable => "not_applicable",
-        }
-    }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RunStats {
     pub wall_time_ns: u64,
+    #[serde(serialize_with = "serialize_round3")]
     pub achieved_rate: f64,
     pub commands: u64,
     pub engine_events: u64,
     /// Mean engine events per command. Event volume grows with fills and
     /// rejections, so this is reported next to the raw count.
+    #[serde(serialize_with = "serialize_round3")]
     pub events_per_command: f64,
     pub trades: u64,
     pub rejections: u64,
@@ -169,22 +171,24 @@ pub struct RunStats {
     pub final_depth_levels: DepthLevels,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct DepthLevels {
     pub bids: u64,
     pub asks: u64,
+    #[serde(skip)]
     pub bids_capped: bool,
+    #[serde(skip)]
     pub asks_capped: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct LatencyReport {
     pub total: CategoryStats,
     pub service: CategoryStats,
     pub send_lag: Summary,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CategoryStats {
     pub all: Summary,
     pub limit: Summary,
@@ -192,7 +196,7 @@ pub struct CategoryStats {
     pub cancel: Summary,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize)]
 pub struct EnvInfo {
     pub os: &'static str,
     pub arch: &'static str,
@@ -505,237 +509,152 @@ impl BenchReport {
     }
 
     pub fn to_json(&self) -> String {
-        let mut out = String::new();
+        let view = BenchReportJson {
+            config: ConfigJson::from(&self.config),
+            run: &self.run,
+            latency_ns: &self.latency,
+            runtime: self.runtime.as_ref().map(|runtime| RuntimeJson {
+                config: RuntimeConfigJson::from(&self.config),
+                report: runtime,
+            }),
+            decide: self.decide.as_ref(),
+            env: &self.env,
+        };
 
-        writeln!(out, "{{").expect("writing to a String cannot fail");
-        writeln!(out, "  \"config\": {{").expect("writing to a String cannot fail");
-        writeln!(out, "    \"events\": {},", self.config.events)
-            .expect("writing to a String cannot fail");
-        writeln!(out, "    \"warmup\": {},", self.config.warmup)
-            .expect("writing to a String cannot fail");
-        writeln!(out, "    \"rate\": {},", self.config.rate)
-            .expect("writing to a String cannot fail");
-        writeln!(out, "    \"seed\": {},", self.config.seed)
-            .expect("writing to a String cannot fail");
-        writeln!(out, "    \"symbols\": {},", self.config.symbols)
-            .expect("writing to a String cannot fail");
-        writeln!(out, "    \"limit_ratio\": {},", self.config.limit_ratio)
-            .expect("writing to a String cannot fail");
-        writeln!(out, "    \"market_ratio\": {},", self.config.market_ratio)
-            .expect("writing to a String cannot fail");
-        writeln!(out, "    \"cancel_ratio\": {},", self.config.cancel_ratio)
-            .expect("writing to a String cannot fail");
-        writeln!(out, "    \"cross_ratio\": {},", self.config.cross_ratio)
-            .expect("writing to a String cannot fail");
-        writeln!(out, "    \"price_band\": {},", self.config.price_band)
-            .expect("writing to a String cannot fail");
-        writeln!(out, "    \"mid\": {},", self.config.mid)
-            .expect("writing to a String cannot fail");
-        writeln!(
-            out,
-            "    \"order_quantity\": {},",
-            self.config.order_quantity
-        )
-        .expect("writing to a String cannot fail");
-        writeln!(
-            out,
-            "    \"max_open_orders\": {}",
-            self.config.max_open_orders
-        )
-        .expect("writing to a String cannot fail");
-        writeln!(out, "  }},").expect("writing to a String cannot fail");
-
-        writeln!(out, "  \"run\": {{").expect("writing to a String cannot fail");
-        writeln!(out, "    \"wall_time_ns\": {},", self.run.wall_time_ns)
-            .expect("writing to a String cannot fail");
-        writeln!(out, "    \"achieved_rate\": {:.3},", self.run.achieved_rate)
-            .expect("writing to a String cannot fail");
-        writeln!(out, "    \"commands\": {},", self.run.commands)
-            .expect("writing to a String cannot fail");
-        writeln!(out, "    \"engine_events\": {},", self.run.engine_events)
-            .expect("writing to a String cannot fail");
-        writeln!(
-            out,
-            "    \"events_per_command\": {:.3},",
-            self.run.events_per_command
-        )
-        .expect("writing to a String cannot fail");
-        writeln!(out, "    \"trades\": {},", self.run.trades)
-            .expect("writing to a String cannot fail");
-        writeln!(out, "    \"rejections\": {},", self.run.rejections)
-            .expect("writing to a String cannot fail");
-        writeln!(
-            out,
-            "    \"final_open_orders\": {},",
-            self.run.final_open_orders
-        )
-        .expect("writing to a String cannot fail");
-        writeln!(
-            out,
-            "    \"peak_open_orders\": {},",
-            self.run.peak_open_orders
-        )
-        .expect("writing to a String cannot fail");
-        writeln!(
-            out,
-            "    \"final_depth_levels\": {{ \"bids\": {}, \"asks\": {} }}",
-            self.run.final_depth_levels.bids, self.run.final_depth_levels.asks
-        )
-        .expect("writing to a String cannot fail");
-        writeln!(out, "  }},").expect("writing to a String cannot fail");
-
-        writeln!(out, "  \"latency_ns\": {{").expect("writing to a String cannot fail");
-        writeln!(out, "    \"total\": {{").expect("writing to a String cannot fail");
-        write_json_category(&mut out, "all", self.latency.total.all, true);
-        write_json_category(&mut out, "limit", self.latency.total.limit, true);
-        write_json_category(&mut out, "market", self.latency.total.market, true);
-        write_json_category(&mut out, "cancel", self.latency.total.cancel, false);
-        writeln!(out, "    }},").expect("writing to a String cannot fail");
-        writeln!(out, "    \"service\": {{").expect("writing to a String cannot fail");
-        write_json_category(&mut out, "all", self.latency.service.all, true);
-        write_json_category(&mut out, "limit", self.latency.service.limit, true);
-        write_json_category(&mut out, "market", self.latency.service.market, true);
-        write_json_category(&mut out, "cancel", self.latency.service.cancel, false);
-        writeln!(out, "    }},").expect("writing to a String cannot fail");
-        writeln!(out, "    \"send_lag\": {{").expect("writing to a String cannot fail");
-        write_json_summary_fields(&mut out, self.latency.send_lag, "      ", false);
-        writeln!(out, "    }}").expect("writing to a String cannot fail");
-        writeln!(out, "  }},").expect("writing to a String cannot fail");
-
-        if let Some(runtime) = &self.runtime {
-            writeln!(out, "  \"runtime\": {{").expect("writing to a String cannot fail");
-            writeln!(out, "    \"config\": {{").expect("writing to a String cannot fail");
-            writeln!(
-                out,
-                "      \"queue_capacity\": {}, \"journal_batch_capacity\": {}, \"apply_batch_max\": {},",
-                self.config.queue_capacity,
-                self.config.journal_batch_capacity,
-                self.config.apply_batch_max
-            )
-            .expect("writing to a String cannot fail");
-            writeln!(
-                out,
-                "      \"journal_coalesce_max\": {}, \"journal_flush_us\": {}, \"idle\": \"{}\",",
-                self.config.journal_coalesce_max,
-                self.config.journal_flush_us,
-                idle_label(self.config.idle)
-            )
-            .expect("writing to a String cannot fail");
-            match self.config.affinity {
-                Some(core) => writeln!(out, "      \"affinity\": {core},")
-                    .expect("writing to a String cannot fail"),
-                None => writeln!(out, "      \"affinity\": null,")
-                    .expect("writing to a String cannot fail"),
-            }
-            writeln!(
-                out,
-                "      \"snapshot_cadence\": {}, \"log\": \"{}\",",
-                self.config.snapshot_cadence,
-                log_label(self.config.log)
-            )
-            .expect("writing to a String cannot fail");
-            match &self.config.data_dir {
-                Some(dir) => writeln!(
-                    out,
-                    "      \"data_dir\": \"{}\", \"in_flight\": {}",
-                    json_escape(&dir.to_string_lossy()),
-                    self.config.in_flight
-                )
-                .expect("writing to a String cannot fail"),
-                None => writeln!(
-                    out,
-                    "      \"data_dir\": null, \"in_flight\": {}",
-                    self.config.in_flight
-                )
-                .expect("writing to a String cannot fail"),
-            }
-            writeln!(out, "    }},").expect("writing to a String cannot fail");
-
-            writeln!(out, "    \"applied_latency\": {{").expect("writing to a String cannot fail");
-            write_json_summary_fields(&mut out, runtime.applied_latency, "      ", false);
-            writeln!(out, "    }},").expect("writing to a String cannot fail");
-            writeln!(out, "    \"durable_latency\": {{").expect("writing to a String cannot fail");
-            write_json_summary_fields(&mut out, runtime.durable_latency, "      ", false);
-            writeln!(out, "    }},").expect("writing to a String cannot fail");
-
-            write_json_metric(&mut out, "queue_wait", runtime.queue_wait, true);
-            write_json_metric(&mut out, "apply_service", runtime.apply_service, true);
-            write_json_metric(&mut out, "durable_wait", runtime.durable_wait, true);
-            write_json_metric(&mut out, "journal_append", runtime.journal_append, true);
-            writeln!(
-                out,
-                "    \"batch_size_mean\": {:.3},",
-                runtime.batch_size_mean
-            )
-            .expect("writing to a String cannot fail");
-            writeln!(out, "    \"batch_size_max\": {},", runtime.batch_size_max)
-                .expect("writing to a String cannot fail");
-            writeln!(out, "    \"batch_count\": {},", runtime.batch_count)
-                .expect("writing to a String cannot fail");
-            writeln!(out, "    \"events_total\": {},", runtime.events_total)
-                .expect("writing to a String cannot fail");
-            writeln!(
-                out,
-                "    \"events_per_command\": {:.3},",
-                runtime.events_per_command
-            )
-            .expect("writing to a String cannot fail");
-            writeln!(out, "    \"queue_depth_max\": {},", runtime.queue_depth_max)
-                .expect("writing to a String cannot fail");
-            writeln!(out, "    \"queue_full\": {},", runtime.queue_full)
-                .expect("writing to a String cannot fail");
-            writeln!(out, "    \"fsync_share\": {:.6},", runtime.fsync_share)
-                .expect("writing to a String cannot fail");
-            writeln!(out, "    \"applied_count\": {},", runtime.applied_count)
-                .expect("writing to a String cannot fail");
-            writeln!(out, "    \"durable_count\": {},", runtime.durable_count)
-                .expect("writing to a String cannot fail");
-
-            writeln!(out, "    \"slo\": {{").expect("writing to a String cannot fail");
-            writeln!(out, "      \"applied\": {{").expect("writing to a String cannot fail");
-            write_json_slo_fields(&mut out, runtime.slo.applied, "        ");
-            writeln!(out, "      }},").expect("writing to a String cannot fail");
-            writeln!(out, "      \"durable\": {{").expect("writing to a String cannot fail");
-            write_json_slo_fields(&mut out, runtime.slo.durable, "        ");
-            writeln!(out, "      }}").expect("writing to a String cannot fail");
-            writeln!(out, "    }}").expect("writing to a String cannot fail");
-            writeln!(out, "  }},").expect("writing to a String cannot fail");
-        }
-
-        if let Some(decide) = &self.decide {
-            writeln!(out, "  \"decide\": {{").expect("writing to a String cannot fail");
-            writeln!(out, "    \"latency\": {{").expect("writing to a String cannot fail");
-            write_json_summary_fields(&mut out, decide.latency, "      ", false);
-            writeln!(out, "    }},").expect("writing to a String cannot fail");
-            writeln!(out, "    \"events_total\": {},", decide.events_total)
-                .expect("writing to a String cannot fail");
-            writeln!(
-                out,
-                "    \"events_per_command\": {:.3},",
-                decide.events_per_command
-            )
-            .expect("writing to a String cannot fail");
-            writeln!(out, "    \"slo\": {{").expect("writing to a String cannot fail");
-            writeln!(out, "      \"submit_to_decide\": {{")
-                .expect("writing to a String cannot fail");
-            write_json_slo_fields(&mut out, decide.slo, "        ");
-            writeln!(out, "      }}").expect("writing to a String cannot fail");
-            writeln!(out, "    }}").expect("writing to a String cannot fail");
-            writeln!(out, "  }},").expect("writing to a String cannot fail");
-        }
-
-        writeln!(
-            out,
-            "  \"env\": {{ \"os\": \"{}\", \"arch\": \"{}\", \"profile\": \"{}\" }}",
-            json_escape(self.env.os),
-            json_escape(self.env.arch),
-            json_escape(self.env.profile)
-        )
-        .expect("writing to a String cannot fail");
-        writeln!(out, "}}").expect("writing to a String cannot fail");
-
-        out
+        serde_json::to_string_pretty(&view).expect("serializing the bench report cannot fail")
+            + "\n"
     }
+}
+
+/// Borrowed envelope for the JSON report.
+///
+/// The DTOs declare their own field lists once; this view only adds the JSON
+/// names that differ from the Rust names and the config subsets the JSON
+/// contract exposes.
+#[derive(Serialize)]
+struct BenchReportJson<'a> {
+    config: ConfigJson,
+    run: &'a RunStats,
+    latency_ns: &'a LatencyReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime: Option<RuntimeJson<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decide: Option<&'a DecideReport>,
+    env: &'a EnvInfo,
+}
+
+#[derive(Serialize)]
+struct RuntimeJson<'a> {
+    config: RuntimeConfigJson,
+    #[serde(flatten)]
+    report: &'a RuntimeReport,
+}
+
+/// The workload subset of [`BenchConfig`] exposed by the JSON contract.
+#[derive(Serialize)]
+struct ConfigJson {
+    events: u64,
+    warmup: u64,
+    rate: u64,
+    seed: u64,
+    symbols: usize,
+    limit_ratio: f64,
+    market_ratio: f64,
+    cancel_ratio: f64,
+    cross_ratio: f64,
+    price_band: u64,
+    mid: u64,
+    order_quantity: u64,
+    max_open_orders: u64,
+}
+
+impl From<&BenchConfig> for ConfigJson {
+    fn from(config: &BenchConfig) -> Self {
+        Self {
+            events: config.events,
+            warmup: config.warmup,
+            rate: config.rate,
+            seed: config.seed,
+            symbols: config.symbols,
+            limit_ratio: config.limit_ratio,
+            market_ratio: config.market_ratio,
+            cancel_ratio: config.cancel_ratio,
+            cross_ratio: config.cross_ratio,
+            price_band: config.price_band,
+            mid: config.mid,
+            order_quantity: config.order_quantity,
+            max_open_orders: config.max_open_orders,
+        }
+    }
+}
+
+/// The runtime-tuning subset of [`BenchConfig`] nested under `runtime.config`.
+#[derive(Serialize)]
+struct RuntimeConfigJson {
+    queue_capacity: usize,
+    journal_batch_capacity: usize,
+    apply_batch_max: usize,
+    journal_coalesce_max: usize,
+    journal_flush_us: u64,
+    idle: &'static str,
+    affinity: Option<usize>,
+    snapshot_cadence: u64,
+    log: &'static str,
+    data_dir: Option<String>,
+    in_flight: usize,
+}
+
+impl From<&BenchConfig> for RuntimeConfigJson {
+    fn from(config: &BenchConfig) -> Self {
+        Self {
+            queue_capacity: config.queue_capacity,
+            journal_batch_capacity: config.journal_batch_capacity,
+            apply_batch_max: config.apply_batch_max,
+            journal_coalesce_max: config.journal_coalesce_max,
+            journal_flush_us: config.journal_flush_us,
+            idle: idle_label(config.idle),
+            affinity: config.affinity,
+            snapshot_cadence: config.snapshot_cadence,
+            log: log_label(config.log),
+            data_dir: config
+                .data_dir
+                .as_ref()
+                .map(|dir| dir.to_string_lossy().into_owned()),
+            in_flight: config.in_flight,
+        }
+    }
+}
+
+fn serialize_round3<S>(value: &f64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_f64((*value * 1_000.0).round() / 1_000.0)
+}
+
+fn serialize_round6<S>(value: &f64, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_f64((*value * 1_000_000.0).round() / 1_000_000.0)
+}
+
+/// Nest the decide SLO under its `submit_to_decide` key.
+fn serialize_decide_slo<S>(check: &SloCheck, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    #[derive(Serialize)]
+    struct DecideSlo<'a> {
+        submit_to_decide: &'a SloCheck,
+    }
+
+    serde::Serialize::serialize(
+        &DecideSlo {
+            submit_to_decide: check,
+        },
+        serializer,
+    )
 }
 
 fn write_summary_row(out: &mut String, label: &str, summary: Summary) {
@@ -808,62 +727,6 @@ fn write_type_row(out: &mut String, label: &str, summary: Summary, wall_time_ns:
         commas(per_second(summary.count, wall_time_ns))
     )
     .expect("writing to a String cannot fail");
-}
-
-fn write_json_category(out: &mut String, name: &str, summary: Summary, trailing_comma: bool) {
-    writeln!(out, "      \"{name}\": {{").expect("writing to a String cannot fail");
-    write_json_summary_fields(out, summary, "        ", false);
-    if trailing_comma {
-        writeln!(out, "      }},").expect("writing to a String cannot fail");
-    } else {
-        writeln!(out, "      }}").expect("writing to a String cannot fail");
-    }
-}
-
-fn write_json_summary_fields(
-    out: &mut String,
-    summary: Summary,
-    indent: &str,
-    trailing_comma: bool,
-) {
-    writeln!(out, "{indent}\"count\": {},", summary.count)
-        .expect("writing to a String cannot fail");
-    writeln!(out, "{indent}\"p50\": {},", summary.p50).expect("writing to a String cannot fail");
-    writeln!(out, "{indent}\"p99\": {},", summary.p99).expect("writing to a String cannot fail");
-    writeln!(out, "{indent}\"p99_9\": {},", summary.p99_9)
-        .expect("writing to a String cannot fail");
-    writeln!(out, "{indent}\"mean\": {},", summary.mean).expect("writing to a String cannot fail");
-    if trailing_comma {
-        writeln!(out, "{indent}\"max\": {},", summary.max)
-            .expect("writing to a String cannot fail");
-    } else {
-        writeln!(out, "{indent}\"max\": {}", summary.max).expect("writing to a String cannot fail");
-    }
-}
-
-fn write_json_metric(out: &mut String, name: &str, metric: LatencyMetric, trailing_comma: bool) {
-    writeln!(out, "    \"{name}\": {{").expect("writing to a String cannot fail");
-    writeln!(out, "      \"mean_ns\": {},", metric.mean_ns)
-        .expect("writing to a String cannot fail");
-    if trailing_comma {
-        writeln!(out, "      \"max_ns\": {}\n    }},", metric.max_ns)
-            .expect("writing to a String cannot fail");
-    } else {
-        writeln!(out, "      \"max_ns\": {}\n    }}", metric.max_ns)
-            .expect("writing to a String cannot fail");
-    }
-}
-
-fn write_json_slo_fields(out: &mut String, check: SloCheck, indent: &str) {
-    writeln!(out, "{indent}\"target_ns\": {},", check.target_ns)
-        .expect("writing to a String cannot fail");
-    writeln!(out, "{indent}\"queue_full\": {},", check.queue_full)
-        .expect("writing to a String cannot fail");
-    writeln!(out, "{indent}\"p50\": {},", check.p50).expect("writing to a String cannot fail");
-    writeln!(out, "{indent}\"p99\": {},", check.p99).expect("writing to a String cannot fail");
-    writeln!(out, "{indent}\"p99_9\": {},", check.p99_9).expect("writing to a String cannot fail");
-    writeln!(out, "{indent}\"status\": \"{}\"", check.status_json())
-        .expect("writing to a String cannot fail");
 }
 
 fn commas(value: u64) -> String {
@@ -949,30 +812,226 @@ mod tests {
             SloCheck::not_applicable(fast(), 10, 0).label(),
             "NOT APPLICABLE"
         );
-        assert_eq!(SloCheck::new(fast(), 10, 0).status_json(), "pass");
-        assert_eq!(SloCheck::new(fast(), 10, 1).status_json(), "fail");
+    }
+
+    fn object_keys(value: &serde_json::Value) -> std::collections::BTreeSet<String> {
+        value
+            .as_object()
+            .expect("expected a JSON object")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    fn expected_keys(names: &[&str]) -> std::collections::BTreeSet<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    fn base_report() -> BenchReport {
+        let categories = || CategoryStats {
+            all: fast(),
+            limit: fast(),
+            market: fast(),
+            cancel: fast(),
+        };
+        BenchReport {
+            config: BenchConfig::default(),
+            run: RunStats {
+                wall_time_ns: 1_000,
+                achieved_rate: 1234.5678,
+                commands: 10,
+                engine_events: 20,
+                events_per_command: 2.0,
+                trades: 0,
+                rejections: 0,
+                final_open_orders: 1,
+                peak_open_orders: 2,
+                final_depth_levels: DepthLevels {
+                    bids: 1,
+                    asks: 0,
+                    bids_capped: true,
+                    asks_capped: true,
+                },
+            },
+            latency: LatencyReport {
+                total: categories(),
+                service: categories(),
+                send_lag: fast(),
+            },
+            runtime: None,
+            decide: None,
+            env: EnvInfo {
+                os: "test-os",
+                arch: "test-arch",
+                profile: "debug",
+            },
+        }
+    }
+
+    fn runtime_report() -> RuntimeReport {
+        RuntimeReport {
+            applied_latency: fast(),
+            durable_latency: fast(),
+            queue_wait: LatencyMetric {
+                mean_ns: 1,
+                max_ns: 2,
+            },
+            apply_service: LatencyMetric {
+                mean_ns: 1,
+                max_ns: 2,
+            },
+            durable_wait: LatencyMetric {
+                mean_ns: 1,
+                max_ns: 2,
+            },
+            journal_append: LatencyMetric {
+                mean_ns: 1,
+                max_ns: 2,
+            },
+            batch_size_mean: 1.2345,
+            batch_size_max: 4,
+            batch_count: 5,
+            events_total: 20,
+            events_per_command: 2.0,
+            queue_depth_max: 3,
+            queue_full: 0,
+            fsync_share: 0.123_456_789,
+            applied_count: 10,
+            durable_count: 10,
+            slo: SloReport {
+                applied: SloCheck::new(fast(), APPLIED_SLO_NS, 0),
+                durable: SloCheck::not_applicable(fast(), DURABLE_SLO_NS, 0),
+            },
+        }
+    }
+
+    fn decide_report() -> DecideReport {
+        DecideReport {
+            latency: fast(),
+            events_total: 20,
+            events_per_command: 2.0,
+            slo: SloCheck::new(fast(), APPLIED_SLO_NS, 0),
+        }
+    }
+
+    #[test]
+    fn json_has_the_exact_top_level_contract_and_no_optional_sections() {
+        let json: serde_json::Value =
+            serde_json::from_str(&base_report().to_json()).expect("valid JSON");
         assert_eq!(
-            SloCheck::not_applicable(fast(), 10, 0).status_json(),
+            object_keys(&json),
+            expected_keys(&["config", "run", "latency_ns", "env"])
+        );
+        assert!(json.get("latency_ns").is_some());
+        assert!(json.get("latency").is_none());
+        assert!(json.get("runtime").is_none());
+        assert!(json.get("decide").is_none());
+    }
+
+    #[test]
+    fn json_config_is_the_workload_subset_only() {
+        let json: serde_json::Value =
+            serde_json::from_str(&base_report().to_json()).expect("valid JSON");
+        assert_eq!(
+            object_keys(&json["config"]),
+            expected_keys(&[
+                "events",
+                "warmup",
+                "rate",
+                "seed",
+                "symbols",
+                "limit_ratio",
+                "market_ratio",
+                "cancel_ratio",
+                "cross_ratio",
+                "price_band",
+                "mid",
+                "order_quantity",
+                "max_open_orders",
+            ])
+        );
+    }
+
+    #[test]
+    fn json_runtime_config_has_the_exact_key_set_and_nesting() {
+        let mut report = base_report();
+        report.runtime = Some(runtime_report());
+        let json: serde_json::Value = serde_json::from_str(&report.to_json()).expect("valid JSON");
+
+        assert!(json.get("decide").is_none());
+        assert_eq!(
+            object_keys(&json["runtime"]["config"]),
+            expected_keys(&[
+                "queue_capacity",
+                "journal_batch_capacity",
+                "apply_batch_max",
+                "journal_coalesce_max",
+                "journal_flush_us",
+                "idle",
+                "affinity",
+                "snapshot_cadence",
+                "log",
+                "data_dir",
+                "in_flight",
+            ])
+        );
+        assert_eq!(json["runtime"]["config"]["idle"], "spin");
+        assert_eq!(json["runtime"]["config"]["log"], "memory");
+        assert!(json["runtime"]["config"]["affinity"].is_null());
+        assert!(json["runtime"]["config"]["data_dir"].is_null());
+
+        // RuntimeReport fields are flattened next to the nested config.
+        assert_eq!(json["runtime"]["applied_latency"]["count"], 100);
+        assert_eq!(json["runtime"]["durable_latency"]["count"], 100);
+        assert_eq!(json["runtime"]["queue_full"], 0);
+        assert_eq!(json["runtime"]["slo"]["applied"]["status"], "pass");
+        assert_eq!(
+            json["runtime"]["slo"]["durable"]["status"],
             "not_applicable"
         );
     }
-}
 
-fn json_escape(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            character if character.is_control() => {
-                write!(out, "\\u{:04x}", character as u32)
-                    .expect("writing to a String cannot fail");
-            }
-            character => out.push(character),
-        }
+    #[test]
+    fn json_decide_section_is_nested_under_slo_submit_to_decide() {
+        let mut report = base_report();
+        report.decide = Some(decide_report());
+        let json: serde_json::Value = serde_json::from_str(&report.to_json()).expect("valid JSON");
+
+        assert!(json.get("runtime").is_none());
+        assert_eq!(json["decide"]["latency"]["count"], 100);
+        assert_eq!(json["decide"]["events_total"], 20);
+        assert_eq!(json["decide"]["slo"]["submit_to_decide"]["status"], "pass");
+        assert_eq!(
+            json["decide"]["slo"]["submit_to_decide"]["target_ns"],
+            APPLIED_SLO_NS
+        );
     }
-    out
+
+    #[test]
+    fn json_depth_levels_omit_the_scan_cap_flags() {
+        let json: serde_json::Value =
+            serde_json::from_str(&base_report().to_json()).expect("valid JSON");
+        assert_eq!(
+            object_keys(&json["run"]["final_depth_levels"]),
+            expected_keys(&["bids", "asks"])
+        );
+        assert_eq!(json["run"]["final_depth_levels"]["bids"], 1);
+        assert_eq!(json["run"]["final_depth_levels"]["asks"], 0);
+    }
+
+    #[test]
+    fn json_rounds_the_contract_floats_and_keeps_them_numbers() {
+        let mut report = base_report();
+        report.runtime = Some(runtime_report());
+        report.decide = Some(decide_report());
+        let json: serde_json::Value = serde_json::from_str(&report.to_json()).expect("valid JSON");
+
+        assert_eq!(json["run"]["achieved_rate"], 1234.568);
+        assert_eq!(json["run"]["events_per_command"], 2.0);
+        assert_eq!(json["runtime"]["batch_size_mean"], 1.235);
+        assert_eq!(json["runtime"]["fsync_share"], 0.123_457);
+        assert_eq!(json["decide"]["events_per_command"], 2.0);
+        assert!(json["runtime"]["fsync_share"].is_number());
+        assert!(json["runtime"]["batch_size_mean"].is_number());
+    }
 }
