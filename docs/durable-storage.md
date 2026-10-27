@@ -143,7 +143,9 @@ invariant:
   the journal thread writes them. The events are durable only after the
   journal's `append_batch` returns.
 
-The synchronous façade keeps append-before-apply; the runtime does not. The
+The synchronous façade keeps append-before-apply; the runtime does not. Both
+paths share `decide`, `apply`, and the `Sequencer` (`assign` + `fold`); they
+differ only in whether the batch is appended before or after it is folded. The
 runtime does not weaken the durable level: no caller is told a command is
 durable before **all of its events** are in the log. The decision and its
 trade-offs are recorded in

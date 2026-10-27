@@ -4,7 +4,9 @@
 //! [`EventLog`] for the single globally ordered event stream and
 //! [`SnapshotStore`] for derived engine snapshots. Only
 //! [`DurableMatchingEngine`] may append to the log; recovery folds events with
-//! [`crate::engine::MatchingEngine::apply`] and never re-runs matching.
+//! [`crate::engine::MatchingEngine::apply`] and never re-runs matching. The
+//! `Sequencer` owns event-sequence and `command_id` assignment and the apply
+//! fold; the log adapters only append and read.
 
 use std::fmt;
 
@@ -17,6 +19,7 @@ pub mod event_snapshot;
 pub mod file_event_log;
 pub mod file_event_snapshot;
 pub mod memory;
+mod sequencer;
 mod snapshot_files;
 
 pub(crate) use event_log::recover;
@@ -25,6 +28,7 @@ pub use event_snapshot::{SnapshotStore, StoredSnapshot};
 pub use file_event_log::FileEventLog;
 pub use file_event_snapshot::FileSnapshotStore;
 pub use memory::{InMemoryEventLog, InMemorySnapshotStore};
+pub(crate) use sequencer::Sequencer;
 
 /// The first record in an event log: format version plus the engine config
 /// every record and snapshot must agree with.

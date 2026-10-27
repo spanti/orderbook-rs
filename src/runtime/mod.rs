@@ -51,10 +51,10 @@
 //!
 //! # Ordering guarantees
 //!
-//! - The matching thread assigns one global, contiguous **event** sequence in
-//!   application order and one `command_id` per command. The event sequence is
-//!   the recovery, durability, and snapshot boundary; `command_id` groups the
-//!   events one command produced.
+//! - The matching thread's `Sequencer` assigns one global, contiguous **event**
+//!   sequence in application order and one `command_id` per command. The event
+//!   sequence is the recovery, durability, and snapshot boundary; `command_id`
+//!   groups the events one command produced.
 //! - Commands submitted from one producer thread are applied in submission
 //!   order because the std channel preserves per-sender FIFO. Commands from
 //!   different producers interleave in whatever order the queue serializes;

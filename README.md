@@ -188,7 +188,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 运行时是 **apply-first**：
 
-1. 撮合线程 `decide` 出事件，分配连续事件序号区间和一个 `command_id`；
+1. 撮合线程 `decide` 出事件，由 `Sequencer` 分配连续事件序号区间和一个 `command_id`；
 2. 逐条 `apply`，发送 applied 回执（携带事件列表与首/末事件序号）；
 3. 把 `EventRecord` 交给 Journal；
 4. Journal 批量 fsync 后推进事件水位，撮合线程再完成 durable 回执。

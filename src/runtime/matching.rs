@@ -15,7 +15,7 @@ use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use crate::durable::{DurableError, EventCursor, EventRecord};
+use crate::durable::{DurableError, EventCursor, EventRecord, Sequencer};
 use crate::engine::MatchingEngine;
 
 use super::RuntimeConfig;
@@ -87,9 +87,7 @@ pub(crate) struct MatchingThread<J, G> {
     apply_batch_max: usize,
     journal_flush_interval: Duration,
 
-    next_sequence: u64,
-    next_command_id: u64,
-    applied_seq: u64,
+    sequencer: Sequencer,
     journal_buffer: Vec<EventRecord>,
     buffer_started_at: Option<Instant>,
     pending_durable: VecDeque<PendingDurable>,
@@ -115,9 +113,7 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
             idle: Idle::new(config.idle),
             apply_batch_max: config.apply_batch_max.max(1),
             journal_flush_interval: config.journal_flush_interval,
-            next_sequence: cursor.next_sequence,
-            next_command_id: cursor.next_command_id,
-            applied_seq: cursor.applied_seq,
+            sequencer: Sequencer::from_cursor(cursor),
             journal_buffer: Vec::with_capacity(config.apply_batch_max),
             buffer_started_at: None,
             pending_durable: VecDeque::new(),
@@ -245,13 +241,16 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
                 .pending_durable
                 .pop_front()
                 .expect("checked the pending front");
-            pending.slot.set_durable(Ok(()));
+            // Record the metric before signalling the durable receipt: a caller
+            // that observes the ack must not snapshot metrics that still miss
+            // this command.
             if let Some(metrics) = &self.shared.metrics {
                 metrics.record_durable();
                 if let Some(enqueued_at) = pending.enqueued_at {
                     metrics.record_durable_wait(enqueued_at.elapsed());
                 }
             }
+            pending.slot.set_durable(Ok(()));
         }
     }
 
@@ -294,9 +293,9 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
     fn gate_decision(&mut self) -> GateDecision {
         self.snapshot_gate.poll(
             &self.engine,
-            self.applied_seq,
+            self.sequencer.applied_seq(),
             self.shared.durable_seq(),
-            self.next_command_id.saturating_sub(1),
+            self.sequencer.last_command_id(),
         )
     }
 
@@ -329,38 +328,29 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
 
         // `decide` always emits at least one event (a rejection is an event).
         // Keep the empty branch defensive: no event means nothing to journal.
-        if events.is_empty() {
+        let Some(batch) = self.sequencer.assign(&events) else {
+            let at = self.sequencer.applied_seq();
             slot.set_applied(Ok(CommandReceipt {
                 events,
-                first_event_sequence: self.applied_seq,
-                last_event_sequence: self.applied_seq,
+                first_event_sequence: at,
+                last_event_sequence: at,
             }));
             slot.set_durable(Ok(()));
             return;
-        }
+        };
 
-        let command_id = self.next_command_id;
-        let first_event_sequence = self.next_sequence;
-        let records = EventRecord::batch(&events, first_event_sequence, command_id);
-        let last_event_sequence = records
-            .last()
-            .map(|record| record.sequence)
-            .expect("a non-empty event list produced no records");
-
-        for record in &records {
-            self.engine.apply(&record.event, record.sequence);
-        }
-
-        self.next_sequence = last_event_sequence.saturating_add(1);
-        self.next_command_id = command_id.saturating_add(1);
-        self.applied_seq = last_event_sequence;
-        self.shared.publish_applied(last_event_sequence);
-        self.shared.publish_applied_command_id(command_id);
+        // Apply-first: fold before the journal makes the records durable.
+        let engine = &mut self.engine;
+        self.sequencer.fold(&batch, |record| {
+            engine.apply(&record.event, record.sequence)
+        });
+        self.shared.publish_applied(batch.last_event_sequence);
+        self.shared.publish_applied_command_id(batch.command_id);
 
         slot.set_applied(Ok(CommandReceipt {
             events,
-            first_event_sequence,
-            last_event_sequence,
+            first_event_sequence: batch.first_event_sequence,
+            last_event_sequence: batch.last_event_sequence,
         }));
 
         if let (Some(metrics), Some(apply_started)) = (metrics.as_ref(), apply_started) {
@@ -369,13 +359,14 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
             // Event volume is per command: a resting submit is at least
             // `OrderAccepted` + `OrderRested`, and a sweep adds one
             // `TradeExecuted` per fill.
-            metrics.record_events(records.len());
+            metrics.record_events(batch.records.len());
         }
 
         if self.journal_buffer.is_empty() {
             self.buffer_started_at = Some(Instant::now());
         }
-        self.journal_buffer.extend(records);
+        let last_event_sequence = batch.last_event_sequence;
+        self.journal_buffer.extend(batch.records);
         self.pending_durable.push_back(PendingDurable {
             last_event_sequence,
             enqueued_at,

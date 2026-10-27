@@ -13,7 +13,7 @@
 
 use std::fmt;
 
-use crate::durable::{DurableError, LogHeader, SnapshotStore, StoredSnapshot};
+use crate::durable::{DurableError, LogHeader, Sequencer, SnapshotStore, StoredSnapshot};
 use crate::engine::MatchingEngine;
 use crate::event::DomainEvent;
 use crate::types::{EngineCommand, EngineConfig};
@@ -44,7 +44,7 @@ impl EventRecord {
     /// each following event takes the next one, and every record shares
     /// `command_id`. Sequence assignment stays with the single writer, which
     /// supplies the cursor values.
-    pub fn batch(events: &[DomainEvent], first_sequence: u64, command_id: u64) -> Vec<Self> {
+    pub(crate) fn batch(events: &[DomainEvent], first_sequence: u64, command_id: u64) -> Vec<Self> {
         events
             .iter()
             .enumerate()
@@ -140,7 +140,7 @@ pub struct DurableMatchingEngine {
     engine: MatchingEngine,
     log: Box<dyn EventLog>,
     snapshots: Box<dyn SnapshotStore>,
-    cursor: EventCursor,
+    sequencer: Sequencer,
     failed: bool,
     last_snapshot_error: Option<DurableError>,
 }
@@ -148,7 +148,10 @@ pub struct DurableMatchingEngine {
 impl fmt::Debug for DurableMatchingEngine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DurableMatchingEngine")
-            .field("cursor", &self.cursor)
+            .field(
+                "cursor",
+                &self.sequencer.cursor(self.sequencer.applied_seq()),
+            )
             .field("failed", &self.failed)
             .field("last_snapshot_error", &self.last_snapshot_error)
             .finish_non_exhaustive()
@@ -286,7 +289,7 @@ impl DurableMatchingEngine {
             engine: MatchingEngine::new(config),
             log,
             snapshots,
-            cursor: EventCursor::fresh(),
+            sequencer: Sequencer::from_cursor(EventCursor::fresh()),
             failed: false,
             last_snapshot_error: None,
         })
@@ -307,7 +310,7 @@ impl DurableMatchingEngine {
             engine,
             log,
             snapshots,
-            cursor,
+            sequencer: Sequencer::from_cursor(cursor),
             failed: false,
             last_snapshot_error: None,
         })
@@ -322,8 +325,8 @@ impl DurableMatchingEngine {
     pub fn snapshot_now(&mut self) -> Result<(), DurableError> {
         let stored = StoredSnapshot {
             format_version: FORMAT_VERSION,
-            applied_seq: self.cursor.applied_seq,
-            last_command_id: self.cursor.next_command_id.saturating_sub(1),
+            applied_seq: self.sequencer.applied_seq(),
+            last_command_id: self.sequencer.last_command_id(),
             snapshot: self.engine.capture_snapshot(),
         };
 
@@ -356,30 +359,21 @@ impl DurableMatchingEngine {
         }
 
         let events = self.engine.decide(&command);
-        if events.is_empty() {
+        let Some(batch) = self.sequencer.assign(&events) else {
             return Ok(events);
-        }
+        };
 
-        let command_id = self.cursor.next_command_id;
-        let first_sequence = self.cursor.next_sequence;
-        let records = EventRecord::batch(&events, first_sequence, command_id);
-
-        // Append-before-apply: a failed append must leave engine state intact.
-        if let Err(error) = self.log.append_batch(records.clone()) {
+        // Append-before-apply: a failed append must leave engine state and the
+        // sequencing cursor intact.
+        if let Err(error) = self.log.append_batch(batch.records.clone()) {
             self.failed = true;
             return Err(error);
         }
 
-        let mut last_applied = self.cursor.applied_seq;
-        for record in &records {
-            self.engine.apply(&record.event, record.sequence);
-            last_applied = record.sequence;
-        }
-
-        self.cursor.applied_seq = last_applied;
-        self.cursor.durable_seq = last_applied;
-        self.cursor.next_sequence = last_applied.saturating_add(1);
-        self.cursor.next_command_id = command_id.saturating_add(1);
+        let engine = &mut self.engine;
+        self.sequencer.fold(&batch, |record| {
+            engine.apply(&record.event, record.sequence)
+        });
         Ok(events)
     }
 
@@ -395,12 +389,13 @@ impl DurableMatchingEngine {
 
     /// Last event sequence applied to the engine.
     pub fn applied_seq(&self) -> u64 {
-        self.cursor.applied_seq
+        self.sequencer.applied_seq()
     }
 
     /// The current sequence/command-id cursor.
     pub fn cursor(&self) -> EventCursor {
-        self.cursor
+        // Append-before-apply: after every successful append, durable == applied.
+        self.sequencer.cursor(self.sequencer.applied_seq())
     }
 
     /// Whether an append failure stopped this instance.
