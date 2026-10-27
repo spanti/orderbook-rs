@@ -57,6 +57,10 @@ _Avoid_: execute（决策阶段）
 唯一的状态写入口：把一个事件增量折叠进引擎状态。重放只调用 apply，不重新撮合。
 _Avoid_: execute、replay command
 
+**Decision View** / 决策视图:
+决策过程中对某个 symbol 订单簿的借用视图：在簿已有状态之上叠加本次决策已计划、尚未应用的效果，供同一决策的后续步骤读取。它不拥有订单簿状态，也不能用于恢复或行情展示。
+_Avoid_: book snapshot、scratch book、copy
+
 **Sequencer** / 定序器:
 为每个事件分配全局递增事件序号，并保证 Event Log 按该顺序追加的组件。分配序号不等于落盘。
 _Avoid_: dispatcher、gateway

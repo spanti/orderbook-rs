@@ -146,11 +146,11 @@ impl MatchWalk {
         }
     }
 
-    /// Next price to visit in an overlay of orders added by rests.
+    /// Next price to visit in an overlay of levels added by rests.
     ///
     /// The overlay shares the same price-priority direction as the base book,
     /// so [`BookView::plan`] can merge the two walks lazily.
-    fn next_added_price(&self, levels: &BTreeMap<u64, VecDeque<Order>>) -> Option<u64> {
+    fn next_added_price(&self, levels: &BTreeMap<u64, PriceLevel>) -> Option<u64> {
         let next = match self.side {
             Side::Bid => levels.range((self.start, self.end)).next_back(),
             Side::Ask => levels.range((self.start, self.end)).next(),
@@ -496,14 +496,17 @@ impl OrderBook {
     }
 }
 
-/// A borrowed, copy-on-write decision view of one symbol's [`OrderBook`].
+/// A decision view of one symbol's [`OrderBook`]: the borrowed base book plus
+/// the effects already planned by this decision.
 ///
-/// `decide` walks the base price levels and an overlay of the fills and rests
-/// it has already planned. Nothing is cloned: the base book stays immutable and
-/// the overlay records only the touched orders and levels, so a plan is
-/// O(touched levels/orders) instead of O(resting orders).
+/// The view composes the base price levels and the overlay's added levels into
+/// one price-priority walk. It does not reimplement the matching rule: every
+/// touched level is matched by [`PriceLevel::match_order`], the same primitive
+/// [`BookSide::match_order`] uses on the mutating path. The view only merges
+/// the two sources and records planned effects, so a plan stays
+/// O(touched levels/orders) and never clones the whole book.
 ///
-/// The overlay reproduces [`OrderBook::submit`] exactly:
+/// The composition reproduces [`OrderBook::submit`] exactly:
 ///
 /// * base orders at a price keep their FIFO position; a nonzero override is a
 ///   partial fill and a zero override removes a fully filled/canceled order;
@@ -528,8 +531,10 @@ impl<'a> BookView<'a> {
     /// Non-mutating equivalent of [`OrderBook::submit`].
     ///
     /// Matches the order against the base book plus earlier planned fills and
-    /// rests, then records its own fills and remainder in the overlay. It never
-    /// mutates the borrowed book, so `decide` stays pure.
+    /// rests, then records its own fills and remainder in the overlay. Each
+    /// touched level is matched by [`PriceLevel::match_order`]; this method only
+    /// merges the base and added price walks. It never mutates the borrowed
+    /// book, so `decide` stays pure.
     pub(crate) fn plan(&mut self, mut order: Order) -> SubmitResult {
         let resting_side = order.side.opposite();
         let book = self.book;
@@ -564,69 +569,22 @@ impl<'a> BookView<'a> {
                     book.expect("a base price level implies a base book"),
                     resting_side,
                 )[&price];
-                for resting in &level.orders {
-                    let quantity = overlay.current_quantity(resting);
-                    if quantity == 0 {
-                        continue;
-                    }
-                    let traded = quantity.min(order.quantity);
-                    fills.push(Fill {
-                        maker_order_id: resting.id,
-                        taker_order_id: order.id,
-                        price: resting.price,
-                        quantity: traded,
-                        taker_side: order.side,
-                    });
-                    order.quantity -= traded;
-
-                    if traded < quantity {
-                        // The taker ran out; the maker keeps its position.
-                        overlay.quantities.insert(resting.id, quantity - traded);
-                        break;
-                    }
-                    overlay.quantities.insert(resting.id, 0);
-                    if order.quantity == 0 {
-                        break;
-                    }
-                }
+                let outcome = match_level_from_base(level, overlay, price, &mut order);
+                fills.extend(outcome.fills);
             }
 
             if added_at_price && order.quantity > 0 {
-                let level = overlay
-                    .added_levels_mut(resting_side)
-                    .get_mut(&price)
-                    .expect("added price level disappeared");
-                while order.quantity > 0 {
-                    let Some(maker) = level.front() else {
-                        break;
-                    };
-                    let maker_quantity = maker.quantity;
-                    if maker_quantity == 0 {
-                        level.pop_front();
-                        continue;
-                    }
-                    let maker_id = maker.id;
-                    let maker_price = maker.price;
-                    let traded = maker_quantity.min(order.quantity);
-                    fills.push(Fill {
-                        maker_order_id: maker_id,
-                        taker_order_id: order.id,
-                        price: maker_price,
-                        quantity: traded,
-                        taker_side: order.side,
-                    });
-                    order.quantity -= traded;
-
-                    if traded == maker_quantity {
-                        level.pop_front();
-                    } else {
-                        // The taker ran out; the maker keeps its position.
-                        level
-                            .front_mut()
-                            .expect("maker vanished while partially filled")
-                            .quantity -= traded;
-                        break;
-                    }
+                let empty = {
+                    let level = overlay
+                        .added_levels_mut(resting_side)
+                        .get_mut(&price)
+                        .expect("added price level disappeared");
+                    let outcome = level.match_order(&mut order);
+                    fills.extend(outcome.fills);
+                    level.orders.is_empty()
+                };
+                if empty {
+                    overlay.added_levels_mut(resting_side).remove(&price);
                 }
             }
         }
@@ -638,8 +596,8 @@ impl<'a> BookView<'a> {
             overlay
                 .added_levels_mut(order.side)
                 .entry(order.price)
-                .or_default()
-                .push_back(Order {
+                .or_insert_with(|| PriceLevel::new(order.price))
+                .add_order(Order {
                     quantity: remaining_quantity,
                     ..order
                 });
@@ -691,6 +649,51 @@ impl<'a> BookView<'a> {
     }
 }
 
+/// Match `order` against one base price level while reusing the mutating
+/// per-level rule.
+///
+/// The base level is immutable during `decide`, so it is materialized into a
+/// temporary [`PriceLevel`] that reflects earlier plans' quantity overrides.
+/// [`PriceLevel::match_order`] then runs the same FIFO and partial-fill logic as
+/// [`BookSide::match_order`]. The resulting quantities are written back to the
+/// overlay; the base book is untouched.
+fn match_level_from_base(
+    base: &PriceLevel,
+    overlay: &mut BookOverlay,
+    price: u64,
+    order: &mut Order,
+) -> MatchOutcome {
+    let mut level = PriceLevel::new(price);
+    for resting in &base.orders {
+        let quantity = overlay.current_quantity(resting);
+        if quantity == 0 {
+            continue;
+        }
+        level.add_order(Order {
+            quantity,
+            ..resting.clone()
+        });
+    }
+
+    let outcome = level.match_order(order);
+
+    let remaining: HashMap<OrderBookId, u64> = level
+        .orders
+        .iter()
+        .map(|resting| (resting.id, resting.quantity))
+        .collect();
+    for resting in &base.orders {
+        let quantity = remaining.get(&resting.id).copied().unwrap_or(0);
+        if quantity == resting.quantity {
+            overlay.quantities.remove(&resting.id);
+        } else {
+            overlay.quantities.insert(resting.id, quantity);
+        }
+    }
+
+    outcome
+}
+
 /// The borrowed book's price levels on `side`.
 fn side_levels(book: &OrderBook, side: Side) -> &BTreeMap<u64, PriceLevel> {
     match side {
@@ -717,10 +720,11 @@ struct BookOverlay {
     /// Remaining quantity for an order whose quantity differs from the base
     /// book. `0` means the order was fully filled or canceled.
     quantities: HashMap<OrderBookId, u64>,
-    /// Orders added by rests in this decision, per price, in FIFO order. Their
-    /// live quantity is stored on the order itself.
-    added_bids: BTreeMap<u64, VecDeque<Order>>,
-    added_asks: BTreeMap<u64, VecDeque<Order>>,
+    /// Levels added by rests in this decision, per price. They are real
+    /// [`PriceLevel`]s so [`BookView::plan`] can reuse
+    /// [`PriceLevel::match_order`] for them.
+    added_bids: BTreeMap<u64, PriceLevel>,
+    added_asks: BTreeMap<u64, PriceLevel>,
 }
 
 impl BookOverlay {
@@ -731,14 +735,14 @@ impl BookOverlay {
             .unwrap_or(order.quantity)
     }
 
-    fn added_levels(&self, side: Side) -> &BTreeMap<u64, VecDeque<Order>> {
+    fn added_levels(&self, side: Side) -> &BTreeMap<u64, PriceLevel> {
         match side {
             Side::Bid => &self.added_bids,
             Side::Ask => &self.added_asks,
         }
     }
 
-    fn added_levels_mut(&mut self, side: Side) -> &mut BTreeMap<u64, VecDeque<Order>> {
+    fn added_levels_mut(&mut self, side: Side) -> &mut BTreeMap<u64, PriceLevel> {
         match side {
             Side::Bid => &mut self.added_bids,
             Side::Ask => &mut self.added_asks,
@@ -749,8 +753,8 @@ impl BookOverlay {
     fn remove_added(&mut self, order_id: OrderBookId) -> Option<Order> {
         for levels in [&mut self.added_bids, &mut self.added_asks] {
             for level in levels.values_mut() {
-                if let Some(position) = level.iter().position(|order| order.id == order_id) {
-                    return level.remove(position);
+                if let Some(order) = level.remove_order(order_id) {
+                    return Some(order);
                 }
             }
         }
