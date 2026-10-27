@@ -105,7 +105,7 @@ impl JournalSink for JournalThreadSink {
     }
 
     fn failure(&self) -> Option<DurableError> {
-        self.shared.failure()
+        self.shared.run().failure()
     }
 }
 
@@ -203,13 +203,15 @@ impl<W: Waker> JournalThread<W> {
                 // The batch is durable now; only now may anyone observe it.
                 // The publisher is woken after the watermark advance; it
                 // re-reads the log up to that watermark.
-                self.shared.publish_durable(last_durable_sequence);
-                self.shared.notify_publisher();
+                self.shared
+                    .watermark()
+                    .publish_durable(last_durable_sequence);
+                self.shared.publisher().notify();
                 self.waker.wake();
                 true
             }
             Err(error) => {
-                self.shared.fail(error);
+                self.shared.run().fail(error);
                 self.waker.wake();
                 false
             }
@@ -584,7 +586,7 @@ mod tests {
         );
         assert!(sink.is_disconnected());
 
-        shared.fail(DurableError::Storage("boom".to_string()));
+        shared.run().fail(DurableError::Storage("boom".to_string()));
         assert!(sink.failure().is_some());
     }
 
@@ -640,9 +642,9 @@ mod tests {
             vec![2, 4],
             "queued batches coalesce into one append"
         );
-        assert_eq!(shared.durable_seq(), 6);
+        assert_eq!(shared.watermark().durable_seq(), 6);
         assert_eq!(waker.count(), 2, "one wake per watermark advance");
-        assert!(!shared.is_failed());
+        assert!(!shared.run().is_failed());
     }
 
     #[test]
@@ -680,7 +682,7 @@ mod tests {
             vec![1, 3, 1],
             "each group stops at the record cap"
         );
-        assert_eq!(shared.durable_seq(), 5);
+        assert_eq!(shared.watermark().durable_seq(), 5);
     }
 
     fn logged_sequences(records: &[EventRecord]) -> Vec<u64> {
@@ -711,7 +713,7 @@ mod tests {
             vec![3, 3, 1],
             "one oversized handoff must be split so every append stays within the cap"
         );
-        assert_eq!(shared.durable_seq(), 7);
+        assert_eq!(shared.watermark().durable_seq(), 7);
         assert_eq!(
             logged_sequences(&log.records()),
             (1..=7).collect::<Vec<_>>()
@@ -752,7 +754,7 @@ mod tests {
             vec![3, 4, 3],
             "a batch larger than the remaining room is split, and its remainder is kept"
         );
-        assert_eq!(shared.durable_seq(), 10);
+        assert_eq!(shared.watermark().durable_seq(), 10);
         assert_eq!(
             logged_sequences(&log.records()),
             (1..=10).collect::<Vec<_>>(),
@@ -780,7 +782,7 @@ mod tests {
         handle.join().expect("journal thread");
 
         assert_eq!(log.batch_sizes(), vec![2, 2, 1]);
-        assert_eq!(shared.durable_seq(), 5);
+        assert_eq!(shared.watermark().durable_seq(), 5);
         assert_eq!(
             logged_sequences(&log.records()),
             (1..=5).collect::<Vec<_>>()
@@ -863,7 +865,7 @@ mod tests {
         );
 
         gate.open();
-        shared.close();
+        shared.run().close();
         drop(submitter);
         drop(tickets);
         matching_handle.join().expect("matching thread");
@@ -889,13 +891,13 @@ mod tests {
         started_rx.recv_timeout(WAIT).expect("append started");
 
         assert_eq!(
-            shared.durable_seq(),
+            shared.watermark().durable_seq(),
             0,
             "the watermark must not move while append_batch is running"
         );
 
         gate.open();
-        wait_until(|| shared.durable_seq() == 3);
+        wait_until(|| shared.watermark().durable_seq() == 3);
         drop(sink);
         handle.join().expect("journal thread");
     }
@@ -909,10 +911,10 @@ mod tests {
         let (mut sink, handle) = spawn(Box::new(log), shared.clone(), &config(), waker.clone());
 
         sink.try_send_batch(records(1..=2)).expect("send");
-        wait_until(|| shared.is_failed());
+        wait_until(|| shared.run().is_failed());
 
-        assert_eq!(shared.failure(), Some(error));
-        assert_eq!(shared.durable_seq(), 0);
+        assert_eq!(shared.run().failure(), Some(error));
+        assert_eq!(shared.watermark().durable_seq(), 0);
         assert_eq!(waker.count(), 1, "the failure wakes the matching thread");
 
         handle.join().expect("journal exits after a failed append");
@@ -946,8 +948,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2, 3, 4, 5]
         );
-        assert_eq!(shared.durable_seq(), 5);
-        assert!(!shared.is_failed());
+        assert_eq!(shared.watermark().durable_seq(), 5);
+        assert!(!shared.run().is_failed());
     }
 
     #[test]
@@ -979,7 +981,7 @@ mod tests {
         ticket.wait_durable_timeout(WAIT).expect("durable");
         assert_eq!(log.records().len(), 2);
 
-        shared.close();
+        shared.run().close();
         drop(submitter);
         matching_handle.join().expect("matching thread");
         journal_handle.join().expect("journal thread");
@@ -1003,7 +1005,7 @@ mod tests {
             matches!(durable, Err(RuntimeError::EngineFailed(_))),
             "a dead journal must fail the pending durable waiter, got {durable:?}"
         );
-        assert!(shared.is_failed());
+        assert!(shared.run().is_failed());
 
         matching_handle.join().expect("matching thread");
         assert!(
@@ -1035,7 +1037,7 @@ mod tests {
             ticket.wait_durable_timeout(WAIT).expect("durable");
         }
 
-        shared.close();
+        shared.run().close();
         drop(submitter);
         matching_handle.join().expect("matching thread");
         journal_handle.join().expect("journal thread");

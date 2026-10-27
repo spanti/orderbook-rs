@@ -9,8 +9,8 @@
 //! a slow subscriber cannot delay the journal or the matching thread.
 //!
 //! The journal signals a durability-watermark advance with
-//! [`SharedState::notify_publisher`], but the signal is advisory: the publisher
-//! always re-reads `durable_seq` and calls
+//! [`super::publisher_signal::PublisherSignal::notify`], but the signal is
+//! advisory: the publisher always re-reads `durable_seq` and calls
 //! [`EventLog::read_from(last_published + 1)`](crate::durable::EventLog::read_from),
 //! clamping the records to the watermark. A lost wake-up is therefore
 //! harmless, and an event is never published before it is durable.
@@ -26,10 +26,11 @@
 //!
 //! # Shutdown
 //!
-//! Shutdown sets [`SharedState::finish_publisher`] only after the journal has
-//! been joined, so no further watermark advance is possible. The publisher
-//! drains to that final watermark and then exits. A log read failure stops the
-//! publisher without failing the engine; the log remains the catch-up source.
+//! Shutdown sets [`super::publisher_signal::PublisherSignal::finish`] only
+//! after the journal has been joined, so no further watermark advance is
+//! possible. The publisher drains to that final watermark and then exits. A log
+//! read failure stops the publisher without failing the engine; the log remains
+//! the catch-up source.
 
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
@@ -55,10 +56,11 @@ impl EventPublisher {
             // Read the generation before draining. A notification that races
             // with the drain then makes the next wait return immediately
             // instead of parking on a stale generation.
-            let seen = self.shared.publisher_generation();
+            let seen = self.shared.publisher().generation();
             let healthy = self.drain();
 
-            if self.shared.publisher_finished() && self.last_published >= self.shared.durable_seq()
+            if self.shared.publisher().finished()
+                && self.last_published >= self.shared.watermark().durable_seq()
             {
                 break;
             }
@@ -66,7 +68,7 @@ impl EventPublisher {
                 break;
             }
 
-            self.shared.wait_for_publisher(seen);
+            self.shared.publisher().wait_for_change(seen);
         }
 
         let _ = done.send(());
@@ -78,7 +80,7 @@ impl EventPublisher {
     /// error or a sequence gap). The caller keeps the durability watermark as
     /// the final authority either way.
     fn drain(&mut self) -> bool {
-        let durable = self.shared.durable_seq();
+        let durable = self.shared.watermark().durable_seq();
         if durable <= self.last_published {
             return true;
         }

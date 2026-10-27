@@ -73,6 +73,15 @@ struct PendingDurable {
     slot: SlotHandle,
 }
 
+/// Why the matching thread is releasing every waiter.
+enum ReleaseReason {
+    /// The journal failed closed; pending and queued commands cannot become
+    /// durable.
+    Failed(DurableError),
+    /// Shutdown's durability deadline expired before the work completed.
+    Stopped,
+}
+
 /// The single matching-thread loop.
 ///
 /// The loop applies one command per iteration so `submit -> applied` latency
@@ -127,8 +136,13 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
     pub(crate) fn run(mut self) -> MatchingEngine {
         loop {
             self.observe_failure();
-            if self.shared.is_failed() {
-                self.fail_stop();
+            if self.shared.run().is_failed() {
+                let error = self
+                    .shared
+                    .run()
+                    .failure()
+                    .unwrap_or(DurableError::EngineFailed);
+                self.release_waiters(ReleaseReason::Failed(error));
                 return self.engine;
             }
 
@@ -136,7 +150,7 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
             // thread stops waiting for an unfinished journal instead of
             // spinning forever. All work already completed still counts as a
             // clean shutdown.
-            if self.shared.is_closed() && self.shared.shutdown_expired() {
+            if self.shared.run().is_closed() && self.shared.run().shutdown_expired() {
                 if self.can_exit() {
                     return self.engine;
                 }
@@ -150,13 +164,13 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
                             return self.engine;
                         }
                         Ok(envelope) => {
-                            self.shared.note_ingress_dequeued();
+                            self.shared.ingress().note_dequeued();
                             envelope.slot.set_applied(Err(RuntimeError::EngineStopped));
                             envelope.slot.set_durable(Err(RuntimeError::EngineStopped));
                         }
                     }
                 }
-                self.abort_timeout();
+                self.release_waiters(ReleaseReason::Stopped);
                 return self.engine;
             }
 
@@ -166,8 +180,7 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
             // A full buffer, an expired flush interval, or an idle ingress all
             // force a flush. If the journal will not take the batch, applying
             // more commands would let applied state run away from the log.
-            if self.should_flush_journal() && !self.flush_journal() {
-                self.idle.idle();
+            if self.flush_or_idle(false) {
                 continue;
             }
 
@@ -189,8 +202,9 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
                 }
                 Err(TryRecvError::Empty) => {
                     self.ingress_empty = true;
-                    if !self.journal_buffer.is_empty() && !self.flush_journal() {
-                        self.idle.idle();
+                    // Nothing new can be applied while the buffer waits, so
+                    // flush it whenever the ingress is empty.
+                    if self.flush_or_idle(true) {
                         continue;
                     }
                 }
@@ -198,9 +212,8 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
                     // No producer can enqueue anything else. With the runtime
                     // holding a sender clone this only happens after teardown.
                     self.ingress_empty = true;
-                    self.shared.close();
-                    if !self.journal_buffer.is_empty() && !self.flush_journal() {
-                        self.idle.idle();
+                    self.shared.run().close();
+                    if self.flush_or_idle(true) {
                         continue;
                     }
                 }
@@ -219,20 +232,20 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
     }
 
     fn observe_failure(&mut self) {
-        if self.shared.is_failed() {
+        if self.shared.run().is_failed() {
             return;
         }
         if let Some(error) = self.journal.failure() {
-            self.shared.fail(error);
+            self.shared.run().fail(error);
         } else if self.journal.is_disconnected() {
-            self.shared.fail(DurableError::Storage(
+            self.shared.run().fail(DurableError::Storage(
                 "journal thread disconnected".to_string(),
             ));
         }
     }
 
     fn drain_durable(&mut self) {
-        let durable_seq = self.shared.durable_seq();
+        let durable_seq = self.shared.watermark().durable_seq();
         while let Some(front) = self.pending_durable.front() {
             if front.last_event_sequence > durable_seq {
                 break;
@@ -244,7 +257,7 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
             // Record the metric before signalling the durable receipt: a caller
             // that observes the ack must not snapshot metrics that still miss
             // this command.
-            if let Some(metrics) = &self.shared.metrics {
+            if let Some(metrics) = self.shared.metrics() {
                 metrics.record_durable();
                 if let Some(enqueued_at) = pending.enqueued_at {
                     metrics.record_durable_wait(enqueued_at.elapsed());
@@ -277,7 +290,7 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
         match self.journal.try_send_batch(batch) {
             Ok(()) => {
                 self.buffer_started_at = None;
-                if let Some(metrics) = &self.shared.metrics {
+                if let Some(metrics) = self.shared.metrics() {
                     metrics.record_journal_batch(records);
                 }
                 true
@@ -290,18 +303,33 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
         }
     }
 
+    /// Flush the journal buffer or idle and retry.
+    ///
+    /// `force` selects the two flush policies: `true` flushes whenever the
+    /// ingress is empty or disconnected and the buffer is non-empty, while
+    /// `false` flushes only when the buffer is due (full or timed out). An
+    /// empty buffer is a no-op either way. Returns `true` when the caller
+    /// should continue to the next loop iteration.
+    fn flush_or_idle(&mut self, force: bool) -> bool {
+        if (force || self.should_flush_journal()) && !self.flush_journal() {
+            self.idle.idle();
+            return true;
+        }
+        false
+    }
+
     fn gate_decision(&mut self) -> GateDecision {
         self.snapshot_gate.poll(
             &self.engine,
             self.sequencer.applied_seq(),
-            self.shared.durable_seq(),
+            self.shared.watermark().durable_seq(),
             self.sequencer.last_command_id(),
         )
     }
 
     fn note_dequeue(&mut self) {
-        if let Some(previous) = self.shared.note_ingress_dequeued()
-            && let Some(metrics) = &self.shared.metrics
+        if let Some(previous) = self.shared.ingress().note_dequeued()
+            && let Some(metrics) = self.shared.metrics()
         {
             metrics.observe_queue_depth(usize::try_from(previous).unwrap_or(usize::MAX));
         }
@@ -315,7 +343,7 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
             ..
         } = envelope;
 
-        let metrics = self.shared.metrics.clone();
+        let metrics = self.shared.metrics().cloned();
         let dequeued_at = metrics.as_ref().map(|_| Instant::now());
         if let (Some(metrics), Some(dequeued_at), Some(enqueued_at)) =
             (metrics.as_ref(), dequeued_at, enqueued_at)
@@ -344,8 +372,12 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
         self.sequencer.fold(&batch, |record| {
             engine.apply(&record.event, record.sequence)
         });
-        self.shared.publish_applied(batch.last_event_sequence);
-        self.shared.publish_applied_command_id(batch.command_id);
+        self.shared
+            .watermark()
+            .publish_applied(batch.last_event_sequence);
+        self.shared
+            .watermark()
+            .publish_applied_command_id(batch.command_id);
 
         slot.set_applied(Ok(CommandReceipt {
             events,
@@ -378,40 +410,32 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
     /// ingress, and mark the ingress empty.
     fn drain_ingress(&mut self, error: &RuntimeError) {
         while let Ok(envelope) = self.ingress.try_recv() {
-            self.shared.note_ingress_dequeued();
+            self.shared.ingress().note_dequeued();
             envelope.slot.set_applied(Err(error.clone()));
             envelope.slot.set_durable(Err(error.clone()));
         }
         self.ingress_empty = true;
     }
 
-    /// Fail every command that cannot become durable and every command still
-    /// waiting in the ingress.
-    fn fail_stop(&mut self) {
-        let error = self.shared.failure().unwrap_or(DurableError::EngineFailed);
-        let runtime_error = RuntimeError::EngineFailed(error);
-
-        self.drain_ingress(&runtime_error);
-        while let Some(pending) = self.pending_durable.pop_front() {
-            pending.slot.set_durable(Err(runtime_error.clone()));
-        }
-
-        self.journal_buffer.clear();
-        self.buffer_started_at = None;
-    }
-
-    /// Stop waiting for durability at the shutdown deadline.
+    /// Release every command that cannot complete, with `reason`.
     ///
-    /// Every command still queued or awaiting its durable acknowledgement is
-    /// released with [`RuntimeError::EngineStopped`]; nothing is applied after
-    /// this point.
-    fn abort_timeout(&mut self) {
-        let stopped = RuntimeError::EngineStopped;
-        self.shared.mark_timed_out();
+    /// A journal failure fails every queued and pending command closed with
+    /// [`RuntimeError::EngineFailed`]. An expired shutdown deadline marks the
+    /// runtime timed out and releases them with [`RuntimeError::EngineStopped`].
+    /// Both stop accepting applied work, so the journal buffer is dropped:
+    /// nothing is applied after this point.
+    fn release_waiters(&mut self, reason: ReleaseReason) {
+        let error = match reason {
+            ReleaseReason::Failed(error) => RuntimeError::EngineFailed(error),
+            ReleaseReason::Stopped => {
+                self.shared.run().mark_timed_out();
+                RuntimeError::EngineStopped
+            }
+        };
 
-        self.drain_ingress(&stopped);
+        self.drain_ingress(&error);
         while let Some(pending) = self.pending_durable.pop_front() {
-            pending.slot.set_durable(Err(stopped.clone()));
+            pending.slot.set_durable(Err(error.clone()));
         }
 
         self.journal_buffer.clear();
@@ -419,7 +443,7 @@ impl<J: JournalSink, G: SnapshotGate> MatchingThread<J, G> {
     }
 
     fn can_exit(&self) -> bool {
-        self.shared.is_closed()
+        self.shared.run().is_closed()
             && self.ingress_empty
             && self.journal_buffer.is_empty()
             && self.pending_durable.is_empty()
@@ -954,7 +978,7 @@ mod tests {
             store.saved()
         );
 
-        shared.close();
+        shared.run().close();
         handle.join().expect("matching thread");
         worker.join().expect("snapshot worker");
     }
@@ -1002,7 +1026,7 @@ mod tests {
         assert_eq!(metrics.applied(), 6);
 
         store_gate.open();
-        shared.close();
+        shared.run().close();
         handle.join().expect("matching thread");
         worker.join().expect("snapshot worker");
         assert!(
@@ -1047,7 +1071,7 @@ mod tests {
                 .expect("snapshot failures never fail durable commands");
         }
 
-        shared.close();
+        shared.run().close();
         handle.join().expect("matching thread");
         wait_until(|| probe.last_error().is_some());
         assert!(store.saved().is_empty());
@@ -1137,7 +1161,7 @@ mod tests {
             ticket.wait_durable_timeout(WAIT).expect("durable");
         }
 
-        shared.close();
+        shared.run().close();
         handle.join().expect("matching thread");
         worker.join().expect("snapshot worker");
 
@@ -1187,7 +1211,7 @@ mod tests {
         for ticket in &tickets {
             ticket.wait_durable_timeout(WAIT).expect("durable");
         }
-        shared.close();
+        shared.run().close();
         let engine = handle.join().expect("matching thread");
 
         // Each of the three submitted orders emits `OrderAccepted` and
@@ -1288,18 +1312,18 @@ mod tests {
 
         let _ticket = submitter.submit(simple_command(1)).expect("submit");
         assert_eq!(
-            shared.ingress_depth.load(Ordering::Relaxed),
+            shared.ingress().depth(),
             0,
             "metrics disabled must not update the ingress depth gauge"
         );
 
         let envelope = receiver.recv().expect("envelope");
         assert_eq!(
-            shared.note_ingress_dequeued(),
+            shared.ingress().note_dequeued(),
             None,
             "metrics disabled must not decrement the ingress depth gauge"
         );
-        assert_eq!(shared.ingress_depth.load(Ordering::Relaxed), 0);
+        assert_eq!(shared.ingress().depth(), 0);
         drop(envelope);
     }
 
@@ -1324,7 +1348,7 @@ mod tests {
         let consumer_metrics = Arc::clone(&metrics);
         let consumer = thread::spawn(move || {
             while let Ok(envelope) = receiver.recv() {
-                if let Some(previous) = consumer_shared.note_ingress_dequeued() {
+                if let Some(previous) = consumer_shared.ingress().note_dequeued() {
                     consumer_metrics
                         .observe_queue_depth(usize::try_from(previous).unwrap_or(usize::MAX));
                 }
@@ -1369,7 +1393,7 @@ mod tests {
             "queue depth {max} exceeded the bounded ingress plus concurrent submitters"
         );
         assert_eq!(
-            shared.ingress_depth.load(Ordering::Relaxed),
+            shared.ingress().depth(),
             0,
             "every accepted envelope was accounted for"
         );
@@ -1401,7 +1425,7 @@ mod tests {
             .expect("durable receipt");
         assert_eq!(durable, applied);
 
-        shared.close();
+        shared.run().close();
         let _engine = handle.join().expect("matching thread");
         assert_eq!(journal.record_count(), 2);
     }
@@ -1463,7 +1487,7 @@ mod tests {
             ticket.wait_durable_timeout(WAIT).expect("durable");
         }
 
-        shared.close();
+        shared.run().close();
         let runtime_engine = handle.join().expect("matching thread");
 
         assert_eq!(
@@ -1566,7 +1590,7 @@ mod tests {
             DomainEvent::OrderAccepted { .. }
         ));
 
-        shared.close();
+        shared.run().close();
         handle.join().expect("matching thread");
         let logged = journal.records();
         assert_eq!(logged.len(), 7);
@@ -1610,7 +1634,7 @@ mod tests {
         for ticket in &tickets {
             ticket.wait_durable_timeout(WAIT).expect("durable");
         }
-        shared.close();
+        shared.run().close();
         handle.join().expect("matching thread");
     }
 
@@ -1644,7 +1668,7 @@ mod tests {
         ticket.wait_durable_timeout(WAIT).expect("durable");
         wait_until(|| journal.record_count() == 2);
 
-        shared.close();
+        shared.run().close();
         let _engine = handle.join().expect("matching thread");
     }
 
@@ -1691,7 +1715,7 @@ mod tests {
             ticket.wait_durable_timeout(WAIT).expect("durable");
         }
 
-        shared.close();
+        shared.run().close();
         handle.join().expect("matching thread");
         assert_eq!(journal.record_count(), 6);
     }
@@ -1737,7 +1761,7 @@ mod tests {
             ticket.wait_durable_timeout(WAIT).expect("durable");
         }
 
-        shared.close();
+        shared.run().close();
         handle.join().expect("matching thread");
         assert_eq!(metrics.applied(), 3);
         assert_eq!(journal.record_count(), 6);
@@ -1796,7 +1820,7 @@ mod tests {
         ));
 
         let _engine = handle.join().expect("matching thread");
-        assert!(shared.is_failed());
+        assert!(shared.run().is_failed());
     }
 
     #[test]
@@ -1829,7 +1853,7 @@ mod tests {
         ));
 
         handle.join().expect("matching thread");
-        assert!(shared.is_failed());
+        assert!(shared.run().is_failed());
     }
 
     #[test]
@@ -1855,13 +1879,15 @@ mod tests {
             "durability must not be confirmed before the watermark advances"
         );
 
-        shared.publish_durable(applied.last_event_sequence);
+        shared
+            .watermark()
+            .publish_durable(applied.last_event_sequence);
         assert_eq!(
             tickets[0].wait_durable_timeout(WAIT).expect("durable"),
             applied
         );
 
-        shared.close();
+        shared.run().close();
         handle.join().expect("matching thread");
     }
 
@@ -1887,7 +1913,7 @@ mod tests {
             },
         );
 
-        shared.close();
+        shared.run().close();
         assert!(matches!(
             submitter.submit(simple_command(6)),
             Err(SubmitError::Shutdown)

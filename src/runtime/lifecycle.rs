@@ -11,22 +11,20 @@
 //! idempotent, so dropping a runtime that was explicitly shut down is a no-op.
 
 use std::sync::atomic::AtomicU64;
-use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
+use std::sync::mpsc;
 use std::sync::{Arc, Barrier, Mutex};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::thread;
+use std::time::Duration;
 
 use crate::bus::{InProcessBus, MessageBus, SubscriberBus};
-use crate::durable::{
-    DurableError, EventCursor, EventLog, FORMAT_VERSION, LogHeader, SnapshotStore, recover,
-};
+use crate::durable::{EventCursor, EventLog, FORMAT_VERSION, LogHeader, SnapshotStore, recover};
 use crate::engine::MatchingEngine;
 use crate::types::{EngineCommand, EngineConfig};
 
 use super::RuntimeConfig;
-use super::envelope::CommandEnvelope;
-use super::error::{RuntimeError, SubmitError, Worker};
-use super::journal::{self, SharedEventLog, ThreadWaker, Waker};
+use super::assembly::RuntimeThreads;
+use super::error::{RuntimeError, SubmitError};
+use super::journal::{self, SharedEventLog, ThreadWaker};
 use super::matching::MatchingThread;
 use super::metrics::RuntimeMetrics;
 use super::publisher;
@@ -39,7 +37,8 @@ use super::ticket::{CommandReceipt, SlotPool, Ticket};
 /// A cloneable, thread-safe submission handle.
 ///
 /// The handle owns no engine state: it reserves a response slot, offers a
-/// [`CommandEnvelope`] to the bounded ingress Command Queue, and observes the
+/// [`CommandEnvelope`](crate::runtime::CommandEnvelope) to the bounded ingress
+/// Command Queue, and observes the
 /// result through a [`Ticket`]. Handles may outlive the runtime; after
 /// shutdown every submission is refused.
 #[derive(Clone)]
@@ -93,7 +92,7 @@ impl EngineHandle {
 
     /// Whether the runtime failed closed after a fatal journal failure.
     pub fn is_failed(&self) -> bool {
-        self.shared.is_failed()
+        self.shared.run().is_failed()
     }
 
     /// This runtime's metrics sink, if metrics are enabled.
@@ -108,19 +107,9 @@ impl EngineHandle {
 /// final snapshot is wanted.
 pub struct EngineRuntime {
     shared: SharedState,
-    waker: ThreadWaker,
     config: RuntimeConfig,
     bus: Arc<dyn MessageBus>,
-    matching: Option<JoinHandle<Option<MatchingEngine>>>,
-    journal: Option<JoinHandle<()>>,
-    publisher: Option<JoinHandle<()>>,
-    publisher_done: Option<mpsc::Receiver<()>>,
-    snapshot: Option<JoinHandle<()>>,
-    snapshot_sink: Option<SnapshotSink>,
-    /// The runtime keeps one ingress sender for its whole life so the Command
-    /// Queue does not disconnect while handles still exist. Shutdown is
-    /// signalled by the closed flag, not by dropping this sender.
-    _ingress_sender: Option<SyncSender<CommandEnvelope>>,
+    threads: RuntimeThreads,
     stopped: bool,
 }
 
@@ -243,8 +232,10 @@ impl EngineRuntime {
             config.metrics.clone(),
             Arc::new(AtomicU64::new(cursor.durable_seq)),
         );
-        shared.publish_applied(cursor.applied_seq);
-        shared.publish_applied_command_id(cursor.next_command_id.saturating_sub(1));
+        shared.watermark().publish_applied(cursor.applied_seq);
+        shared
+            .watermark()
+            .publish_applied_command_id(cursor.next_command_id.saturating_sub(1));
 
         let (ingress_sender, ingress_receiver) = mpsc::sync_channel(config.queue_capacity.max(1));
         let pool = SlotPool::from_config(&config);
@@ -305,29 +296,35 @@ impl EngineRuntime {
                 Ok(handle) => handle,
                 Err(error) => {
                     // The closure was dropped with `matching`, disconnecting the
-                    // journal sink and snapshot gate. Drop the local handles too
-                    // so both workers can drain and exit.
-                    shared.close();
-                    shared.set_shutdown_deadline(Instant::now());
-                    drop(snapshot_sink);
-                    drop(handle);
-                    drop(ingress_sender);
-                    let _ = journal_handle.join();
-                    shared.finish_publisher();
-                    match publisher_done.recv_timeout(config.shutdown_timeout) {
-                        Ok(()) | Err(RecvTimeoutError::Disconnected) => {
-                            let _ = publisher_handle.join();
-                        }
-                        // A detached publisher cannot be joined without
-                        // blocking; every event remains readable from the log.
-                        Err(RecvTimeoutError::Timeout) => {}
-                    }
-                    let _ = snapshot_handle.join();
+                    // journal sink and snapshot gate; `abort_startup` drops the
+                    // remaining owners too so both workers can drain and exit.
+                    RuntimeThreads::new(
+                        None,
+                        journal_handle,
+                        publisher_handle,
+                        publisher_done,
+                        snapshot_handle,
+                        snapshot_sink,
+                        ingress_sender,
+                        waker,
+                    )
+                    .abort_startup(&shared, &config, handle);
                     return Err(RuntimeError::Startup(format!(
                         "could not start the matching thread: {error}"
                     )));
                 }
             };
+
+        let threads = RuntimeThreads::new(
+            Some(matching_handle),
+            journal_handle,
+            publisher_handle,
+            publisher_done,
+            snapshot_handle,
+            snapshot_sink,
+            ingress_sender,
+            waker,
+        );
 
         let startup = startup_receiver
             .recv_timeout(config.shutdown_timeout.max(Duration::from_millis(100)))
@@ -336,36 +333,15 @@ impl EngineRuntime {
         if let Err(detail) = startup {
             // The matching thread already returned (or is about to) without
             // running the loop; disconnect both workers and join them.
-            shared.close();
-            shared.set_shutdown_deadline(Instant::now());
-            drop(snapshot_sink);
-            drop(handle);
-            drop(ingress_sender);
-            let _ = matching_handle.join();
-            let _ = journal_handle.join();
-            shared.finish_publisher();
-            match publisher_done.recv_timeout(config.shutdown_timeout) {
-                Ok(()) | Err(RecvTimeoutError::Disconnected) => {
-                    let _ = publisher_handle.join();
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-            }
-            let _ = snapshot_handle.join();
+            threads.abort_startup(&shared, &config, handle);
             return Err(RuntimeError::Startup(detail));
         }
 
         let runtime = Self {
             shared,
-            waker,
             config,
             bus,
-            matching: Some(matching_handle),
-            journal: Some(journal_handle),
-            publisher: Some(publisher_handle),
-            publisher_done: Some(publisher_done),
-            snapshot: Some(snapshot_handle),
-            snapshot_sink: Some(snapshot_sink),
-            _ingress_sender: Some(ingress_sender),
+            threads,
             stopped: false,
         };
         Ok((handle, runtime))
@@ -405,111 +381,8 @@ impl EngineRuntime {
             return Ok(());
         }
         self.stopped = true;
-
-        self.shared.close();
-        self.shared
-            .set_shutdown_deadline(Instant::now() + self.config.shutdown_timeout);
-        self.waker.wake();
-
-        let mut panic_error = None;
-        let mut engine = None;
-        if let Some(handle) = self.matching.take() {
-            match handle.join() {
-                Ok(Some(matching_engine)) => engine = Some(matching_engine),
-                // Startup failures are reported by `start_with_gate`; a
-                // runtime that returned successfully always yields an engine.
-                Ok(None) => {}
-                Err(_) => panic_error = Some(RuntimeError::WorkerPanicked(Worker::Matching)),
-            }
-        }
-
-        let timed_out = self.shared.timed_out();
-        let mut failure = None;
-
-        if let Some(engine) = engine.as_ref()
-            && panic_error.is_none()
-            && !timed_out
-            && !self.shared.is_failed()
-            && final_snapshot
-        {
-            let applied_seq = self.shared.applied_seq();
-            let durable_seq = self.shared.durable_seq();
-            if applied_seq == durable_seq {
-                if let Some(sink) = self.snapshot_sink.as_ref()
-                    && let Err(error) = sink.capture_final(
-                        engine,
-                        applied_seq,
-                        durable_seq,
-                        self.shared.applied_command_id(),
-                    )
-                {
-                    failure = Some(RuntimeError::SnapshotFailed(error));
-                }
-            } else {
-                failure = Some(RuntimeError::Timeout);
-            }
-        }
-
-        if timed_out && failure.is_none() && panic_error.is_none() {
-            failure = Some(RuntimeError::Timeout);
-        }
-
-        // The matching thread's gate clone is gone; dropping the lifecycle's
-        // sink lets the worker drain its queue and exit.
-        self.snapshot_sink = None;
-
-        if let Some(handle) = self.journal.take()
-            && handle.join().is_err()
-            && panic_error.is_none()
-        {
-            panic_error = Some(RuntimeError::WorkerPanicked(Worker::Journal));
-        }
-
-        // The journal has exited, so the durability watermark is final. Let
-        // the publisher drain to it and stop. A synchronous handler cannot be
-        // interrupted, so the wait is bounded: on timeout the thread is
-        // detached and consumers catch up from the event log.
-        self.shared.finish_publisher();
-        if let Some(done) = self.publisher_done.take() {
-            match done.recv_timeout(self.shared.shutdown_remaining()) {
-                Ok(()) | Err(RecvTimeoutError::Disconnected) => {
-                    if let Some(handle) = self.publisher.take()
-                        && handle.join().is_err()
-                        && panic_error.is_none()
-                    {
-                        panic_error = Some(RuntimeError::WorkerPanicked(Worker::Publisher));
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    // Abandoning the join handle leaves the thread detached;
-                    // every event is already durable and readable from the log.
-                    self.publisher = None;
-                    if failure.is_none() && panic_error.is_none() {
-                        failure = Some(RuntimeError::Timeout);
-                    }
-                }
-            }
-        }
-
-        if let Some(handle) = self.snapshot.take()
-            && handle.join().is_err()
-            && panic_error.is_none()
-        {
-            panic_error = Some(RuntimeError::WorkerPanicked(Worker::Snapshot));
-        }
-
-        if let Some(error) = panic_error {
-            return Err(error);
-        }
-        if let Some(error) = failure {
-            return Err(error);
-        }
-        if self.shared.is_failed() {
-            return Err(RuntimeError::EngineFailed(
-                self.shared.failure().unwrap_or(DurableError::EngineFailed),
-            ));
-        }
-        Ok(())
+        self.threads
+            .shutdown(&self.shared, &self.config, final_snapshot)
     }
 }
 
@@ -622,6 +495,7 @@ fn bind_matching_core(index: Option<usize>) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::durable::InMemorySnapshotStore;
+    use crate::runtime::error::Worker;
     use crate::runtime::snapshot_gate::GateDecision;
     use crate::types::{OrderRequest, OrderType, Side, TimeInForce};
     use std::time::Duration;

@@ -20,7 +20,6 @@ pub mod file_event_log;
 pub mod file_event_snapshot;
 pub mod memory;
 mod sequencer;
-mod snapshot_files;
 
 pub(crate) use event_log::recover;
 pub use event_log::{DurableMatchingEngine, EventCursor, EventLog, EventRecord, FORMAT_VERSION};

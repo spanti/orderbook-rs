@@ -43,14 +43,14 @@ impl IngressSubmitter {
     }
 
     pub(crate) fn submit(&self, command: EngineCommand) -> Result<Ticket, SubmitError> {
-        if let Some(error) = self.shared.failure() {
-            if let Some(metrics) = &self.shared.metrics {
+        if let Some(error) = self.shared.run().failure() {
+            if let Some(metrics) = self.shared.metrics() {
                 metrics.record_engine_failed();
             }
             return Err(SubmitError::EngineFailed(error));
         }
-        if self.shared.is_closed() {
-            if let Some(metrics) = &self.shared.metrics {
+        if self.shared.run().is_closed() {
+            if let Some(metrics) = self.shared.metrics() {
                 metrics.record_stopped();
             }
             return Err(SubmitError::Shutdown);
@@ -59,40 +59,40 @@ impl IngressSubmitter {
         // No slot means the response pool is exhausted; treat it exactly like
         // a full ingress queue so producers shed load instead of allocating.
         let Some((ticket, slot)) = self.pool.checkout() else {
-            if let Some(metrics) = &self.shared.metrics {
+            if let Some(metrics) = self.shared.metrics() {
                 metrics.record_queue_full();
             }
             return Err(SubmitError::QueueFull);
         };
 
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-        let enqueued_at = self.shared.metrics.as_ref().map(|_| Instant::now());
+        let enqueued_at = self.shared.metrics().map(|_| Instant::now());
         let envelope = CommandEnvelope::new(request_id, enqueued_at, command, slot);
 
         // Count the offer before sending: the consumer may dequeue and
         // decrement before this thread resumes, which would underflow a
         // post-send increment and poison `queue_depth_max`.
-        self.shared.note_ingress_enqueued();
+        self.shared.ingress().note_enqueued();
         match self.sender.try_send(envelope) {
             Ok(()) => {
-                if let Some(metrics) = &self.shared.metrics {
+                if let Some(metrics) = self.shared.metrics() {
                     metrics.record_submitted();
                 }
                 Ok(ticket)
             }
             Err(TrySendError::Full(_envelope)) => {
-                self.shared.note_ingress_refused();
+                self.shared.ingress().note_refused();
                 // Dropping the returned envelope releases its slot handle; the
                 // ticket is dropped on return, so the slot goes back to the
                 // pool. The command was never accepted.
-                if let Some(metrics) = &self.shared.metrics {
+                if let Some(metrics) = self.shared.metrics() {
                     metrics.record_queue_full();
                 }
                 Err(SubmitError::QueueFull)
             }
             Err(TrySendError::Disconnected(_envelope)) => {
-                self.shared.note_ingress_refused();
-                if let Some(metrics) = &self.shared.metrics {
+                self.shared.ingress().note_refused();
+                if let Some(metrics) = self.shared.metrics() {
                     metrics.record_stopped();
                 }
                 Err(SubmitError::Shutdown)

@@ -112,20 +112,25 @@
 //! - This is not HFT-grade latency until a custom ring, CPU isolation, and
 //!   async IO exist.
 
+pub(crate) mod assembly;
 pub mod envelope;
 pub mod error;
 pub(crate) mod idle;
+pub(crate) mod ingress_gauge;
 pub(crate) mod journal;
 pub(crate) mod lifecycle;
 pub(crate) mod matching;
 pub mod metrics;
 pub(crate) mod publisher;
+pub(crate) mod publisher_signal;
+pub(crate) mod run_status;
 pub(crate) mod shared;
 pub(crate) mod snapshot;
 pub(crate) mod snapshot_gate;
 pub(crate) mod submitter;
 pub(crate) mod sync;
 pub(crate) mod ticket;
+pub(crate) mod watermark;
 
 pub use envelope::CommandEnvelope;
 pub use error::{RuntimeError, SubmitError, Worker};
