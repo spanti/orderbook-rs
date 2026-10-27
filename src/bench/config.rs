@@ -22,7 +22,7 @@ pub const WARMUP_CAP: u64 = 100_000;
 pub const RATIO_TOLERANCE: f64 = 1e-6;
 
 pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;
-pub const DEFAULT_JOURNAL_BATCH_CAPACITY: usize = 64;
+pub const DEFAULT_JOURNAL_BATCH_CAPACITY: usize = 256;
 pub const DEFAULT_APPLY_BATCH_MAX: usize = 64;
 pub const DEFAULT_JOURNAL_COALESCE_MAX: usize = 1024;
 pub const DEFAULT_JOURNAL_FLUSH_US: u64 = 100;
@@ -81,7 +81,7 @@ Runtime path options:
   --path decide            Pure event-sourced decide baseline
   --queue-capacity <N>     Ingress Command Queue capacity (default: 1024)
   --journal-batch-capacity <N>
-                           Journal batches in flight before backpressure (default: 64)
+                           Journal batches in flight before backpressure (default: 256)
   --apply-batch-max <N>    Maximum records per journal batch (default: 64)
   --journal-coalesce-max <N>
                            Maximum records per journal append/fsync (default: 1024)
@@ -601,7 +601,7 @@ mod tests {
         let config = BenchConfig::default();
         assert_eq!(config.path, BenchPath::Direct);
         assert_eq!(config.queue_capacity, 1024);
-        assert_eq!(config.journal_batch_capacity, 64);
+        assert_eq!(config.journal_batch_capacity, 256);
         assert_eq!(config.apply_batch_max, 64);
         assert_eq!(config.journal_coalesce_max, 1024);
         assert_eq!(config.journal_flush_us, 100);

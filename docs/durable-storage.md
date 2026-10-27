@@ -247,10 +247,14 @@ carry commands. See [ADR 0005](adr/0005-in-process-message-bus.md).
   the matching thread's journal buffer and the journal thread's split
   remainder, not only the journal channel. Exhausting the pool is also reported
   as `QueueFull`, so the hot path never allocates a response channel.
-- The journal batch channel holds `journal_batch_capacity` batches (default 64)
+- The journal batch channel holds `journal_batch_capacity` batches (default 256)
   of up to `apply_batch_max` **event records** (default 64). If the journal will
   not accept a flush, the matching thread stops applying; applied state cannot
-  run away from the log.
+  run away from the log. The batch count, not a record count, is the capacity
+  unit: in practice a batch carries only a few records, so the effective buffer
+  is much smaller than `256 * 64` and is sized to absorb one slow fsync rather
+  than a long I/O stall. Raising it also grows the response-slot pool and the
+  window in which applied state leads the durable log.
 - The journal coalesces up to `journal_coalesce_max` event records (default
   1024) per `append_batch`/fsync, and `journal_flush_interval` (default 100 µs)
   bounds how long the first record in a group waits for a flush. A handoff

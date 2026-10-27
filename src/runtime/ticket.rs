@@ -647,8 +647,13 @@ mod tests {
         config.queue_capacity = 0;
         assert_eq!(SlotPool::capacity_for(&config), 1 + 12 + 7 + 8 + 64);
 
-        let defaults = SlotPool::from_config(&crate::runtime::RuntimeConfig::default());
-        assert_eq!(defaults.capacity(), 1024 + 64 * 64 + 1024 + 2 * 64 + 64);
+        let defaults = crate::runtime::RuntimeConfig::default();
+        let expected = defaults.queue_capacity
+            + defaults.journal_batch_capacity * defaults.apply_batch_max
+            + defaults.journal_coalesce_max
+            + 2 * defaults.apply_batch_max
+            + 64;
+        assert_eq!(SlotPool::from_config(&defaults).capacity(), expected);
     }
 
     #[test]

@@ -186,7 +186,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             queue_capacity: 1024,
-            journal_batch_capacity: 64,
+            journal_batch_capacity: 256,
             apply_batch_max: 64,
             journal_coalesce_max: 1024,
             journal_flush_interval: Duration::from_micros(100),
@@ -209,7 +209,7 @@ mod tests {
         let config = RuntimeConfig::default();
 
         assert_eq!(config.queue_capacity, 1024);
-        assert_eq!(config.journal_batch_capacity, 64);
+        assert_eq!(config.journal_batch_capacity, 256);
         assert_eq!(config.apply_batch_max, 64);
         assert_eq!(config.journal_coalesce_max, 1024);
         assert_eq!(config.journal_flush_interval, Duration::from_micros(100));
