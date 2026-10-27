@@ -279,6 +279,16 @@ clock:
   NVMe, with the same spin/pinned setup and `queue_full == 0`. It waits for the
   command's last event to be durable.
 
+Throughput and durable latency are judged in **separate runs**. Little's law
+gives `mean latency >= in_flight / rate` once the producer keeps that many
+commands outstanding, so at 100k commands/s the 500 µs p99 target requires
+`in_flight <= 50`. The `--in-flight 128` run measures throughput only; the
+report prints a note when `in_flight / rate` exceeds the target. The achieved
+rate is measured over the submission window (first to last submit), excluding
+the final durable drain, so a rate-limited run is not depressed by its last
+fsync. The warning is strict: a rate below the offered target is reported
+without a tolerance.
+
 A PASS requires both `p99 <= target` **and** `queue_full == 0`: a refusal means
 the producer could not sustain the offered rate, so the measured latency does not
 describe the acceptance workload. The required setup is a Linux release build,

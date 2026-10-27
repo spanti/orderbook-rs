@@ -92,7 +92,8 @@ Runtime path options:
                            command boundary; 0 disables (default: 0)
   --log memory|file        Runtime storage adapters (default: memory)
   --data-dir <PATH>        Directory for file adapters; required with --log file
-  --in-flight <N>          Commands in flight; 1 measures submit-to-ack latency (default: 1)
+  --in-flight <N>          Commands in flight (default: 1). Mean latency is at least
+                           in-flight / rate; use a separate run for latency SLOs
 
 The benchmark must be built with --release for meaningful numbers.
 ";

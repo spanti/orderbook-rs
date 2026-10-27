@@ -196,7 +196,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 目标（详见 [docs/durable-storage.md](docs/durable-storage.md) 的 SLO 测量）：
 
 - `submit -> applied` p99 ≤ 10µs：`--log memory`、单生产者、`--in-flight 1`、`--idle spin`、撮合线程绑核、`queue_full == 0`。
-- `submit -> durable` p99 ≤ 500µs（100k commands/s）：`--log file` + NVMe，同样 spin/绑核、`queue_full == 0`。
+- `submit -> durable` p99 ≤ 500µs（100k commands/s）：`--log file` + NVMe，同样 spin/绑核、`queue_full == 0`。吞吐和延迟分两次跑：Little's law 给出均值延迟下限 `in_flight / rate`，100k/s 下 `--in-flight` 必须 ≤ 50 才能判定 500µs；`--in-flight 128` 只用于吞吐组。
 
 Windows 的 QPC/NTFS 只做功能验证；numeric SLO 需要在原生 Linux + NVMe 上测量。
 
@@ -227,12 +227,20 @@ taskset -c 0-15 ./target/release/bench \
   --rate 0 --in-flight 1 \
   --idle spin --affinity 15
 
-# submit -> durable（把 data-dir 放在 NVMe 挂载点）
+# throughput：100k commands/s，验证 achieved rate 与 queue_full
 mkdir -p /mnt/nvme/orderbook-bench
 taskset -c 0-15 ./target/release/bench \
   --path runtime --log file --data-dir /mnt/nvme/orderbook-bench \
-  --events 200000 --warmup 20000 \
-  --rate 100000 --in-flight 128 \
+  --events 500000 --warmup 20000 \
+  --rate 100000 --in-flight 512 \
+  --idle spin --affinity 15
+
+# durable latency：p99 <= 500us；in-flight <= rate * target
+# （100k/s、500us -> 50；超过时报告会打印 Little's law note）
+taskset -c 0-15 ./target/release/bench \
+  --path runtime --log file --data-dir /mnt/nvme/orderbook-bench \
+  --events 500000 --warmup 20000 \
+  --rate 100000 --in-flight 50 \
   --idle spin --affinity 15
 
 # 纯 decide 基线
@@ -244,7 +252,9 @@ taskset -c 0-15 ./target/release/bench \
 
 - `--affinity <CORE>` 是 `core_affinity::get_core_ids` 的索引，不是裸 CPU 号。
 - `PASS` 同时要求 `p99 <= target` 与 `queue_full == 0`；`--log memory` 时 durable 为 `NOT APPLICABLE`。
-- 若 `queue_full > 0` 或 achieved rate 明显低于 100k，先增大 `--in-flight`，不要用有拒绝的运行宣称 PASS。
+- `achieved rate` 按提交窗口（首条到最后一条 submit）计算，不含最后的 durable 收尾；低于目标会打印 warning，没有容差。
+- 吞吐组：若 `queue_full > 0` 或 achieved rate 低于 100k，增大 `--in-flight`；不要用有拒绝的运行宣称 PASS。
+- 延迟组：`--in-flight` 不能超过 `rate × target`；超过时该配置在数学上不可能满足 p99，报告会打印 Little's law note。
 - Windows 功能 smoke：`cargo run --release --bin bench -- --path runtime --log memory --events 20000 --warmup 2000 --rate 0 --in-flight 1 --idle spin`。
 
 ## 测试

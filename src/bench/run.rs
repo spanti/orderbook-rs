@@ -76,8 +76,13 @@ fn run_decide(config: &BenchConfig) -> Result<BenchReport, BenchError> {
     let mut samples = Samples::default();
     let mut events_total = 0u64;
     let measured_start = Instant::now();
+    let mut first_start_ns: Option<u64> = None;
+    let mut last_start_ns = 0u64;
     for _ in 0..config.events {
         let start = Instant::now();
+        let offset = ns_between(measured_start, start);
+        first_start_ns.get_or_insert(offset);
+        last_start_ns = offset;
         let events = engine.decide(&command);
         let elapsed = ns_between(start, Instant::now());
         std::hint::black_box(&events);
@@ -86,12 +91,11 @@ fn run_decide(config: &BenchConfig) -> Result<BenchReport, BenchError> {
     }
 
     let wall_time_ns = duration_ns(measured_start.elapsed());
+    let rate_window_ns = first_start_ns
+        .filter(|first| last_start_ns > *first)
+        .map_or(wall_time_ns, |first| last_start_ns - first);
     let summary = samples.summary();
-    let achieved_rate = if wall_time_ns == 0 {
-        0.0
-    } else {
-        config.events as f64 / (wall_time_ns as f64 / 1e9)
-    };
+    let achieved_rate = rate_over_window(config.events, rate_window_ns);
     let events_per_command = events_total as f64 / config.events as f64;
     // The pure decide path is gated against the applied SLO: if it cannot
     // produce the events within that budget, the shortfall is reported rather
@@ -110,6 +114,7 @@ fn run_decide(config: &BenchConfig) -> Result<BenchReport, BenchError> {
         config: config.clone(),
         run: RunStats {
             wall_time_ns,
+            rate_window_ns,
             achieved_rate,
             commands: config.events,
             engine_events: events_total,
@@ -184,6 +189,8 @@ fn run_direct(config: &BenchConfig) -> Result<BenchReport, BenchError> {
     let measured_start = Instant::now();
     let mut measured_events = 0u64;
     let trades_before = engine.trades().len();
+    let mut first_send_ns: Option<u64> = None;
+    let mut last_send_ns = 0u64;
 
     for index in 0..config.events {
         let action =
@@ -199,6 +206,9 @@ fn run_direct(config: &BenchConfig) -> Result<BenchReport, BenchError> {
         }
 
         let send = Instant::now();
+        let send_offset = ns_between(measured_start, send);
+        first_send_ns.get_or_insert(send_offset);
+        last_send_ns = send_offset;
         let events = engine.execute(command);
         let done = Instant::now();
         std::hint::black_box(&events);
@@ -252,17 +262,17 @@ fn run_direct(config: &BenchConfig) -> Result<BenchReport, BenchError> {
         send_lag: send_lag_samples.summary(),
     };
 
-    let achieved_rate = if wall_time_ns == 0 {
-        0.0
-    } else {
-        config.events as f64 / (wall_time_ns as f64 / 1e9)
-    };
+    let rate_window_ns = first_send_ns
+        .filter(|first| last_send_ns > *first)
+        .map_or(wall_time_ns, |first| last_send_ns - first);
+    let achieved_rate = rate_over_window(config.events, rate_window_ns);
     let events_per_command = events_per_command(engine_events, config.events);
 
     Ok(BenchReport {
         config: config.clone(),
         run: RunStats {
             wall_time_ns,
+            rate_window_ns,
             achieved_rate,
             commands: config.events,
             engine_events,
@@ -285,6 +295,19 @@ pub(crate) fn events_per_command(events: u64, commands: u64) -> f64 {
         0.0
     } else {
         events as f64 / commands as f64
+    }
+}
+
+/// Commands per second over a measured window.
+///
+/// The runtime path passes the submission window (first to last submit), so the
+/// final durable drain does not depress the rate. `commands - 1` submission
+/// intervals span that window.
+pub(crate) fn rate_over_window(commands: u64, window_ns: u64) -> f64 {
+    if commands <= 1 || window_ns == 0 {
+        0.0
+    } else {
+        (commands - 1) as f64 / (window_ns as f64 / 1e9)
     }
 }
 
@@ -442,6 +465,13 @@ mod tests {
         config.symbols = 1;
         config.seed = 7;
         config
+    }
+
+    #[test]
+    fn rate_over_window_uses_submission_intervals() {
+        assert!((rate_over_window(500_000, 5_000_000_000) - 99_999.8).abs() < 0.05);
+        assert_eq!(rate_over_window(1, 1_000_000_000), 0.0);
+        assert_eq!(rate_over_window(10, 0), 0.0);
     }
 
     #[test]

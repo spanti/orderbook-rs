@@ -31,7 +31,7 @@ use super::report::{
 };
 use super::run::{
     book_prices, command_from_action, count_depth, duration_ns, events_per_command, intended_time,
-    ns_between, pace, record_workload, symbol_list,
+    ns_between, pace, rate_over_window, record_workload, symbol_list,
 };
 use super::stats::Samples;
 use super::workload::{Action, CommandKind, Workload};
@@ -106,11 +106,10 @@ pub(crate) fn run_runtime(config: &BenchConfig) -> Result<BenchReport, BenchErro
         cancel: applied_cancel,
     };
 
-    let achieved_rate = if wall_time_ns == 0 {
-        0.0
-    } else {
-        config.events as f64 / (wall_time_ns as f64 / 1e9)
-    };
+    let achieved_rate = rate_over_window(
+        config.events,
+        stats.submission_window_ns().unwrap_or(wall_time_ns),
+    );
 
     let runtime_report = RuntimeReport {
         applied_latency: applied_all,
@@ -166,6 +165,7 @@ pub(crate) fn run_runtime(config: &BenchConfig) -> Result<BenchReport, BenchErro
         config: config.clone(),
         run: RunStats {
             wall_time_ns,
+            rate_window_ns: stats.submission_window_ns().unwrap_or(wall_time_ns),
             achieved_rate,
             commands: config.events,
             engine_events,
@@ -246,6 +246,19 @@ struct DriveStats {
     applied_cancel: Samples,
     durable: Samples,
     send_lag: Samples,
+    /// First and last submission offsets from the phase start. Together they
+    /// form the rate window, which excludes the final durable drain.
+    first_submit_ns: Option<u64>,
+    last_submit_ns: Option<u64>,
+}
+
+impl DriveStats {
+    fn submission_window_ns(&self) -> Option<u64> {
+        match (self.first_submit_ns, self.last_submit_ns) {
+            (Some(first), Some(last)) if last > first => Some(last - first),
+            _ => None,
+        }
+    }
 }
 
 /// Drive one phase (warmup or measured) through the runtime.
@@ -282,6 +295,11 @@ fn drive(
         }
 
         let submit_start = Instant::now();
+        if measure {
+            let offset = ns_between(phase_start, submit_start);
+            stats.first_submit_ns.get_or_insert(offset);
+            stats.last_submit_ns = Some(offset);
+        }
         let send_lag_ns = intended.map_or(0, |intended| ns_between(intended, submit_start));
         let ticket = submit_with_retry(handle, &command)?;
         pending.push_back(Pending {

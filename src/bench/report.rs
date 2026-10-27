@@ -156,6 +156,10 @@ impl SloCheck {
 #[derive(Debug, Clone, Serialize)]
 pub struct RunStats {
     pub wall_time_ns: u64,
+    /// Denominator used for [`Self::achieved_rate`]. The runtime path uses the
+    /// submission window (first to last submit), excluding the final durable
+    /// drain; direct and decide use the measured loop.
+    pub rate_window_ns: u64,
     #[serde(serialize_with = "serialize_round3")]
     pub achieved_rate: f64,
     pub commands: u64,
@@ -282,7 +286,7 @@ impl BenchReport {
             out,
             "  engine events   {} ({}/s, {:.2}/command)",
             commas(self.run.engine_events),
-            commas(per_second(self.run.engine_events, self.run.wall_time_ns)),
+            commas(per_second(self.run.engine_events, self.run.rate_window_ns)),
             self.run.events_per_command
         )
         .expect("writing to a String cannot fail");
@@ -290,7 +294,7 @@ impl BenchReport {
             out,
             "  trades          {} ({}/s)",
             commas(self.run.trades),
-            commas(per_second(self.run.trades, self.run.wall_time_ns))
+            commas(per_second(self.run.trades, self.run.rate_window_ns))
         )
         .expect("writing to a String cannot fail");
         writeln!(out, "  rejections      {}", commas(self.run.rejections))
@@ -469,14 +473,44 @@ impl BenchReport {
         if self.config.rate == 0 {
             writeln!(out, "note: rate=unlimited; total = service, send lag = 0")
                 .expect("writing to a String cannot fail");
-        } else if self.run.achieved_rate < self.config.rate as f64 * 0.99 {
+        } else {
+            let achieved = self.run.achieved_rate as u64;
+            if achieved < self.config.rate {
+                writeln!(
+                    out,
+                    "warning: achieved rate {} is below target {} commands/s",
+                    commas(achieved),
+                    commas(self.config.rate)
+                )
+                .expect("writing to a String cannot fail");
+            }
+        }
+
+        if self.runtime.is_some() {
             writeln!(
                 out,
-                "warning: achieved rate {:.0} is below target {} commands/s",
-                self.run.achieved_rate,
-                commas(self.config.rate)
+                "note: achieved rate uses the submission window (first to last submit); the final durable drain is excluded"
             )
             .expect("writing to a String cannot fail");
+        }
+
+        if self.runtime.is_some() && self.config.log == LogKind::File && self.config.rate > 0 {
+            let in_flight = self.config.in_flight.max(1) as f64;
+            let mean_floor_ns = in_flight / self.config.rate as f64 * 1e9;
+            if mean_floor_ns > DURABLE_SLO_NS as f64 {
+                let max_in_flight =
+                    (self.config.rate as f64 * DURABLE_SLO_NS as f64 / 1e9).floor() as u64;
+                writeln!(
+                    out,
+                    "note: in-flight {} at {} commands/s implies a mean latency floor of {:.0} us, above the {} us durable target; judge latency in a separate run with in-flight <= {}",
+                    self.config.in_flight.max(1),
+                    commas(self.config.rate),
+                    mean_floor_ns / 1000.0,
+                    DURABLE_SLO_NS / 1000,
+                    commas(max_in_flight)
+                )
+                .expect("writing to a String cannot fail");
+            }
         }
 
         let samples = self.latency.total.all.count;
@@ -838,6 +872,7 @@ mod tests {
             config: BenchConfig::default(),
             run: RunStats {
                 wall_time_ns: 1_000,
+                rate_window_ns: 1_000,
                 achieved_rate: 1234.5678,
                 commands: 10,
                 engine_events: 20,
@@ -1033,5 +1068,50 @@ mod tests {
         assert_eq!(json["decide"]["events_per_command"], 2.0);
         assert!(json["runtime"]["fsync_share"].is_number());
         assert!(json["runtime"]["batch_size_mean"].is_number());
+    }
+
+    #[test]
+    fn achieved_rate_warning_is_strict() {
+        let mut report = base_report();
+        report.config.rate = 100_000;
+        report.run.achieved_rate = 99_999.0;
+
+        let text = report.render_text();
+        assert!(
+            text.contains("warning: achieved rate 99,999 is below target 100,000 commands/s"),
+            "a rate one command below target must warn:\n{text}"
+        );
+
+        report.run.achieved_rate = 100_000.0;
+        let text = report.render_text();
+        assert!(
+            !text.contains("warning: achieved rate"),
+            "the target itself must pass:\n{text}"
+        );
+    }
+
+    #[test]
+    fn runtime_report_notes_the_submission_window_and_littles_law() {
+        let mut report = base_report();
+        report.config.log = LogKind::File;
+        report.config.rate = 100_000;
+        report.config.in_flight = 128;
+        report.runtime = Some(runtime_report());
+
+        let text = report.render_text();
+        assert!(
+            text.contains("achieved rate uses the submission window"),
+            "the rate denominator must be visible:\n{text}"
+        );
+        assert!(
+            text.contains(
+                "in-flight 128 at 100,000 commands/s implies a mean latency floor of 1280 us"
+            ),
+            "an unsatisfiable in-flight/rate combination must warn:\n{text}"
+        );
+        assert!(
+            text.contains("in-flight <= 50"),
+            "the warning must name the latency-run bound:\n{text}"
+        );
     }
 }
